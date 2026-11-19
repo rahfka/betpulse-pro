@@ -90,13 +90,17 @@ def _noter_erreur_foot(msg):
 def _appeler_avec_signatures(fn, candidats_kwargs):
     if not callable(fn):
         return None
+    nom_fn = getattr(fn, "__name__", "fb_fn")
     for kwargs in candidats_kwargs:
         try:
-            return fn(**kwargs)
-        except TypeError:
+            res = fn(**kwargs)
+            if res is not None:
+                return res
+        except TypeError as exc:
+            _noter_erreur_foot(f"{nom_fn} TypeError{kwargs}: {exc}")
             continue
         except Exception as exc:
-            _noter_erreur_foot(f"{getattr(fn, '__name__', 'fb_fn')}: {exc}")
+            _noter_erreur_foot(f"{nom_fn}{kwargs}: {exc}")
     return None
 
 
@@ -165,8 +169,16 @@ def resoudre_season_id_foot(league_slug):
 
 
 def _extraire_evenements_depuis_reponse(payload):
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
     if not isinstance(payload, dict):
         return []
+
+    if payload.get("error"):
+        _noter_erreur_foot(f"api_error: {payload.get('error')}")
+
     data = payload.get("data", payload)
     if isinstance(data, list):
         return [x for x in data if isinstance(x, dict)]
@@ -174,18 +186,18 @@ def _extraire_evenements_depuis_reponse(payload):
         return []
 
     evenements = []
-    for cle in ("events", "matches", "fixtures", "games", "schedules"):
+    for cle in ("events", "matches", "fixtures", "games", "schedules", "results", "items"):
         val = data.get(cle)
         if isinstance(val, list):
             for item in val:
                 if not isinstance(item, dict):
                     continue
-                if "competitors" in item or "teams" in item or "home_team" in item:
+                if any(k in item for k in ("competitors", "teams", "home_team", "away_team", "home", "away")):
                     evenements.append(item)
                 else:
                     evenements.extend(_extraire_evenements_depuis_reponse(item))
 
-    for cle_bloc in ("leagues", "competitions", "seasons", "days"):
+    for cle_bloc in ("leagues", "competitions", "seasons", "days", "tournaments"):
         bloc = data.get(cle_bloc)
         if isinstance(bloc, list):
             for sub in bloc:
@@ -209,6 +221,7 @@ def _match_appartient_competition(ev, comp_cfg):
 
     for champ in (
         "league_slug", "competition_id", "competition", "league",
+        "competition_name", "league_name", "tournament", "category",
         "_bloc_slug", "_bloc_id", "_bloc_name", "_bloc_short_name", "_bloc_abbreviation",
         "_bloc_league_slug", "_bloc_competition_id"
     ):
@@ -276,6 +289,7 @@ def recuperer_evenements_competition(comp_cfg):
                 [
                     {"season_id": sid_test},
                     {"competition_id": slug, "season_id": sid_test},
+                    {"league_slug": slug, "season_id": sid_test},
                 ],
             )
             evs = _extraire_evenements_depuis_reponse(res_sched)
