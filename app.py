@@ -10,13 +10,13 @@ import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from concurrent.futures import ThreadPoolExecutor
 
 import requests
-from flask import Flask, jsonify, redirect, render_template_string, url_for
+from flask import Flask, jsonify, make_response, redirect, render_template_string, url_for
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -116,7 +116,9 @@ def _charger_rapport_disque():
     try:
         if os.path.exists(FICHIER_RAPPORT):
             with open(FICHIER_RAPPORT, "r", encoding="utf-8") as f:
-                _DERNIER_RAPPORT = json.load(f)
+                data = json.load(f)
+                if isinstance(data, dict):
+                    _DERNIER_RAPPORT.update(data)
     except Exception:
         pass
 
@@ -437,7 +439,6 @@ def analyser_foot_competitions(competitions, heures_max=48):
     alertes_globales = {}
     stats_par_comp = {}
     apercu_lignes = []
-    vus_globaux = set()
 
     aujourdhui = datetime.now(timezone.utc).date()
 
@@ -467,8 +468,10 @@ def analyser_foot_competitions(competitions, heures_max=48):
         eqs = set(comp.get("equipes") or [])
         for ev in events_upcoming_par_slug[slug]:
             h, a = _normaliser_home_away(ev)
-            if h.get("id"): eqs.add(str(h["id"]))
-            if a.get("id"): eqs.add(str(a["id"]))
+            if h.get("id"):
+                eqs.add(str(h["id"]))
+            if a.get("id"):
+                eqs.add(str(a["id"]))
         for tid in eqs:
             taches_hist.append((tid, slug))
 
@@ -484,13 +487,13 @@ def analyser_foot_competitions(competitions, heures_max=48):
         res_hist = list(ex.map(charger_hist, taches_hist))
 
     events_hist_par_slug = {c["slug"]: [] for c in competitions}
-    for i, (tid, slug) in enumerate(taches_hist):
+    for i, (_, slug) in enumerate(taches_hist):
         events_hist_par_slug[slug].extend(res_hist[i])
 
     def analyser_comp(comp):
         slug = comp["slug"]
         label_comp = comp["label"]
-        
+
         raw_comp_events = events_hist_par_slug[slug] + events_upcoming_par_slug[slug]
         dedup_comp = {}
         for idx, ev in enumerate(raw_comp_events):
@@ -585,7 +588,7 @@ def analyser_tennis(heures_max=48):
                 favori, prob = (j1, p1) if p1 >= 0.5 else (j2, 1 - p1)
                 if complet:
                     prob = min(max(prob, 0.50), 0.82)
-                
+
                 proba_pct = round(max(0.05, prob) * 100, 1)
                 simples.append({
                     "sport": "TENNIS",
@@ -599,7 +602,7 @@ def analyser_tennis(heures_max=48):
                     "proba": proba_pct,
                     "prudence": "MODERE" if proba_pct >= 56 else "PRUDENT",
                     "mise_u": 0.0,
-                    "equipes": [favori]
+                    "equipes": [favori],
                 })
     return simples, alertes_tennis
 
@@ -607,13 +610,13 @@ def analyser_tennis(heures_max=48):
 def _enrichir_sante_top(top_items):
     if not top_items:
         return {}
-    
+
     equipes_a_scanner = set()
     for it in top_items:
         for nom in it.get("equipes", []):
             if nom:
                 equipes_a_scanner.add(nom)
-    
+
     alertes_globales = {}
     penalites = {}
 
@@ -721,8 +724,10 @@ def executer_analyse():
         if _ANALYSE_EN_COURS:
             return _DERNIER_RAPPORT
         _ANALYSE_EN_COURS = True
+
+    try:
         print(f"Analyse en cours (fenetre: {CFG.fenetre_heures}h)...", flush=True)
-        
+
         try:
             foot_res, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
                 COMPETITIONS_CIBLES, CFG.fenetre_heures
@@ -740,8 +745,14 @@ def executer_analyse():
         foot_sorted = sorted(foot_res, key=lambda x: x["proba"], reverse=True)
         tennis_sorted = sorted(tennis_res, key=lambda x: x["proba"], reverse=True)
         top_sur = sorted(foot_sorted + tennis_sorted, key=lambda x: x["proba"], reverse=True)[:10]
-        
-        _DERNIER_RAPPORT = {
+
+        try:
+            bilan = mettre_a_jour_historique([x for x in top_sur if x.get("fiable", True)])
+        except Exception as e:
+            print(f"[ERREUR] Historique: {e}", flush=True)
+            bilan = _DERNIER_RAPPORT.get("bilan") or {}
+
+        nouveau_rapport = {
             "mis_a_jour": datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M %Z"),
             "stats_comp": stats_comp,
             "apercu_bruts": apercu_bruts,
@@ -749,29 +760,30 @@ def executer_analyse():
             "foot": foot_sorted,
             "tennis": tennis_sorted,
             "alertes": {**alertes_f, **alertes_t},
-            "bilan": mettre_a_jour_historique([x for x in top_sur if x.get("fiable", True)]),
+            "bilan": bilan,
             "synthese": "",
         }
-        
-        _sauvegarder_rapport_disque()
 
         try:
             alertes_sante = _enrichir_sante_top(top_sur)
-            _DERNIER_RAPPORT["alertes"] = {**_DERNIER_RAPPORT["alertes"], **alertes_sante}
-            _DERNIER_RAPPORT["top_sur"] = sorted(top_sur, key=lambda x: x["proba"], reverse=True)
-            _DERNIER_RAPPORT["foot"] = sorted(foot_sorted, key=lambda x: x["proba"], reverse=True)
+            nouveau_rapport["alertes"] = {**nouveau_rapport["alertes"], **alertes_sante}
+            nouveau_rapport["top_sur"] = sorted(top_sur, key=lambda x: x["proba"], reverse=True)
+            nouveau_rapport["foot"] = sorted(foot_sorted, key=lambda x: x["proba"], reverse=True)
         except Exception as e:
             print(f"[ERREUR] Santé: {e}", flush=True)
-            
-        _DERNIER_RAPPORT["synthese"] = "\n".join(
+
+        nouveau_rapport["synthese"] = "\n".join(
             f"• [{x['sport']} | {x['prudence']}] {x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
-            for x in _DERNIER_RAPPORT["top_sur"][:8]
+            for x in nouveau_rapport["top_sur"][:8]
         ) or "Aucun match à venir dans les prochaines 48h."
 
+        _DERNIER_RAPPORT = nouveau_rapport
         _sauvegarder_rapport_disque()
         print("Analyse terminée et rapport mis à jour.", flush=True)
-        _ANALYSE_EN_COURS = False
         return _DERNIER_RAPPORT
+    finally:
+        with _ANALYSE_LOCK:
+            _ANALYSE_EN_COURS = False
 
 
 app = Flask(__name__, static_folder="statique", static_url_path="/statique")
@@ -941,7 +953,7 @@ def health():
 
 @app.route("/api/analyse")
 def api_analyse():
-    if not _DERNIER_RAPPORT["mis_a_jour"]:
+    if not _DERNIER_RAPPORT.get("mis_a_jour"):
         executer_analyse()
     return jsonify(_DERNIER_RAPPORT)
 
@@ -985,12 +997,12 @@ def refresh():
 
 @app.route("/")
 def index():
-    if not _DERNIER_RAPPORT["mis_a_jour"]:
-        return render_template_string("""
+    if not _DERNIER_RAPPORT.get("mis_a_jour"):
+        resp = make_response(render_template_string("""
         <!doctype html>
         <html><head>
           <meta charset="utf-8">
-          <meta http-equiv="refresh" content="5">
+          <meta http-equiv="refresh" content="4">
           <title>BetPulse Pro — Analyse en cours…</title>
           <style>
             body { background: #0f172a; color: #e2e8f0; font-family: sans-serif; text-align: center; padding: 80px; }
@@ -1003,10 +1015,15 @@ def index():
           <h1>BetPulse Pro</h1>
           <div class="loader"></div>
           <p>Récupération des matchs et analyse des données en cours…</p>
-          <p style="font-size: 0.85em;">La page se rafraîchit automatiquement toutes les 5 secondes.</p>
+          <p style="font-size: 0.85em;">La page se rafraîchit automatiquement toutes les 4 secondes.</p>
         </body></html>
-        """), 200
-    return render_template_string(_HTML_PAGE, r=_DERNIER_RAPPORT)
+        """), 200)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+
+    resp = make_response(render_template_string(_HTML_PAGE, r=_DERNIER_RAPPORT), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 def _lancer_analyse_background():
@@ -1019,7 +1036,7 @@ def _lancer_analyse_background():
 
 _charger_rapport_disque()
 
-if not _DERNIER_RAPPORT["mis_a_jour"]:
+if not _DERNIER_RAPPORT.get("mis_a_jour"):
     threading.Thread(target=_lancer_analyse_background, daemon=True).start()
 
 
