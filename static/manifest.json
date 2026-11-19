@@ -1,0 +1,17 @@
+{
+  "name": "BetPulse Pro — Foot & Tennis",
+  "short_name": "BetPulse",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0b0f17",
+  "theme_color": "#0b0f17",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/5328/5328015.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
