@@ -324,4 +324,4 @@ def simuler_poisson_foot(lam_h, lam_a):
 
 
 def calculer_mise_kelly(prob, cote_dec, ev_pct, alerte_grave=False):
-    if cote_dec is None or cote_dec <= 1.01 or prob <= 0.0 or prob >= 
+if cote_dec is None or cote_dec <= 1.01 or prob <= 0.0 or prob >= 1.0:
