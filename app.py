@@ -1,4 +1,5 @@
 import csv
+import importlib
 import math
 import os
 import re
@@ -9,15 +10,27 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 from flask import Flask, jsonify, render_template_string
-import sports_skills.betting as bt
-import sports_skills.football as fb
-import sports_skills.tennis as tn
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+
+def _charger_module_sport(nom_anglais, nom_francais):
+    for mod_name in (nom_anglais, nom_francais):
+        try:
+            return importlib.import_module(mod_name)
+        except Exception:
+            continue
+    raise ImportError(f"Impossible d'importer le module '{nom_anglais}' ni '{nom_francais}'.")
+
+
+bt = _charger_module_sport("sports_skills.betting", "compétences_sportives.paris")
+fb = _charger_module_sport("sports_skills.football", "compétences_sportives.football")
+tn = _charger_module_sport("sports_skills.tennis", "compétences_sportives.tennis")
+
 
 # =====================================================================
 # CONFIGURATION GENERALE (GitHub + Render — 8 compétitions / 48h)
@@ -109,7 +122,16 @@ _CACHE_SEASON_ID = {}
 _CACHE_COMP_EVENTS = {}
 _CACHE_SANTE = {}
 _CACHE_MAPPING_IDS = None
-_DERNIER_RAPPORT = {"mis_a_jour": None, "top_sur": [], "foot": [], "tennis": [], "bilan": {}, "synthese": ""}
+_DERNIER_RAPPORT = {
+    "mis_a_jour": None,
+    "stats_comp": {},
+    "top_sur": [],
+    "foot": [],
+    "tennis": [],
+    "alertes": {},
+    "bilan": {},
+    "synthese": "",
+}
 
 _HTTP_SESSION = requests.Session()
 _HTTP_SESSION.headers.update({
@@ -120,6 +142,9 @@ _HTTP_SESSION.headers.update({
 })
 
 
+# =====================================================================
+# RECUPERATION ET NORMALISATION DES DONNEES FOOTBALL
+# =====================================================================
 def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year="2026"):
     cle = (str(team_id), str(league_slug), str(season_year))
     if cle not in _CACHE_FOOT_SCHED:
@@ -130,7 +155,8 @@ def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year="2026")
                 season_year=cle[2],
                 competition_id=cle[1],
             )
-        except Exception:
+        except Exception as e:
+            print(f"[FOOT] get_team_schedule({cle}) erreur: {e}", flush=True)
             _CACHE_FOOT_SCHED[cle] = {"data": {"events": []}}
     return _CACHE_FOOT_SCHED[cle]
 
@@ -164,7 +190,8 @@ def _resoudre_ids_competitions(forcer_refresh=False):
     try:
         comps_resp = fb.get_competitions()
         comps_list = _extraire_liste_dict(comps_resp, ("competitions", "leagues", "items", "events"))
-    except Exception:
+    except Exception as e:
+        print(f"[FOOT] get_competitions() erreur: {e}", flush=True)
         comps_list = []
 
     for cible in COMPETITIONS_CIBLES:
@@ -306,8 +333,8 @@ def recuperer_evenements_competition(comp_cfg, ids_candidats):
         try:
             sched_s = fb.get_season_schedule(season_id=season_id)
             evenements.extend(_extraire_events_depuis_payload(sched_s))
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[FOOT] get_season_schedule({season_id}) erreur: {e}", flush=True)
 
     maintenant = datetime.now(timezone.utc)
     jours_recherche = (-1, 0, 1, 2) if not evenements else (-7, -5, -3, -1, 0, 1, 2)
@@ -316,11 +343,16 @@ def recuperer_evenements_competition(comp_cfg, ids_candidats):
         try:
             d_resp = fb.get_daily_schedule(date=jour_str)
             for ev in _extraire_events_depuis_payload(d_resp):
-                txt_ev = str(ev).lower()
-                if any(m in txt_ev for m in comp_cfg["mots"]):
+                comp_obj = ev.get("competition") or ev.get("league") or ev.get("tournament") or {}
+                comp_txt = " ".join(
+                    str(comp_obj.get(k) or "").lower()
+                    for k in ("id", "slug", "name", "short_name")
+                ) if isinstance(comp_obj, dict) else str(comp_obj).lower()
+                txt_ev = f"{comp_txt} {str(ev.get('name') or '').lower()}"
+                if any(m in txt_ev for m in comp_cfg["mots"]) or any(cid.lower() in comp_txt for cid in ids_candidats):
                     evenements.append(ev)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[FOOT] get_daily_schedule({jour_str}) erreur: {e}", flush=True)
 
     dedup = {}
     for idx, ev in enumerate(evenements):
@@ -623,859 +655,4 @@ def stats_foot_detail(team_id, team_name="", league_slug="ligue-1", season_year=
 
     return {
         "forme": f"{v}V-{n}N-{d}D" if a_historique else "Forme récente",
-        "a_historique": a_historique,
-        "bp_home": moyenne_ponderee(bp_home, bp_base),
-        "bc_home": moyenne_ponderee(bc_home, bc_base),
-        "bp_away": moyenne_ponderee(bp_away, bp_base),
-        "bc_away": moyenne_ponderee(bc_away, bc_base),
-        "a_venir": a_venir,
-    }
-
-
-def simuler_poisson_foot(lam_h, lam_a):
-    p_h = p_n = p_a = p_over_25 = 0.0
-    for h in range(8):
-        for a in range(8):
-            pr = poisson_prob(h, lam_h) * poisson_prob(a, lam_a)
-            if h > a:
-                p_h += pr
-            elif h == a:
-                p_n += pr
-            else:
-                p_a += pr
-            if (h + a) > 2:
-                p_over_25 += pr
-    tot = p_h + p_n + p_a
-    p_h, p_n, p_a = p_h / tot, p_n / tot, p_a / tot
-    return p_h, p_n, p_a, p_over_25, max(0.0, 1.0 - p_over_25)
-
-
-def calculer_mise_kelly(prob, cote_dec, ev_pct, alerte_grave=False):
-    if cote_dec is None or cote_dec <= 1.01 or prob <= 0.0 or prob >= 1.0:
-        return 0.0
-    if ev_pct is None or ev_pct < SEUIL_EV_POSITIF_PCT:
-        return 0.0
-    b = cote_dec - 1.0
-    q = 1.0 - prob
-    kelly_plein = (b * prob - q) / b
-    if kelly_plein <= 0:
-        return 0.0
-    mise = kelly_plein * FRACTION_KELLY * 10.0
-    if alerte_grave:
-        mise *= 0.5
-    mise = min(mise, MISE_MAX_UNITES)
-    if mise < MISE_MIN_UNITES:
-        return 0.0
-    return round(mise, 2)
-
-
-def cote_dec_est_courte(dec_val):
-    return dec_val is not None and 1.0 < dec_val <= 1.55
-
-
-def analyser_cote_us(details_str, fair_prob, alerte_grave=False):
-    m = re.search(r"([+-]\d+)", str(details_str))
-    if not m:
-        return "", None, "Neutre", None, 0.0
-    cote_us = m.group(1)
-    cote_num = int(cote_us)
-
-    if abs(cote_num) < 100:
-        return f" | Cote {cote_us} (anomalie flux)", None, "Neutre", None, 0.0
-
-    conv = None
-    try:
-        conv = bt.convert_odds(odds=cote_us, from_format="american")
-    except Exception:
-        conv = None
-
-    data_c = conv.get("data", {}) if isinstance(conv, dict) else {}
-    imp = data_c.get("implied_probability") or data_c.get("probability") if isinstance(data_c, dict) else None
-    dec = data_c.get("decimal") if isinstance(data_c, dict) else None
-
-    if dec is None:
-        if cote_num > 0:
-            dec = 1.0 + (cote_num / 100.0)
-        elif cote_num < 0:
-            dec = 1.0 + (100.0 / abs(cote_num))
-
-    if imp is None and dec and float(dec) > 1.0:
-        imp = 1.0 / float(dec)
-
-    try:
-        dec_val = float(dec) if dec is not None else None
-    except Exception:
-        dec_val = None
-
-    if dec_val and dec_val > 1.0:
-        ev_pct = (fair_prob * dec_val - 1.0) * 100.0
-        mise_u = calculer_mise_kelly(fair_prob, dec_val, ev_pct, alerte_grave=alerte_grave)
-        if ev_pct >= SEUIL_EV_POSITIF_PCT:
-            label_val = f"+Valeur ({ev_pct:+.1f}%)"
-        elif cote_dec_est_courte(dec_val) or ev_pct <= -12.0:
-            label_val = f"Cote courte ({ev_pct:+.1f}%)"
-        else:
-            label_val = f"Ajusté ({ev_pct:+.1f}%)"
-
-        imp_txt = f", implicite {float(imp)*100:.1f}%" if imp is not None else ""
-        mise_txt = f" | Mise: {mise_u:.2f}u" if mise_u > 0 else ""
-        txt = f" | Cote {cote_us} (dec {dec_val:.2f}{imp_txt}) -> {label_val}{mise_txt}"
-        return txt, ev_pct, label_val, dec_val, mise_u
-
-    return f" | Cote {cote_us}", None, "Neutre", dec_val, 0.0
-
-
-def niveau_prudence(proba_pct, nb_alertes_sante, label_val="Neutre", alerte_grave=False, donnees_completes=True):
-    if not donnees_completes:
-        return "PRUDENT (données partielles)"
-    if alerte_grave:
-        return "PRUDENT (alerte blessure)"
-    if "Cote courte" in label_val:
-        return "PRUDENT (cote courte)"
-    if proba_pct >= 72 and nb_alertes_sante == 0:
-        return "ELEVE"
-    if proba_pct >= 56 and nb_alertes_sante <= 1:
-        return "MODERE"
-    return "PRUDENT"
-
-
-def _construire_entree_foot(ev, label_comp, slug, events_comp, n_derniers):
-    ev_id = str(ev.get("id") or "")
-    start_str = str(ev.get("start_time") or ev.get("date") or "")
-    h_info, a_info = _normaliser_home_away(ev)
-    h_nom = h_info.get("short_name") or h_info.get("name") or "Home"
-    a_nom = a_info.get("short_name") or a_info.get("name") or "Away"
-
-    st_h = stats_foot_detail(
-        h_info.get("id", ""), team_name=h_nom, league_slug=slug,
-        season_year=SAISON_FOOT, n_derniers=n_derniers, events_override=events_comp,
-    )
-    st_a = stats_foot_detail(
-        a_info.get("id", ""), team_name=a_nom, league_slug=slug,
-        season_year=SAISON_FOOT, n_derniers=n_derniers, events_override=events_comp,
-    )
-
-    donnees_completes = st_h["a_historique"] or st_a["a_historique"]
-
-    lam_h = max((st_h["bp_home"] + st_a["bc_away"]) / 2, 0.35)
-    lam_a = max((st_a["bp_away"] + st_h["bc_home"]) / 2, 0.35)
-    p_h, p_n, p_a, p_ov25, p_un25 = simuler_poisson_foot(lam_h, lam_a)
-
-    options = [
-        (f"Victoire {h_nom}", p_h, h_nom),
-        ("Match nul", p_n, None),
-        (f"Victoire {a_nom}", p_a, a_nom),
-    ]
-    choix, prob, _ = max(options, key=lambda x: x[1])
-
-    titres_sante = []
-    for cible in [h_nom, a_nom]:
-        autres = [x for x in [h_nom, a_nom] if x != cible]
-        titres_sante += scanner_sante_cible(cible, max_titres=2, autres_cibles=autres)
-    titres_sante = list(dict.fromkeys(titres_sante))[:3]
-
-    grave = alerte_grave_detectee(titres_sante)
-    malus_sante = min(len(titres_sante) * 0.02 + (0.04 if grave else 0.0), 0.10)
-    prob_ajustee = max(0.05, prob - malus_sante)
-
-    cote_txt = ""
-    ev_val = None
-    label_val = "Neutre"
-    cote_dec = None
-    mise_u = 0.0
-    odds_obj = ev.get("odds")
-    if isinstance(odds_obj, dict) and odds_obj.get("details"):
-        cote_txt, ev_val, label_val, cote_dec, mise_u = analyser_cote_us(
-            odds_obj.get("details"), prob_ajustee, alerte_grave=grave
-        )
-
-    if not donnees_completes:
-        mise_u = 0.0
-        a_val = False
-    else:
-        a_val = ("+Valeur" in label_val)
-
-    ov_pct = round(p_ov25 * 100, 1)
-    un_pct = round(p_un25 * 100, 1)
-    if ov_pct >= un_pct:
-        buts_label = "+2.5 buts"
-        buts_proba = ov_pct
-    else:
-        buts_label = "-2.5 buts"
-        buts_proba = un_pct
-
-    buts_opt = f"{buts_label} ({buts_proba:.0f}%)"
-    focus_buts = " [Signal buts fort]" if (donnees_completes and max(ov_pct, un_pct) >= 75) else ""
-
-    proba_pct = round(prob_ajustee * 100, 1)
-    prudence = niveau_prudence(
-        proba_pct, len(titres_sante), label_val,
-        alerte_grave=grave, donnees_completes=donnees_completes
-    )
-
-    return {
-        "sport": "FOOT",
-        "competition": label_comp,
-        "fiable": donnees_completes,
-        "event_id": str(ev_id),
-        "match": f"{h_nom} vs {a_nom}",
-        "date_match": start_str[:16].replace("T", " ") if len(start_str) >= 16 else start_str[:10],
-        "detail": (
-            f"[{label_comp}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] | "
-            f"Buts: {buts_opt}{focus_buts} | Alertes 3j: {len(titres_sante)}{cote_txt}"
-        ),
-        "choix": choix,
-        "proba": proba_pct,
-        "prudence": prudence,
-        "a_valeur": a_val,
-        "ev_pct": ev_val,
-        "cote_dec": cote_dec,
-        "mise_u": mise_u,
-        "buts_choix": buts_label,
-        "buts_proba": buts_proba,
-    }, titres_sante
-
-
-def analyser_foot_competitions(competitions, equipes_ids=None, n_derniers=10, heures_max=48, mapping_ids=None):
-    vus = set()
-    resultats = []
-    alertes_globales = {}
-    stats_par_comp = {}
-    if mapping_ids is None:
-        mapping_ids = _resoudre_ids_competitions()
-
-    for comp in competitions:
-        slug = comp["slug"]
-        label_comp = comp.get("label", slug)
-        ids_cand = mapping_ids.get(slug, [slug])
-        events_comp = recuperer_evenements_competition(comp, ids_cand)
-
-        if equipes_ids:
-            for cid in ids_cand:
-                for tid in equipes_ids:
-                    sched = get_foot_schedule_cached(tid, league_slug=cid, season_year=SAISON_FOOT)
-                    for ev in _extraire_events_depuis_payload(sched):
-                        if not _event_valide_pour_competition(ev, comp):
-                            continue
-                        eid_f = str(ev.get("id") or "")
-                        if eid_f and not any(str(x.get("id")) == eid_f for x in events_comp):
-                            events_comp.append(ev)
-
-        nb_retenus = 0
-        for ev in events_comp:
-            statut = str(ev.get("status", "")).lower()
-            if statut in ("closed", "final", "post", "completed", "in_progress", "live"):
-                continue
-            ev_id = str(ev.get("id") or "")
-            cle_ev = f"{slug}_{ev_id}" if ev_id else f"{slug}_{ev.get('start_time')}_{len(vus)}"
-            if cle_ev in vus:
-                continue
-
-            start_str = str(ev.get("start_time") or ev.get("date") or "")
-            if not dans_fenetre_heures(start_str, heures_max):
-                continue
-
-            vus.add(cle_ev)
-            nb_retenus += 1
-            entree, titres_sante = _construire_entree_foot(ev, label_comp, slug, events_comp, n_derniers)
-            resultats.append(entree)
-            if titres_sante:
-                alertes_globales[entree["match"]] = titres_sante
-
-        stats_par_comp[label_comp] = f"{nb_retenus} (bruts: {len(events_comp)})"
-
-    return resultats, alertes_globales, stats_par_comp
-
-
-def analyser_tennis(heures_max=48):
-    atp_rk = {
-        " ".join(p["name"].lower().split()): p["rank"]
-        for p in tn.get_rankings(tour="atp").get("data", {}).get("rankings", [])
-    }
-    wta_rk = {
-        " ".join(p["name"].lower().split()): p["rank"]
-        for p in tn.get_rankings(tour="wta").get("data", {}).get("rankings", [])
-    }
-
-    sb = tn.get_scoreboard()
-    simples_fiables = []
-    simples_nc = []
-    alertes_tennis = {}
-
-    tous_joueurs = []
-    for t in sb.get("data", {}).get("tournaments", []):
-        for d in t.get("draws", []):
-            for m in d.get("matches", []):
-                for c in m.get("competitors", []):
-                    nm = c.get("name", "")
-                    if nm and nm != "TBD":
-                        tous_joueurs.append(nm)
-
-    for t in sb.get("data", {}).get("tournaments", []):
-        t_name = t.get("name")
-        for d in t.get("draws", []):
-            draw_name = d.get("name", "")
-            if "Doubles" in draw_name:
-                continue
-
-            victoires_tournoi = {}
-            for m in d.get("matches", []):
-                if m.get("status") == "closed":
-                    res = m.get("result", "")
-                    if " bt " in res:
-                        gagnant = res.split(" bt ")[0].strip()
-                        victoires_tournoi[gagnant] = victoires_tournoi.get(gagnant, 0) + 1
-
-            for m in d.get("matches", []):
-                if m.get("status") != "not_started":
-                    continue
-                date_m = str(m.get("date", ""))
-                if not dans_fenetre_heures(date_m, heures_max):
-                    continue
-
-                comps = m.get("competitors", [])
-                if len(comps) != 2:
-                    continue
-                j1, j2 = comps[0].get("name", ""), comps[1].get("name", "")
-                if j1 == "TBD" or j2 == "TBD":
-                    continue
-
-                rk_map = atp_rk if "Men" in draw_name else wta_rk
-                r1 = trouver_rang(j1, rk_map)
-                r2 = trouver_rang(j2, rk_map)
-
-                v1 = sum(v for k, v in victoires_tournoi.items() if j1.lower() in k.lower())
-                v2 = sum(v for k, v in victoires_tournoi.items() if j2.lower() in k.lower())
-
-                donnees_completes = (r1 is not None and r2 is not None)
-                eff_r1 = r1 if r1 is not None else 150
-                eff_r2 = r2 if r2 is not None else 150
-                poids_rk = 0.85 if donnees_completes else 0.35
-
-                diff = (math.log(eff_r2 + 1) - math.log(eff_r1 + 1)) * poids_rk + (v1 - v2) * 0.20
-                p1 = 1 / (1 + math.exp(-diff))
-                p2 = 1 - p1
-
-                favori, prob = (j1, p1) if p1 >= p2 else (j2, p2)
-                if donnees_completes:
-                    prob = min(max(prob, 0.50), 0.82)
-
-                titres_sante = []
-                if donnees_completes:
-                    autres = [x for x in tous_joueurs if x.lower() != favori.lower()]
-                    titres_sante = scanner_sante_cible(favori, max_titres=2, autres_cibles=autres)
-                    if titres_sante:
-                        alertes_tennis[favori] = titres_sante
-
-                grave = alerte_grave_detectee(titres_sante)
-                malus = min(len(titres_sante) * 0.03 + (0.06 if grave else 0.0), 0.12)
-                prob_ajustee = max(0.05, prob - malus)
-                proba_pct = round(prob_ajustee * 100, 1)
-
-                lbl1 = f"#{r1}" if r1 is not None else "NC"
-                lbl2 = f"#{r2}" if r2 is not None else "NC"
-                prudence = (
-                    niveau_prudence(proba_pct, len(titres_sante), alerte_grave=grave)
-                    if donnees_completes
-                    else "PRUDENT (NC)"
-                )
-
-                entree = {
-                    "sport": "TENNIS",
-                    "competition": t_name or "Tennis",
-                    "fiable": donnees_completes,
-                    "event_id": str(m.get("id", "")),
-                    "match": f"{j1} ({lbl1}) vs {j2} ({lbl2})",
-                    "date_match": date_m[:16].replace("T", " ") if len(date_m) >= 16 else date_m[:10],
-                    "detail": (
-                        f"{t_name} | {date_m[:16]} UTC | "
-                        f"V_tournoi: {j1}={v1}, {j2}={v2} | Alertes 3j: {len(titres_sante)}"
-                    ),
-                    "choix": f"Victoire {favori}",
-                    "proba": proba_pct,
-                    "prudence": prudence,
-                    "a_valeur": False,
-                    "ev_pct": None,
-                    "cote_dec": None,
-                    "mise_u": 0.0,
-                }
-                if donnees_completes:
-                    simples_fiables.append(entree)
-                else:
-                    simples_nc.append(entree)
-
-    return simples_fiables, simples_nc, alertes_tennis
-
-
-def _calculer_pnl_ligne(row):
-    statut = (row.get("statut") or "").strip().upper()
-    if statut not in ("GAGNE", "PERDU"):
-        return None
-    try:
-        mise = float(row.get("mise_u") or 0.0)
-    except Exception:
-        mise = 0.0
-    try:
-        cote = float(row.get("cote_dec") or 0.0)
-    except Exception:
-        cote = 0.0
-    if mise <= 0 or cote <= 1.0:
-        return 0.0
-    if statut == "GAGNE":
-        return round(mise * (cote - 1.0), 2)
-    return round(-mise, 2)
-
-
-def _evaluer_issue_foot(res_f, choix_l):
-    if "+2.5 buts" in choix_l:
-        return "GAGNE" if res_f["total_buts"] > 2 else "PERDU"
-    if "-2.5 buts" in choix_l:
-        return "GAGNE" if res_f["total_buts"] < 3 else "PERDU"
-    if res_f["issue"] == "DRAW":
-        return "GAGNE" if "nul" in choix_l else "PERDU"
-    gagne = any(nm and nm in choix_l for nm in res_f["noms"])
-    return "GAGNE" if gagne else "PERDU"
-
-
-def mettre_a_jour_et_sauver_historique(pistes, foot_res, competitions, mapping_ids=None):
-    champs = [
-        "date_analyse", "sport", "event_id", "match", "date_match",
-        "choix", "proba", "prudence", "cote_dec", "mise_u", "pnl_u", "statut"
-    ]
-    lignes_existantes = []
-    cles_deja_enregistrees = set()
-
-    if os.path.exists(FICHIER_HISTORIQUE):
-        try:
-            with open(FICHIER_HISTORIQUE, "r", newline="", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                if reader.fieldnames:
-                    for row in reader:
-                        if not any((v or "").strip() for v in row.values()):
-                            continue
-                        row["statut"] = (row.get("statut") or "EN_ATTENTE").strip().upper()
-                        lignes_existantes.append(row)
-                        cle = f"{row.get('sport')}_{row.get('event_id')}_{row.get('choix')}"
-                        cles_deja_enregistrees.add(cle)
-        except Exception:
-            lignes_existantes = []
-
-    vainqueurs_tennis_par_id = {}
-    matchs_tennis_clos = []
-    try:
-        sb = tn.get_scoreboard()
-        for t in sb.get("data", {}).get("tournaments", []):
-            for d in t.get("draws", []):
-                for m in d.get("matches", []):
-                    if m.get("status") == "closed":
-                        res = m.get("result", "")
-                        mid = str(m.get("id", ""))
-                        joueurs = [
-                            c.get("name", "").strip().lower()
-                            for c in m.get("competitors", [])
-                            if c.get("name")
-                        ]
-                        if " bt " in res:
-                            gagnant = res.split(" bt ")[0].strip().lower()
-                            if mid:
-                                vainqueurs_tennis_par_id[mid] = gagnant
-                            if len(joueurs) == 2:
-                                matchs_tennis_clos.append({
-                                    "vainqueur": gagnant,
-                                    "joueurs": joueurs,
-                                })
-    except Exception:
-        pass
-
-    resultats_foot_clos = {}
-    liste_foot_clos = []
-    if mapping_ids is None:
-        mapping_ids = _resoudre_ids_competitions()
-
-    for comp in competitions:
-        try:
-            for ev in recuperer_evenements_competition(comp, mapping_ids.get(comp["slug"], [comp["slug"]])):
-                if str(ev.get("status", "")).lower() in ("closed", "final", "post", "completed"):
-                    eid = str(ev.get("id", ""))
-                    h_info, a_info = _normaliser_home_away(ev)
-                    s0, s1 = h_info.get("score"), a_info.get("score")
-                    if s0 is not None and s1 is not None:
-                        i0, i1 = int(float(s0)), int(float(s1))
-                        total_buts = i0 + i1
-                        h_noms = {
-                            str(h_info.get(k, "")).strip().lower()
-                            for k in ("name", "short_name", "abbreviation")
-                            if h_info.get(k)
-                        }
-                        a_noms = {
-                            str(a_info.get(k, "")).strip().lower()
-                            for k in ("name", "short_name", "abbreviation")
-                            if a_info.get(k)
-                        }
-                        if i0 == i1:
-                            entry_res = {
-                                "issue": "DRAW",
-                                "noms": set(),
-                                "h_noms": h_noms,
-                                "a_noms": a_noms,
-                                "total_buts": total_buts,
-                            }
-                        else:
-                            gagnant_obj = h_info if i0 > i1 else a_info
-                            noms = {
-                                str(gagnant_obj.get(k, "")).strip().lower()
-                                for k in ("name", "short_name", "abbreviation")
-                                if gagnant_obj.get(k)
-                            }
-                            entry_res = {
-                                "issue": "WIN",
-                                "noms": noms,
-                                "h_noms": h_noms,
-                                "a_noms": a_noms,
-                                "total_buts": total_buts,
-                            }
-                        if eid:
-                            resultats_foot_clos[eid] = entry_res
-                        liste_foot_clos.append(entry_res)
-        except Exception:
-            pass
-
-    for row in lignes_existantes:
-        if row.get("statut") == "EN_ATTENTE":
-            sp = row.get("sport")
-            eid = str(row.get("event_id", ""))
-            choix_l = row.get("choix", "").lower()
-            match_l = row.get("match", "").lower()
-
-            if sp == "TENNIS":
-                if eid and eid in vainqueurs_tennis_par_id:
-                    vainq = vainqueurs_tennis_par_id[eid]
-                    row["statut"] = "GAGNE" if (vainq and vainq in choix_l) else "PERDU"
-                else:
-                    for mc in matchs_tennis_clos:
-                        j_a, j_b = mc["joueurs"]
-                        if j_a in match_l and j_b in match_l:
-                            row["statut"] = "GAGNE" if mc["vainqueur"] in choix_l else "PERDU"
-                            break
-            elif sp == "FOOT":
-                res_f = resultats_foot_clos.get(eid)
-                if not res_f and " vs " in match_l:
-                    for rf in liste_foot_clos:
-                        h_ok = any(n and n in match_l for n in rf["h_noms"])
-                        a_ok = any(n and n in match_l for n in rf["a_noms"])
-                        if h_ok and a_ok:
-                            res_f = rf
-                            break
-                if res_f:
-                    row["statut"] = _evaluer_issue_foot(res_f, choix_l)
-
-        pnl = _calculer_pnl_ligne(row)
-        row["pnl_u"] = "" if pnl is None else f"{pnl:+.2f}"
-
-    maintenant = datetime.now().strftime("%Y-%m-%d %H:%M")
-    a_enregistrer = [p for p in pistes if p.get("fiable", True)]
-    for f in foot_res:
-        if f.get("fiable", True) and f.get("buts_choix") and f.get("buts_proba") is not None:
-            a_enregistrer.append({
-                "sport": "FOOT",
-                "event_id": f["event_id"],
-                "match": f["match"],
-                "date_match": f["date_match"],
-                "choix": f["buts_choix"],
-                "proba": f["buts_proba"],
-                "prudence": "MODERE" if f["buts_proba"] >= 75 else "PRUDENT",
-                "cote_dec": "",
-                "mise_u": 0.0,
-            })
-
-    for p in a_enregistrer:
-        cle = f"{p['sport']}_{p['event_id']}_{p['choix']}"
-        if cle not in cles_deja_enregistrees:
-            lignes_existantes.append({
-                "date_analyse": maintenant,
-                "sport": p["sport"],
-                "event_id": p["event_id"],
-                "match": p["match"],
-                "date_match": p["date_match"],
-                "choix": p["choix"],
-                "proba": str(p["proba"]),
-                "prudence": p["prudence"],
-                "cote_dec": "" if p.get("cote_dec") is None else str(p.get("cote_dec")),
-                "mise_u": str(p.get("mise_u", 0.0)),
-                "pnl_u": "",
-                "statut": "EN_ATTENTE",
-            })
-            cles_deja_enregistrees.add(cle)
-
-    try:
-        os.makedirs(os.path.dirname(FICHIER_HISTORIQUE) or ".", exist_ok=True)
-        with open(FICHIER_HISTORIQUE, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=champs)
-            writer.writeheader()
-            for r in lignes_existantes:
-                writer.writerow({k: r.get(k, "") for k in champs})
-    except Exception:
-        pass
-
-    def resume_filtre(predicat):
-        sous = [r for r in lignes_existantes if predicat(r) and r.get("statut") in ("GAGNE", "PERDU")]
-        ok = [r for r in sous if r.get("statut") == "GAGNE"]
-        pct = (len(ok) / len(sous) * 100) if sous else 0.0
-        return f"{len(ok)}/{len(sous)} ({pct:.1f}%)"
-
-    verifies = [r for r in lignes_existantes if r.get("statut") in ("GAGNE", "PERDU")]
-    gagnes = [r for r in verifies if r.get("statut") == "GAGNE"]
-    en_attente = [r for r in lignes_existantes if r.get("statut") == "EN_ATTENTE"]
-    taux = (len(gagnes) / len(verifies) * 100) if verifies else 0.0
-
-    mises_engagees = 0.0
-    pnl_total = 0.0
-    for r in verifies:
-        try:
-            m = float(r.get("mise_u") or 0.0)
-        except Exception:
-            m = 0.0
-        try:
-            p_val = float(r.get("pnl_u") or 0.0)
-        except Exception:
-            p_val = 0.0
-        if m > 0:
-            mises_engagees += m
-            pnl_total += p_val
-
-    roi_pct = (pnl_total / mises_engagees * 100.0) if mises_engagees > 0 else 0.0
-
-    return {
-        "total": len(lignes_existantes),
-        "en_attente": len(en_attente),
-        "verifies": len(verifies),
-        "gagnes": len(gagnes),
-        "taux": round(taux, 1),
-        "mises_engagees": round(mises_engagees, 2),
-        "pnl_total": round(pnl_total, 2),
-        "roi_pct": round(roi_pct, 1),
-        "bilan_foot": resume_filtre(lambda r: r.get("sport") == "FOOT" and "2.5 buts" not in r.get("choix", "")),
-        "bilan_buts": resume_filtre(lambda r: r.get("sport") == "FOOT" and "2.5 buts" in r.get("choix", "")),
-        "bilan_tennis": resume_filtre(lambda r: r.get("sport") == "TENNIS"),
-    }
-
-
-def appeler_ia_gratuite(prompt_texte):
-    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    if or_key:
-        try:
-            r = _HTTP_SESSION.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {or_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "openrouter/free",
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Tu es un analyste sportif concis en français. "
-                                "Synthétise forme, blessures détectées et risques "
-                                "sans jamais garantir de résultat."
-                            ),
-                        },
-                        {"role": "user", "content": prompt_texte},
-                    ],
-                    "max_tokens": 500,
-                },
-                timeout=20,
-            )
-            if r.status_code == 200:
-                txt = r.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-                if txt.strip():
-                    return txt.strip()
-        except Exception:
-            pass
-
-    gm_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if gm_key:
-        try:
-            url = (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"gemini-2.5-flash:generateContent?key={gm_key}"
-            )
-            r = _HTTP_SESSION.post(
-                url,
-                headers={"Content-Type": "application/json"},
-                json={
-                    "contents": [{"parts": [{"text": prompt_texte}]}],
-                    "generationConfig": {"maxOutputTokens": 500},
-                },
-                timeout=20,
-            )
-            if r.status_code == 200:
-                parts = (
-                    r.json()
-                    .get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [])
-                )
-                txt = "".join(p.get("text", "") for p in parts).strip()
-                if txt:
-                    return txt
-        except Exception:
-            pass
-
-    return None
-
-
-def generer_synthese(pistes, alertes_sante):
-    lignes_pistes = [
-        f"- [{p['sport']}] {p['match']} -> {p['choix']} ({p['proba']}%, niveau {p['prudence']}) | {p['detail']}"
-        for p in pistes[:6]
-    ]
-    lignes_sante = [
-        f"- {cible} : {' // '.join(titres)}"
-        for cible, titres in alertes_sante.items()
-    ]
-
-    prompt = (
-        "Analyse ces pronostics statistiques et les alertes blessures récentes (3 jours) :\n"
-        "PISTES :\n" + "\n".join(lignes_pistes) + "\n\n"
-        "ALERTES SANTE RECENTES :\n" + ("\n".join(lignes_sante) if lignes_sante else "Aucune alerte récente détectée.") + "\n\n"
-        "Rédige un bilan court en français : points forts, impact des blessures et niveau de prudence."
-    )
-
-    rep_ia = appeler_ia_gratuite(prompt)
-    if rep_ia:
-        return rep_ia
-
-    lignes = ["(Synthese locale — renseigne GEMINI_API_KEY ou OPENROUTER_API_KEY pour le texte IA)"]
-    for p in pistes[:6]:
-        mise_str = f" | Mise: {p['mise_u']:.2f}u" if p.get("mise_u", 0.0) > 0 else ""
-        lignes.append(f"• [{p['prudence']}] {p['match']} -> {p['choix']} ({p['proba']}%{mise_str})")
-    for cible, titres in alertes_sante.items():
-        lignes.append(f"• Sante {cible} : {titres[0]}")
-    return "\n".join(lignes)
-
-
-def executer_analyse():
-    global _DERNIER_RAPPORT
-    print(f"Analyse en cours (fenetre: {FENETRE_HEURES}h)...", flush=True)
-    mapping_ids = _resoudre_ids_competitions()
-    foot_res, alertes_f, stats_comp = analyser_foot_competitions(
-        COMPETITIONS_CIBLES,
-        equipes_ids=EQUIPES_FOOT_IDS,
-        n_derniers=N_DERNIERS_MATCHS,
-        heures_max=FENETRE_HEURES,
-        mapping_ids=mapping_ids,
-    )
-    t_simples_ok, t_simples_nc, alertes_t = analyser_tennis(heures_max=FENETRE_HEURES)
-
-    foot_complets = sorted([x for x in foot_res if x.get("fiable", True)], key=lambda x: x["proba"], reverse=True)
-    foot_partiels = sorted([x for x in foot_res if not x.get("fiable", True)], key=lambda x: x["proba"], reverse=True)
-    tous_matchs_foot = sorted(foot_complets + foot_partiels, key=lambda x: x["proba"], reverse=True)
-
-    toutes_simples_tennis = sorted(t_simples_ok + t_simples_nc, key=lambda x: x["proba"], reverse=True)
-    principaux_complets = sorted(foot_complets + t_simples_ok, key=lambda x: x["proba"], reverse=True)
-
-    top_sur = sorted(tous_matchs_foot + toutes_simples_tennis, key=lambda x: x["proba"], reverse=True)
-    toutes_alertes = filtrer_alertes_uniques({**alertes_f, **alertes_t})
-
-    bilan = mettre_a_jour_et_sauver_historique(
-        principaux_complets,
-        foot_res,
-        COMPETITIONS_CIBLES,
-        mapping_ids=mapping_ids,
-    )
-    synthese = generer_synthese(top_sur or foot_partiels, toutes_alertes)
-
-    _DERNIER_RAPPORT = {
-        "mis_a_jour": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "stats_comp": stats_comp,
-        "top_sur": top_sur[:10],
-        "foot": tous_matchs_foot,
-        "tennis": toutes_simples_tennis,
-        "alertes": toutes_alertes,
-        "bilan": bilan,
-        "synthese": synthese,
-    }
-    return _DERNIER_RAPPORT
-
-
-# =====================================================================
-# APPLICATION FLASK POUR GUNCORN (gunicorn app:app sur Render)
-# =====================================================================
-app = Flask(__name__, static_folder="statique", static_url_path="/statique")
-
-_HTML_PAGE = """<!doctype html>
-<html lang="fr">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BetPulse Pro</title>
-  <style>
-    body { font-family: Arial, sans-serif; margin: 16px; background: #0f172a; color: #e2e8f0; }
-    h1, h2 { color: #38bdf8; }
-    .card { background: #1e293b; padding: 12px 14px; border-radius: 8px; margin-bottom: 10px; }
-    .meta { color: #94a3b8; font-size: 0.9em; }
-    a { color: #38bdf8; }
-    pre { white-space: pre-wrap; background: #1e293b; padding: 12px; border-radius: 8px; }
-  </style>
-</head>
-<body>
-  <h1>BetPulse Pro</h1>
-  <p class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }} — <a href="/refresh">Actualiser maintenant</a> · <a href="/api/analyse">JSON</a></p>
-
-  <h2>Bilan historique</h2>
-  <div class="card">
-    Total suivis : {{ r.bilan.get("total", 0) }} | En attente : {{ r.bilan.get("en_attente", 0) }} | Vérifiés : {{ r.bilan.get("verifies", 0) }} | Gagnés : {{ r.bilan.get("gagnes", 0) }} ({{ r.bilan.get("taux", 0) }}%)<br>
-    Mises : {{ r.bilan.get("mises_engagees", 0) }}u | PnL : {{ r.bilan.get("pnl_total", 0) }}u | ROI : {{ r.bilan.get("roi_pct", 0) }}%
-  </div>
-
-  <h2>Top pronostics</h2>
-  {% for it in r.top_sur %}
-  <div class="card">
-    <strong>[{{ it.sport }}] {{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong>{% if it.mise_u %} | Mise: {{ it.mise_u }}u{% endif %}<br>
-    <span class="meta">{{ it.match }} ({{ it.date_match }}) — {{ it.detail }}</span>
-  </div>
-  {% else %}
-  <div class="card">Aucun match disponible sur cette fenêtre.</div>
-  {% endfor %}
-
-  <h2>Synthèse</h2>
-  <pre>{{ r.synthese }}</pre>
-</body>
-</html>
-"""
-
-
-@app.route("/health")
-def health():
-    return "ok", 200
-
-
-@app.route("/api/analyse")
-def api_analyse():
-    if not _DERNIER_RAPPORT["mis_a_jour"]:
-        executer_analyse()
-    return jsonify(_DERNIER_RAPPORT)
-
-
-@app.route("/refresh")
-def refresh():
-    executer_analyse()
-    return render_template_string(_HTML_PAGE, r=_DERNIER_RAPPORT)
-
-
-@app.route("/")
-def index():
-    if not _DERNIER_RAPPORT["mis_a_jour"]:
-        try:
-            executer_analyse()
-        except Exception as e:
-            _DERNIER_RAPPORT["synthese"] = f"Erreur lors de l'analyse : {e}"
-    return render_template_string(_HTML_PAGE, r=_DERNIER_RAPPORT)
-
-
-if __name__ == "__main__":
-    executer_analyse()
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+        "a_historique": a_
