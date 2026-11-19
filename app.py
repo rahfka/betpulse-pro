@@ -9,6 +9,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, jsonify, redirect, render_template_string, url_for
@@ -32,6 +33,8 @@ def _charger_module_sport(nom_francais, nom_anglais):
 bt = _charger_module_sport("compétences_sportives.paris", "sports_skills.betting")
 fb = _charger_module_sport("compétences_sportives.football", "sports_skills.football")
 tn = _charger_module_sport("compétences_sportives.tennis", "sports_skills.tennis")
+
+TZ_PARIS = ZoneInfo("Europe/Paris")
 
 
 @dataclass(frozen=True)
@@ -200,9 +203,16 @@ def _parse_date_utc(date_str):
         if len(s) == 10 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
             return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
+
+
+def _formater_date_locale(date_str):
+    dt = _parse_date_utc(date_str)
+    if dt is None:
+        return str(date_str or "")[:16].replace("T", " ")
+    return dt.astimezone(TZ_PARIS).strftime("%Y-%m-%d %H:%M")
 
 
 def _est_match_a_venir_dans_fenetre(ev, heures_max):
@@ -392,7 +402,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "fiable": fiable,
         "event_id": ev_id,
         "match": f"{h_nom} vs {a_nom}",
-        "date_match": start_str[:16].replace("T", " "),
+        "date_match": _formater_date_locale(start_str),
         "detail": (
             f"[{label_comp} | {statut_raw}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] "
             f"| Buts: {buts_label} ({buts_proba:.0f}%)"
@@ -527,7 +537,7 @@ def analyser_tennis(heures_max=48):
                     "fiable": complet,
                     "event_id": str(m.get("id", "")),
                     "match": f"{j1} (#{r1 or 'NC'}) vs {j2} (#{r2 or 'NC'})",
-                    "date_match": str(m.get("date", ""))[:16].replace("T", " "),
+                    "date_match": _formater_date_locale(str(m.get("date", ""))),
                     "detail": f"{t_name} | Alertes 3j: {len(sante)}",
                     "choix": f"Victoire {favori}",
                     "proba": proba_pct,
@@ -580,7 +590,7 @@ def mettre_a_jour_historique(items):
         except Exception:
             pass
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    now_str = datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M")
     for p in items:
         cle = f"{p['sport']}_{p['event_id']}_{p['choix']}"
         if cle not in cles:
@@ -632,7 +642,7 @@ def executer_analyse():
         ) or "Aucun match à venir dans les prochaines 48h."
 
         _DERNIER_RAPPORT = {
-            "mis_a_jour": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "mis_a_jour": datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M %Z"),
             "stats_comp": stats_comp,
             "apercu_bruts": apercu_bruts,
             "top_sur": top_sur,
@@ -668,7 +678,7 @@ _HTML_PAGE = """<!doctype html>
   <form method="post" action="/refresh" style="display:inline;">
     <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }} —</span>
     <button type="submit">Actualiser maintenant</button>
-    <span class="meta">· <a href="/api/analyse">JSON</a></span>
+    <span class="meta">· <a href="/api/analyse">JSON</a> · <a href="/api/debug-foot">Debug Foot</a></span>
   </form>
 
   <h2>Couverture Foot</h2>
@@ -737,6 +747,29 @@ def api_analyse():
     if not _DERNIER_RAPPORT["mis_a_jour"]:
         executer_analyse()
     return jsonify(_DERNIER_RAPPORT)
+
+
+@app.route("/api/debug-foot")
+def api_debug_foot():
+    fonctions = [n for n in dir(fb) if not n.startswith("_") and callable(getattr(fb, n, None))]
+    sched = get_foot_schedule_cached("160", "ligue-1", CFG.saison_foot)
+    evs = _extraire_events(sched)
+    echantillon = [
+        {
+            "id": ev.get("id"),
+            "status": ev.get("status"),
+            "date": ev.get("start_time") or ev.get("date"),
+            "home": (_normaliser_home_away(ev)[0].get("name")),
+            "away": (_normaliser_home_away(ev)[1].get("name")),
+        }
+        for ev in evs[:5]
+    ]
+    return jsonify({
+        "module": getattr(fb, "__name__", str(fb)),
+        "fonctions_disponibles": fonctions,
+        "nb_events_psg": len(evs),
+        "echantillon_psg": echantillon,
+    })
 
 
 @app.route("/refresh", methods=["POST"])
