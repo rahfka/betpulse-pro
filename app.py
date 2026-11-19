@@ -1,11 +1,13 @@
 import csv
 import importlib
 import inspect
+import json
 import math
 import os
 import re
 import sys
 import threading
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -68,6 +70,7 @@ def _resoudre_chemin_historique():
 
 
 FICHIER_HISTORIQUE = _resoudre_chemin_historique()
+FICHIER_RAPPORT = "/tmp/rapport.json"
 
 COMPETITIONS_CIBLES = [
     {"slug": "ligue-1", "label": "Ligue 1", "mots": ("ligue 1", "ligue-1", "fra.1", "france"), "equipes": ["160", "174", "176", "166"]},
@@ -86,6 +89,8 @@ STATUTS_TERMINES_OU_EN_COURS = STATUTS_TERMINES | {"in_progress", "live"}
 _CACHE_FOOT_SCHED = {}
 _CACHE_SANTE = {}
 _ANALYSE_LOCK = threading.Lock()
+_ANALYSE_EN_COURS = False
+
 _DERNIER_RAPPORT = {
     "mis_a_jour": None,
     "stats_comp": {},
@@ -104,6 +109,24 @@ _HTTP_HEADERS = {
         "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
     )
 }
+
+
+def _charger_rapport_disque():
+    global _DERNIER_RAPPORT
+    try:
+        if os.path.exists(FICHIER_RAPPORT):
+            with open(FICHIER_RAPPORT, "r", encoding="utf-8") as f:
+                _DERNIER_RAPPORT = json.load(f)
+    except Exception:
+        pass
+
+
+def _sauvegarder_rapport_disque():
+    try:
+        with open(FICHIER_RAPPORT, "w", encoding="utf-8") as f:
+            json.dump(_DERNIER_RAPPORT, f, ensure_ascii=False)
+    except Exception:
+        pass
 
 
 def _cache_get(cache_dict, cle):
@@ -346,7 +369,6 @@ def _requete_rss(requete_brute, max_titres=2):
     url = f"https://news.google.com/rss/search?q={q}&hl=fr&gl=FR&ceid=FR:fr"
     titres = []
     try:
-        # On utilise requests.get au lieu de _HTTP_SESSION pour être thread-safe
         r = requests.get(url, headers=_HTTP_HEADERS, timeout=CFG.timeout_http)
         if r.status_code == 200:
             root = ET.fromstring(r.text)
@@ -365,9 +387,7 @@ def scanner_sante_cible(cible, max_titres=2):
     if cached is not None:
         return list(cached)
 
-    # Une seule requête pour limiter le temps d'exécution
     res = _requete_rss(f'"{cible}" (blessure OR forfait OR incertain OR absent) when:3d', max_titres)
-
     _cache_set(_CACHE_SANTE, cle, res)
     return list(res)
 
@@ -421,7 +441,6 @@ def analyser_foot_competitions(competitions, heures_max=48):
 
     aujourdhui = datetime.now(timezone.utc).date()
 
-    # --- ÉTAPE 1 : Récupérer les scoreboards (matchs à venir) en parallèle ---
     taches_sb = []
     for comp in competitions:
         for delta in range(3):
@@ -435,14 +454,13 @@ def analyser_foot_competitions(competitions, heures_max=48):
         except Exception:
             return []
 
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         res_sb = list(ex.map(charger_sb, taches_sb))
 
     events_upcoming_par_slug = {c["slug"]: [] for c in competitions}
     for i, (slug, _) in enumerate(taches_sb):
         events_upcoming_par_slug[slug].extend(res_sb[i])
 
-    # --- ÉTAPE 2 : Récupérer les historiques en parallèle ---
     taches_hist = []
     for comp in competitions:
         slug = comp["slug"]
@@ -462,14 +480,13 @@ def analyser_foot_competitions(competitions, heures_max=48):
         except Exception:
             return []
 
-    with ThreadPoolExecutor(max_workers=20) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         res_hist = list(ex.map(charger_hist, taches_hist))
 
     events_hist_par_slug = {c["slug"]: [] for c in competitions}
     for i, (tid, slug) in enumerate(taches_hist):
         events_hist_par_slug[slug].extend(res_hist[i])
 
-    # --- ÉTAPE 3 : Construire les pronostics ---
     def analyser_comp(comp):
         slug = comp["slug"]
         label_comp = comp["label"]
@@ -504,7 +521,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
 
         return label_comp, res_comp, alertes_comp, nb_clos, len(events_comp), apercu_comp
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         res_comps = list(ex.map(analyser_comp, competitions))
 
     for label_comp, res_comp, alertes_comp, nb_clos, total_events, apercu_comp in res_comps:
@@ -588,7 +605,6 @@ def analyser_tennis(heures_max=48):
 
 
 def _enrichir_sante_top(top_items):
-    """Scanne la santé UNIQUEMENT pour les N meilleurs pronostics."""
     if not top_items:
         return {}
     
@@ -607,7 +623,7 @@ def _enrichir_sante_top(top_items):
         except Exception:
             return nom, []
 
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=5) as ex:
         for nom, titres in ex.map(scanner, equipes_a_scanner):
             if titres:
                 alertes_globales[nom] = titres
@@ -700,8 +716,11 @@ def mettre_a_jour_historique(items):
 
 
 def executer_analyse():
-    global _DERNIER_RAPPORT
+    global _DERNIER_RAPPORT, _ANALYSE_EN_COURS
     with _ANALYSE_LOCK:
+        if _ANALYSE_EN_COURS:
+            return _DERNIER_RAPPORT
+        _ANALYSE_EN_COURS = True
         print(f"Analyse en cours (fenetre: {CFG.fenetre_heures}h)...", flush=True)
         
         try:
@@ -722,7 +741,6 @@ def executer_analyse():
         tennis_sorted = sorted(tennis_res, key=lambda x: x["proba"], reverse=True)
         top_sur = sorted(foot_sorted + tennis_sorted, key=lambda x: x["proba"], reverse=True)[:10]
         
-        # Publication d'un rapport rapide sans les blessures
         _DERNIER_RAPPORT = {
             "mis_a_jour": datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M %Z"),
             "stats_comp": stats_comp,
@@ -735,7 +753,8 @@ def executer_analyse():
             "synthese": "",
         }
         
-        # Enrichissement blessures (seulement top 10)
+        _sauvegarder_rapport_disque()
+
         try:
             alertes_sante = _enrichir_sante_top(top_sur)
             _DERNIER_RAPPORT["alertes"] = {**_DERNIER_RAPPORT["alertes"], **alertes_sante}
@@ -749,7 +768,9 @@ def executer_analyse():
             for x in _DERNIER_RAPPORT["top_sur"][:8]
         ) or "Aucun match à venir dans les prochaines 48h."
 
+        _sauvegarder_rapport_disque()
         print("Analyse terminée et rapport mis à jour.", flush=True)
+        _ANALYSE_EN_COURS = False
         return _DERNIER_RAPPORT
 
 
@@ -956,14 +977,15 @@ def api_debug_foot():
 
 @app.route("/refresh", methods=["POST"])
 def refresh():
-    executer_analyse()
+    global _DERNIER_RAPPORT
+    _DERNIER_RAPPORT["mis_a_jour"] = None
+    threading.Thread(target=executer_analyse, daemon=True).start()
     return redirect(url_for("index"))
 
 
 @app.route("/")
 def index():
     if not _DERNIER_RAPPORT["mis_a_jour"]:
-        # Écran d'attente pour éviter de faire planter Gunicorn au démarrage
         return render_template_string("""
         <!doctype html>
         <html><head>
@@ -988,14 +1010,17 @@ def index():
 
 
 def _lancer_analyse_background():
+    time.sleep(2)  # Laisse Gunicorn finir de s'initialiser
     try:
         executer_analyse()
     except Exception as e:
         print(f"[ERREUR FATALE] analyse background: {e}", flush=True)
 
 
-# Lance l'analyse dès le démarrage du serveur, en arrière-plan
-threading.Thread(target=_lancer_analyse_background, daemon=True).start()
+_charger_rapport_disque()
+
+if not _DERNIER_RAPPORT["mis_a_jour"]:
+    threading.Thread(target=_lancer_analyse_background, daemon=True).start()
 
 
 if __name__ == "__main__":
