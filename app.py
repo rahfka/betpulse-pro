@@ -16,26 +16,27 @@ import sports_skills.tennis as tn
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 
 # =====================================================================
-# CONFIGURATION GENERALE (Toutes compétitions + Tennis, fenêtre 48h)
+# CONFIGURATION GENERALE (Clés optionnelles + Toutes compétitions 48h)
 # =====================================================================
 _DOSSIER_SCRIPT = os.path.dirname(os.path.abspath(__file__))
 FICHIER_HISTORIQUE = os.path.join(_DOSSIER_SCRIPT, "historique_paris.csv")
 
-# Optionnel : tu peux laisser vide et definir OPENROUTER_API_KEY / GEMINI_API_KEY
-# dans les variables d'environnement Render (recommande) ou en local.
-OPENROUTER_API_KEY_DEFAULT = ""
-GEMINI_API_KEY_DEFAULT = ""
+# Optionnel : tu peux coller une clé ici pour tester ou laisser vide et utiliser
+# les variables d'environnement Render (OPENROUTER_API_KEY / GEMINI_API_KEY).
+OPENROUTER_API_KEY_LOCAL = ""
+GEMINI_API_KEY_LOCAL = ""
 
 COMPETITIONS_FOOT = [
-    {"slug": "ligue-1", "label": "Ligue 1", "season_year": "2026"},
-    {"slug": "premier-league", "label": "Premier League", "season_year": "2026"},
-    {"slug": "la-liga", "label": "La Liga", "season_year": "2026"},
-    {"slug": "bundesliga", "label": "Bundesliga", "season_year": "2026"},
-    {"slug": "portuguese-liga", "label": "Liga Portugal", "season_year": "2026"},
-    {"slug": "uefa-champions-league", "label": "Ligue des Champions", "season_year": "2026"},
-    {"slug": "uefa-europa-league", "label": "Ligue Europa", "season_year": "2026"},
+    {"slug": "ligue-1", "label": "Ligue 1", "aliases": {"ligue-1", "fra.1", "french ligue 1", "ligue 1"}},
+    {"slug": "premier-league", "label": "Premier League", "aliases": {"premier-league", "eng.1", "english premier league", "premier league"}},
+    {"slug": "la-liga", "label": "La Liga", "aliases": {"la-liga", "esp.1", "spanish la liga", "la liga"}},
+    {"slug": "bundesliga", "label": "Bundesliga", "aliases": {"bundesliga", "ger.1", "german bundesliga"}},
+    {"slug": "portuguese-liga", "label": "Liga Portugal", "aliases": {"portuguese-liga", "primeira-liga", "por.1", "portuguese liga", "liga portugal", "primeira liga"}},
+    {"slug": "uefa-champions-league", "label": "Ligue des Champions", "aliases": {"uefa-champions-league", "champions-league", "uefa.champions", "uefa champions league", "ligue des champions"}},
+    {"slug": "uefa-europa-league", "label": "Ligue Europa", "aliases": {"uefa-europa-league", "europa-league", "uefa.europa", "uefa europa league", "ligue europa"}},
 ]
 
+SAISON_FALLBACK_YEAR = "2026"
 N_DERNIERS_MATCHS = 10
 FENETRE_HEURES = 48
 MAX_SCAN_SANTE_MATCHS = 25
@@ -46,7 +47,8 @@ MISE_MAX_UNITES = 2.0
 SEUIL_EV_POSITIF_PCT = 3.0
 
 _CACHE_FOOT_SCHED = {}
-_CACHE_SAISON_ACTIVE = {}
+_CACHE_SEASON_ID = {}
+_CACHE_COMP_EVENTS = {}
 _DERNIER_SNAPSHOT = {
     "maj": None,
     "principaux": [],
@@ -71,37 +73,116 @@ _DERNIER_SNAPSHOT = {
 
 
 def _get_openrouter_key():
-    return (os.getenv("OPENROUTER_API_KEY") or OPENROUTER_API_KEY_DEFAULT or "").strip()
+    return (os.getenv("OPENROUTER_API_KEY") or OPENROUTER_API_KEY_LOCAL or "").strip()
 
 
 def _get_gemini_key():
-    return (os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY_DEFAULT or "").strip()
+    return (os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY_LOCAL or "").strip()
 
 
-def resoudre_saison_foot(league_slug, season_fallback="2026"):
-    cle = str(league_slug)
-    if cle in _CACHE_SAISON_ACTIVE:
-        return _CACHE_SAISON_ACTIVE[cle]
+def resoudre_season_id_foot(league_slug):
+    cle = str(league_slug).strip()
+    if cle in _CACHE_SEASON_ID:
+        return _CACHE_SEASON_ID[cle]
 
-    saison = str(season_fallback)
+    season_id = f"{cle}-{SAISON_FALLBACK_YEAR}"
     if hasattr(fb, "get_current_season"):
         try:
             res = fb.get_current_season(competition_id=cle)
-            data = res.get("data", {}) if isinstance(res, dict) else {}
-            sid = str(data.get("season_id") or data.get("id") or data.get("year") or "").strip()
-            if sid:
-                m = re.search(r"(20\d{2})", sid)
-                saison = m.group(1) if m else sid
+            data = res.get("data", res) if isinstance(res, dict) else {}
+            if isinstance(data, dict):
+                candidat = (
+                    data.get("season_id")
+                    or (data.get("season", {}) if isinstance(data.get("season"), dict) else {}).get("id")
+                    or data.get("id")
+                )
+                if candidat:
+                    season_id = str(candidat).strip()
         except Exception:
             pass
 
-    _CACHE_SAISON_ACTIVE[cle] = saison
-    return saison
+    _CACHE_SEASON_ID[cle] = season_id
+    return season_id
 
 
-def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year=None):
-    saison = season_year or resoudre_saison_foot(league_slug)
-    cle = (str(team_id), str(league_slug), str(saison))
+def _extraire_evenements_depuis_reponse(payload):
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data", payload)
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for cle in ("events", "matches", "fixtures", "games", "schedules"):
+        val = data.get(cle)
+        if isinstance(val, list):
+            return val
+    return []
+
+
+def _match_appartient_competition(ev, comp_cfg):
+    slug = comp_cfg["slug"].lower()
+    aliases = {a.lower() for a in comp_cfg.get("aliases", set())} | {slug, comp_cfg.get("label", "").lower()}
+
+    for champ in ("league_slug", "competition_id", "competition", "league"):
+        val = ev.get(champ)
+        if isinstance(val, dict):
+            for k in ("slug", "id", "name", "short_name", "abbreviation"):
+                v = str(val.get(k) or "").strip().lower()
+                if v in aliases:
+                    return True
+        elif val:
+            v = str(val).strip().lower()
+            if v in aliases or slug in v:
+                return True
+
+    sid = str(ev.get("season_id") or "").strip().lower()
+    if sid.startswith(slug):
+        return True
+    return False
+
+
+def recuperer_evenements_competition(comp_cfg):
+    slug = comp_cfg["slug"]
+    if slug in _CACHE_COMP_EVENTS:
+        return _CACHE_COMP_EVENTS[slug]
+
+    season_id = resoudre_season_id_foot(slug)
+    evenements = []
+
+    if hasattr(fb, "get_season_schedule"):
+        try:
+            res_sched = fb.get_season_schedule(season_id=season_id)
+            evenements.extend(_extraire_evenements_depuis_reponse(res_sched))
+        except Exception:
+            pass
+
+    if hasattr(fb, "get_daily_schedule"):
+        now_utc = datetime.now(timezone.utc)
+        for offset_jours in (0, 1, 2):
+            jour = (now_utc + timedelta(days=offset_jours)).strftime("%Y-%m-%d")
+            try:
+                res_day = fb.get_daily_schedule(date=jour)
+                for ev in _extraire_evenements_depuis_reponse(res_day):
+                    if _match_appartient_competition(ev, comp_cfg):
+                        evenements.append(ev)
+            except Exception:
+                pass
+
+    dedup = {}
+    for idx, ev in enumerate(evenements):
+        if not isinstance(ev, dict):
+            continue
+        eid = str(ev.get("id") or ev.get("event_id") or f"idx_{idx}")
+        dedup[eid] = ev
+
+    liste_finale = list(dedup.values())
+    _CACHE_COMP_EVENTS[slug] = liste_finale
+    return liste_finale
+
+
+def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year=SAISON_FALLBACK_YEAR):
+    cle = (str(team_id), str(league_slug), str(season_year))
     if cle not in _CACHE_FOOT_SCHED:
         try:
             _CACHE_FOOT_SCHED[cle] = fb.get_team_schedule(
@@ -113,64 +194,6 @@ def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year=None):
         except Exception:
             _CACHE_FOOT_SCHED[cle] = {"data": {"events": []}}
     return _CACHE_FOOT_SCHED[cle]
-
-
-def _extraire_evenements_depuis_reponse(payload):
-    if not isinstance(payload, dict):
-        return []
-    data = payload.get("data", payload)
-    if not isinstance(data, dict):
-        return []
-    for cle in ("events", "matches", "fixtures", "games"):
-        val = data.get(cle)
-        if isinstance(val, list):
-            return val
-    return []
-
-
-def recuperer_evenements_competition(league_slug, season_year=None):
-    saison = season_year or resoudre_saison_foot(league_slug)
-    evenements = []
-
-    for nom_fn in ("get_competition_schedule", "get_league_schedule", "get_scoreboard", "get_events"):
-        fn = getattr(fb, nom_fn, None)
-        if callable(fn):
-            for kwargs in (
-                {"competition_id": league_slug, "league_slug": league_slug, "season_year": saison},
-                {"league_slug": league_slug, "season_year": saison},
-                {"competition_id": league_slug},
-            ):
-                try:
-                    evs = _extraire_evenements_depuis_reponse(fn(**kwargs))
-                    if evs:
-                        return evs
-                except TypeError:
-                    continue
-                except Exception:
-                    continue
-
-    team_ids = []
-    if hasattr(fb, "get_season_teams"):
-        try:
-            res_teams = fb.get_season_teams(
-                competition_id=league_slug,
-                league_slug=league_slug,
-                season_year=saison,
-            )
-            data_t = res_teams.get("data", {}) if isinstance(res_teams, dict) else {}
-            teams_list = data_t.get("teams") or data_t.get("competitors") or []
-            for t in teams_list:
-                tid = t.get("id") or (t.get("team", {}) if isinstance(t.get("team"), dict) else {}).get("id")
-                if tid:
-                    team_ids.append(str(tid))
-        except Exception:
-            pass
-
-    for tid in dict.fromkeys(team_ids):
-        sched = get_foot_schedule_cached(tid, league_slug=league_slug, season_year=saison)
-        evenements.extend(_extraire_evenements_depuis_reponse(sched))
-
-    return evenements
 
 
 def poisson_prob(k, lam):
@@ -199,6 +222,27 @@ def trouver_rang(nom, rk_map):
         if len(nom_l) >= 5 and (nom_l in k or k in nom_l):
             return v
     return None
+
+
+def _extraire_date_evenement(ev):
+    for champ in ("start_time", "date", "commence_time", "startDate"):
+        if ev.get(champ):
+            return str(ev.get(champ))
+    return ""
+
+
+def _est_match_a_venir(ev):
+    statut = str(ev.get("status") or "").strip().lower()
+    if isinstance(ev.get("status"), dict):
+        statut = str(ev["status"].get("type") or ev["status"].get("name") or ev["status"].get("state") or "").strip().lower()
+    return statut in ("not_started", "scheduled", "pre", "upcoming", "status_scheduled")
+
+
+def _est_match_clos(ev):
+    statut = str(ev.get("status") or "").strip().lower()
+    if isinstance(ev.get("status"), dict):
+        statut = str(ev["status"].get("type") or ev["status"].get("name") or ev["status"].get("state") or "").strip().lower()
+    return statut in ("closed", "final", "post", "completed", "finished", "status_final")
 
 
 def dans_fenetre_heures(date_str, heures_max):
@@ -350,14 +394,29 @@ def moyenne_ponderee(valeurs, defaut):
     return sum(v * p for v, p in zip(valeurs, poids)) / sum(poids)
 
 
-def stats_foot_detail(team_id, league_slug="ligue-1", season_year=None, n_derniers=10):
-    sched = get_foot_schedule_cached(team_id, league_slug=league_slug, season_year=season_year)
-    events = _extraire_evenements_depuis_reponse(sched)
-    joues = [ev for ev in events if ev.get("status") == "closed"]
-    joues.sort(key=lambda ev: str(ev.get("start_time", "")))
+def _extraire_score_numerique(val):
+    if val is None:
+        return None
+    if isinstance(val, dict):
+        val = val.get("value") or val.get("score")
+    if val is None:
+        return None
+    try:
+        return int(float(str(val).strip()))
+    except Exception:
+        return None
 
-    a_venir = [ev for ev in events if ev.get("status") in ("not_started", "scheduled")]
-    a_venir.sort(key=lambda ev: str(ev.get("start_time", "")))
+
+def stats_foot_detail(team_id, league_slug="ligue-1", season_year=SAISON_FALLBACK_YEAR, n_derniers=10, events_comp=None):
+    events = []
+    if team_id:
+        sched = get_foot_schedule_cached(team_id, league_slug=league_slug, season_year=season_year)
+        events = _extraire_evenements_depuis_reponse(sched)
+    if not events and events_comp:
+        events = events_comp
+
+    joues = [ev for ev in events if _est_match_clos(ev)]
+    joues.sort(key=lambda ev: _extraire_date_evenement(ev))
 
     bp_all, bc_all = [], []
     bp_home, bc_home = [], []
@@ -368,15 +427,20 @@ def stats_foot_detail(team_id, league_slug="ligue-1", season_year=None, n_dernie
         comps = ev.get("competitors", [])
         moi = adv = None
         mon_qual = None
+
         for c in comps:
-            tid = str(c.get("team", {}).get("id"))
-            sc = c.get("score")
+            t_obj = c.get("team", {}) if isinstance(c.get("team"), dict) else {}
+            tid = str(t_obj.get("id") or c.get("id") or "")
+            sc = _extraire_score_numerique(c.get("score"))
             if sc is None:
                 continue
-            sc = int(sc)
-            if tid == str(team_id):
+            if team_id and tid == str(team_id):
                 moi = sc
-                mon_qual = c.get("qualifier")
+                mon_qual = str(c.get("qualifier") or c.get("homeAway") or "").lower()
+            elif moi is None and adv is None:
+                # Si team_id absent, prend le premier compétiteur comme référence
+                moi = sc
+                mon_qual = str(c.get("qualifier") or c.get("homeAway") or "").lower()
             else:
                 adv = sc
 
@@ -406,7 +470,6 @@ def stats_foot_detail(team_id, league_slug="ligue-1", season_year=None, n_dernie
         "bc_home": moyenne_ponderee(bc_home, bc_base),
         "bp_away": moyenne_ponderee(bp_away, bp_base),
         "bc_away": moyenne_ponderee(bc_away, bc_base),
-        "a_venir": a_venir,
     }
 
 
@@ -499,6 +562,25 @@ def niveau_prudence(proba_pct, nb_alertes_sante, label_val="Neutre", alerte_grav
     return "PRUDENT"
 
 
+def _extraire_home_away(ev):
+    h_info = {}
+    a_info = {}
+    for c in ev.get("competitors", []):
+        qual = str(c.get("qualifier") or c.get("homeAway") or "").strip().lower()
+        t_obj = c.get("team") if isinstance(c.get("team"), dict) else c
+        if qual == "home":
+            h_info = t_obj or {}
+        elif qual == "away":
+            a_info = t_obj or {}
+    if (not h_info or not a_info) and len(ev.get("competitors", [])) >= 2:
+        c0, c1 = ev["competitors"][0], ev["competitors"][1]
+        if not h_info:
+            h_info = c0.get("team") if isinstance(c0.get("team"), dict) else c0
+        if not a_info:
+            a_info = c1.get("team") if isinstance(c1.get("team"), dict) else c1
+    return h_info or {}, a_info or {}
+
+
 def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=48):
     vus_evenements = set()
     matchs_candidats = []
@@ -506,48 +588,45 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=48):
     for comp in competitions:
         slug = comp["slug"]
         label_comp = comp.get("label", slug)
-        season_year = comp.get("season_year")
+        evenements = recuperer_evenements_competition(comp)
 
-        evenements = recuperer_evenements_competition(slug, season_year=season_year)
         for ev in evenements:
-            if ev.get("status") not in ("not_started", "scheduled"):
+            if not _est_match_a_venir(ev):
                 continue
-            ev_id = str(ev.get("id", ""))
-            cle_ev = f"{slug}_{ev_id}" if ev_id else f"{slug}_{ev.get('start_time', '')}_{len(vus_evenements)}"
+            ev_id = str(ev.get("id") or ev.get("event_id") or "")
+            cle_ev = f"{slug}_{ev_id}" if ev_id else f"{slug}_{_extraire_date_evenement(ev)}_{len(vus_evenements)}"
             if cle_ev in vus_evenements:
                 continue
 
-            start_str = str(ev.get("start_time", ""))
+            start_str = _extraire_date_evenement(ev)
             if not dans_fenetre_heures(start_str, heures_max):
                 continue
 
-            comps = {c.get("qualifier"): c.get("team") for c in ev.get("competitors", [])}
-            h_info = comps.get("home") or {}
-            a_info = comps.get("away") or {}
+            h_info, a_info = _extraire_home_away(ev)
             if not h_info or not a_info:
                 continue
 
             vus_evenements.add(cle_ev)
-            matchs_candidats.append((slug, label_comp, season_year, ev, h_info, a_info))
+            matchs_candidats.append((slug, label_comp, evenements, ev, h_info, a_info))
 
-    matchs_candidats.sort(key=lambda item: str(item[3].get("start_time", "")))
+    matchs_candidats.sort(key=lambda item: _extraire_date_evenement(item[3]))
 
     resultats = []
     alertes_globales = {}
     scans_sante_effectues = 0
 
-    for slug, label_comp, season_year, ev, h_info, a_info in matchs_candidats:
-        ev_id = str(ev.get("id", ""))
-        start_str = str(ev.get("start_time", ""))
+    for slug, label_comp, evenements_comp, ev, h_info, a_info in matchs_candidats:
+        ev_id = str(ev.get("id") or ev.get("event_id") or "")
+        start_str = _extraire_date_evenement(ev)
 
-        h_nom = h_info.get("short_name") or h_info.get("name") or "Home"
-        a_nom = a_info.get("short_name") or a_info.get("name") or "Away"
+        h_nom = h_info.get("short_name") or h_info.get("shortDisplayName") or h_info.get("name") or h_info.get("displayName") or "Home"
+        a_nom = a_info.get("short_name") or a_info.get("shortDisplayName") or a_info.get("name") or a_info.get("displayName") or "Away"
 
         st_h = stats_foot_detail(
-            h_info.get("id", ""), league_slug=slug, season_year=season_year, n_derniers=n_derniers
+            h_info.get("id", ""), league_slug=slug, n_derniers=n_derniers, events_comp=evenements_comp
         )
         st_a = stats_foot_detail(
-            a_info.get("id", ""), league_slug=slug, season_year=season_year, n_derniers=n_derniers
+            a_info.get("id", ""), league_slug=slug, n_derniers=n_derniers, events_comp=evenements_comp
         )
 
         lam_h = max((st_h["bp_home"] + st_a["bc_away"]) / 2, 0.35)
@@ -871,32 +950,30 @@ def mettre_a_jour_et_sauver_historique(pistes, foot_res, competitions):
 
     resultats_foot_clos = {}
     for comp in competitions:
-        slug = comp["slug"]
-        season_year = comp.get("season_year")
         try:
-            events = recuperer_evenements_competition(slug, season_year=season_year)
+            events = recuperer_evenements_competition(comp)
             for ev in events:
-                if ev.get("status") == "closed":
-                    eid = str(ev.get("id", ""))
+                if _est_match_clos(ev):
+                    eid = str(ev.get("id") or ev.get("event_id") or "")
                     comps = ev.get("competitors", [])
                     if len(comps) == 2:
                         c0, c1 = comps[0], comps[1]
-                        s0, s1 = c0.get("score"), c1.get("score")
+                        s0 = _extraire_score_numerique(c0.get("score"))
+                        s1 = _extraire_score_numerique(c1.get("score"))
                         if s0 is not None and s1 is not None:
-                            i0, i1 = int(s0), int(s1)
-                            total_buts = i0 + i1
-                            if i0 == i1:
+                            total_buts = s0 + s1
+                            if s0 == s1:
                                 resultats_foot_clos[eid] = {
                                     "issue": "DRAW",
                                     "noms": set(),
                                     "total_buts": total_buts,
                                 }
                             else:
-                                gagnant_comp = c0 if i0 > i1 else c1
-                                t_obj = gagnant_comp.get("team", {})
+                                gagnant_comp = c0 if s0 > s1 else c1
+                                t_obj = gagnant_comp.get("team", {}) if isinstance(gagnant_comp.get("team"), dict) else gagnant_comp
                                 noms = {
                                     str(t_obj.get(k, "")).strip().lower()
-                                    for k in ("name", "short_name", "abbreviation")
+                                    for k in ("name", "short_name", "abbreviation", "displayName")
                                     if t_obj.get(k)
                                 }
                                 resultats_foot_clos[eid] = {
@@ -1122,7 +1199,9 @@ def generer_synthese(pistes, alertes_sante):
 
 def executer_analyse_complete(heures_max=FENETRE_HEURES):
     _CACHE_FOOT_SCHED.clear()
-    _CACHE_SAISON_ACTIVE.clear()
+    _CACHE_SEASON_ID.clear()
+    _CACHE_COMP_EVENTS.clear()
+
     foot_res, alertes_f = analyser_tous_matchs_foot(
         COMPETITIONS_FOOT,
         n_derniers=N_DERNIERS_MATCHS,
