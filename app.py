@@ -44,10 +44,10 @@ TZ_PARIS = ZoneInfo("Europe/Paris")
 @dataclass(frozen=True)
 class Config:
     saison_foot: str = os.getenv("SAISON_FOOT", "2026").strip() or "2026"
-    n_derniers_matchs: int = int(os.getenv("N_DERNIERS_MATCHS", "10"))
+    n_derniers_matchs: int = int(os.getenv("N_DERNIERS_MATCHS", "8"))
     fenetre_heures: int = int(os.getenv("FENETRE_HEURES", "48"))
-    timeout_http: int = int(os.getenv("TIMEOUT_HTTP", "4"))
-    cache_ttl_sec: int = int(os.getenv("CACHE_TTL_SEC", "600"))
+    timeout_http: int = int(os.getenv("TIMEOUT_HTTP", "3"))
+    cache_ttl_sec: int = int(os.getenv("CACHE_TTL_SEC", "900"))
 
 
 CFG = Config()
@@ -73,14 +73,14 @@ FICHIER_HISTORIQUE = _resoudre_chemin_historique()
 FICHIER_RAPPORT = "/tmp/rapport.json"
 
 COMPETITIONS_CIBLES = [
-    {"slug": "ligue-1", "label": "Ligue 1", "mots": ("ligue 1", "ligue-1", "fra.1", "france"), "equipes": ["160", "174", "176", "166"]},
-    {"slug": "la-liga", "label": "Liga Espagnole", "mots": ("la liga", "laliga", "la-liga", "esp.1", "spain"), "equipes": ["86", "83", "81", "89"]},
-    {"slug": "bundesliga", "label": "Bundesliga", "mots": ("bundesliga", "ger.1", "germany"), "equipes": ["132", "124", "167", "129"]},
-    {"slug": "portuguese-liga", "label": "Liga Portugaise", "mots": ("liga portugal", "primeira liga", "portuguese-liga", "por.1", "portugal"), "equipes": ["1929", "1927", "1930", "1936"]},
-    {"slug": "premier-league", "label": "Premier League", "mots": ("premier league", "premier-league", "eng.1", "england"), "equipes": ["364", "359", "360", "382"]},
-    {"slug": "serie-a", "label": "Serie A", "mots": ("serie a", "serie-a", "ita.1", "italy"), "equipes": ["111", "110", "103", "114"]},
-    {"slug": "uefa-champions-league", "label": "Ligue des Champions", "mots": ("champions league", "champions-league", "uefa.champions", "ucl"), "equipes": ["160", "86", "83", "364", "132", "110"]},
-    {"slug": "uefa-europa-league", "label": "Europa League", "mots": ("europa league", "europa-league", "uefa.europa", "uel"), "equipes": ["176", "174", "360", "111", "1929", "129"]},
+    {"slug": "ligue-1", "label": "Ligue 1", "mots": ("ligue 1", "ligue-1", "fra.1", "france"), "equipes": ["160", "174", "176"]},
+    {"slug": "la-liga", "label": "Liga Espagnole", "mots": ("la liga", "laliga", "la-liga", "esp.1", "spain"), "equipes": ["86", "83", "81"]},
+    {"slug": "bundesliga", "label": "Bundesliga", "mots": ("bundesliga", "ger.1", "germany"), "equipes": ["132", "124", "167"]},
+    {"slug": "portuguese-liga", "label": "Liga Portugaise", "mots": ("liga portugal", "primeira liga", "portuguese-liga", "por.1", "portugal"), "equipes": ["1929", "1927", "1930"]},
+    {"slug": "premier-league", "label": "Premier League", "mots": ("premier league", "premier-league", "eng.1", "england"), "equipes": ["364", "359", "360"]},
+    {"slug": "serie-a", "label": "Serie A", "mots": ("serie a", "serie-a", "ita.1", "italy"), "equipes": ["111", "110", "103"]},
+    {"slug": "uefa-champions-league", "label": "Ligue des Champions", "mots": ("champions league", "champions-league", "uefa.champions", "ucl"), "equipes": ["160", "86", "83", "364"]},
+    {"slug": "uefa-europa-league", "label": "Europa League", "mots": ("europa league", "europa-league", "uefa.europa", "uel"), "equipes": ["176", "174", "360", "111"]},
 ]
 
 STATUTS_TERMINES = {"closed", "final", "post", "completed", "finished", "ft", "aet", "pen", "status_final", "status_post"}
@@ -288,7 +288,7 @@ def moyenne_ponderee(valeurs, defaut):
     return sum(v * p for v, p in zip(valeurs, poids)) / sum(poids)
 
 
-def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=10):
+def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8):
     events = list(events_override or [])
     joues = [ev for ev in events if str(ev.get("status", "")).lower() in STATUTS_TERMINES]
     joues.sort(key=lambda ev: str(ev.get("start_time") or ev.get("date") or ""))
@@ -375,7 +375,7 @@ def _requete_rss(requete_brute, max_titres=2):
         r = requests.get(url, headers=_HTTP_HEADERS, timeout=CFG.timeout_http)
         if r.status_code == 200:
             root = ET.fromstring(r.text)
-            for item in root.findall(".//item")[:5]:
+            for item in root.findall(".//item")[:4]:
                 t = (item.findtext("title") or "").strip()
                 if t:
                     titres.append(t)
@@ -456,14 +456,14 @@ def analyser_foot_competitions(competitions, heures_max=48):
         except Exception:
             return []
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         res_sb = list(ex.map(charger_sb, taches_sb))
 
     events_upcoming_par_slug = {c["slug"]: [] for c in competitions}
     for i, (slug, _) in enumerate(taches_sb):
         events_upcoming_par_slug[slug].extend(res_sb[i])
 
-    taches_hist = []
+    taches_hist_set = set()
     for comp in competitions:
         slug = comp["slug"]
         eqs = set(comp.get("equipes") or [])
@@ -474,7 +474,9 @@ def analyser_foot_competitions(competitions, heures_max=48):
             if a.get("id"):
                 eqs.add(str(a["id"]))
         for tid in eqs:
-            taches_hist.append((tid, slug))
+            taches_hist_set.add((str(tid), slug))
+
+    taches_hist = list(taches_hist_set)
 
     def charger_hist(args):
         tid, slug = args
@@ -612,13 +614,11 @@ def _enrichir_sante_top(top_items):
     if not top_items:
         return {}
 
-    equipes_a_scanner = []
-    vus = set()
+    equipes_a_scanner = set()
     for it in top_items[:8]:
         for nom in it.get("equipes", []):
-            if nom and nom not in vus:
-                vus.add(nom)
-                equipes_a_scanner.append(nom)
+            if nom:
+                equipes_a_scanner.add(nom)
 
     alertes_globales = {}
     penalites = {}
@@ -630,7 +630,7 @@ def _enrichir_sante_top(top_items):
             return nom, []
 
     with ThreadPoolExecutor(max_workers=6) as ex:
-        for nom, titres in ex.map(scanner, equipes_a_scanner[:8]):
+        for nom, titres in ex.map(scanner, equipes_a_scanner):
             if titres:
                 alertes_globales[nom] = titres
                 penalites[nom] = len(titres)
@@ -795,24 +795,93 @@ def executer_analyse():
 
 app = Flask(__name__, static_folder="statique", static_url_path="/statique")
 
+_HTML_HOME = """<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BetPulse Pro — Accueil</title>
+  <style>
+    :root { --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8; --green: #10b981; --border: #334155; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 24px; background: var(--bg); color: var(--text); }
+    .container { max-width: 980px; margin: 0 auto; }
+    .hero { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); border: 1px solid var(--border); border-radius: 14px; padding: 32px; margin-bottom: 24px; }
+    .badge-status { display: inline-block; padding: 5px 12px; border-radius: 999px; font-size: 0.8em; font-weight: bold; background: rgba(56, 189, 248, 0.15); color: var(--accent); margin-bottom: 12px; }
+    .badge-ready { background: rgba(16, 185, 129, 0.15); color: var(--green); }
+    h1 { margin: 0 0 10px 0; color: var(--accent); font-size: 2rem; }
+    p { color: var(--muted); line-height: 1.6; margin: 0 0 20px 0; }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+    .btn { background: var(--accent); color: #0f172a; border: none; padding: 11px 18px; border-radius: 8px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; font-size: 0.95rem; }
+    .btn-secondary { background: var(--card); color: var(--text); border: 1px solid var(--border); }
+    .btn:hover { opacity: 0.9; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+    .box { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
+    .box h3 { margin: 0 0 8px 0; font-size: 1rem; color: var(--text); }
+    .box .val { font-size: 1.4rem; font-weight: bold; color: var(--accent); margin-bottom: 6px; }
+    .box .sub { font-size: 0.85rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="hero">
+      <span class="badge-status {% if r.mis_a_jour %}badge-ready{% endif %}">
+        {% if en_cours %}Analyse en cours en arrière-plan{% elif r.mis_a_jour %}Données prêtes{% else %}Initialisation{% endif %}
+      </span>
+      <h1>BetPulse Pro</h1>
+      <p>
+        Suivi des rencontres Football et Tennis sur une fenêtre de {{ fenetre_heures }}h, estimation probabiliste par modèle de Poisson et classement ATP/WTA, et contrôle des alertes blessures récentes.
+      </p>
+      <div class="actions">
+        <a href="/app" class="btn">Accéder aux matchs &amp; pronostics</a>
+        <a href="/bilan" class="btn btn-secondary">Voir le bilan &amp; la synthèse</a>
+        <form method="post" action="/refresh" style="margin: 0;">
+          <button type="submit" class="btn btn-secondary">Lancer une actualisation</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="box">
+        <h3>Dernière mise à jour</h3>
+        <div class="val">{{ r.mis_a_jour or "En attente" }}</div>
+        <div class="sub">Cache actif : {{ cache_ttl }}s</div>
+      </div>
+      <div class="box">
+        <h3>Matchs à venir ({{ fenetre_heures }}h)</h3>
+        <div class="val">{{ (r.foot|length) + (r.tennis|length) }}</div>
+        <div class="sub">{{ r.foot|length }} Football · {{ r.tennis|length }} Tennis</div>
+      </div>
+      <div class="box">
+        <h3>Historique vérifié</h3>
+        <div class="val">{{ r.get("bilan", {}).get("taux", 0.0) }}%</div>
+        <div class="sub">{{ r.get("bilan", {}).get("gagnes", 0) }} / {{ r.get("bilan", {}).get("verifies", 0) }} validés</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
 _HTML_LOADING = """<!doctype html>
 <html lang="fr">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BetPulse Pro — Analyse en cours…</title>
+  <title>BetPulse Pro — Préparation des données…</title>
   <style>
-    body { background: #0f172a; color: #e2e8f0; font-family: sans-serif; text-align: center; padding: 80px; }
+    body { background: #0f172a; color: #e2e8f0; font-family: sans-serif; text-align: center; padding: 80px 20px; }
     h1 { color: #38bdf8; }
     p { color: #94a3b8; }
-    .loader { border: 4px solid #334155; border-top: 4px solid #38bdf8; border-radius: 50%; width: 42px; height: 42px; animation: spin 0.9s linear infinite; margin: 24px auto; }
+    a { color: #38bdf8; text-decoration: none; display: inline-block; margin-top: 16px; }
+    .loader { border: 4px solid #334155; border-top: 4px solid #38bdf8; border-radius: 50%; width: 42px; height: 42px; animation: spin 1s linear infinite; margin: 24px auto; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
   <h1>BetPulse Pro</h1>
   <div class="loader"></div>
-  <p id="status-msg">Chargement rapide des matchs et analyses…</p>
+  <p id="status-msg">Récupération des matchs et calcul des probabilités en cours…</p>
+  <a href="/">← Retour à l'accueil</a>
   <script>
     async function verifierEtat() {
       try {
@@ -820,12 +889,12 @@ _HTML_LOADING = """<!doctype html>
         if (res.ok) {
           const data = await res.json();
           if (data.ready) {
-            window.location.replace("/");
+            window.location.replace("/app");
             return;
           }
         }
       } catch (e) {}
-      setTimeout(verifierEtat, 1000);
+      setTimeout(verifierEtat, 2000);
     }
     verifierEtat();
   </script>
@@ -842,41 +911,45 @@ _HTML_PAGE = """<!doctype html>
   <style>
     :root { --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --accent: #38bdf8; --green: #10b981; --orange: #f59e0b; --red: #ef4444; }
     body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--text); }
-    h1 { color: var(--accent); margin: 0; }
+    h1, h2 { color: var(--accent); margin-bottom: 15px; }
     .container { max-width: 1200px; margin: 0 auto; }
-    .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 22px; padding-bottom: 14px; border-bottom: 1px solid #334155; }
+    .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #334155; }
     .header .meta { color: #94a3b8; font-size: 0.9em; }
-    button, .btn { background: var(--accent); color: var(--bg); border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; }
-    button:hover, .btn:hover { opacity: 0.85; }
-    details.onglet { background: var(--card); border-radius: 8px; margin-bottom: 14px; overflow: hidden; border: 1px solid #293548; }
-    details.onglet > summary { padding: 15px 18px; cursor: pointer; font-weight: bold; font-size: 1.05em; color: var(--accent); user-select: none; list-style: none; display: flex; align-items: center; justify-content: space-between; }
-    details.onglet > summary::-webkit-details-marker { display: none; }
-    details.onglet > summary:hover { background: #273549; }
-    .onglet-body { padding: 6px 16px 18px 16px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 14px; }
-    .card { background: #162032; padding: 14px; border-radius: 8px; border-left: 4px solid var(--accent); box-shadow: 0 4px 6px rgba(0,0,0,0.12); }
+    button, .btn { background: var(--accent); color: var(--bg); border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; font-size: 0.9em; }
+    .btn-ghost { background: #1e293b; color: var(--text); border: 1px solid #334155; }
+    button:hover, .btn:hover { opacity: 0.88; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 15px; }
+    .card { background: var(--card); padding: 15px; border-radius: 8px; border-left: 4px solid var(--accent); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
     .card.ELEVE { border-left-color: var(--green); }
     .card.MODERE { border-left-color: var(--orange); }
     .card.PRUDENT { border-left-color: var(--red); }
-    .card-title { font-size: 1.05em; font-weight: bold; margin-bottom: 8px; display: flex; justify-content: space-between; gap: 8px; }
+    .card-title { font-size: 1.1em; font-weight: bold; margin-bottom: 8px; display: flex; justify-content: space-between; gap: 8px; }
     .badge { font-size: 0.75em; padding: 3px 8px; border-radius: 12px; font-weight: bold; white-space: nowrap; }
     .badge.ELEVE { background: var(--green); color: #000; }
     .badge.MODERE { background: var(--orange); color: #000; }
     .badge.PRUDENT { background: var(--red); color: #fff; }
     .card-meta { font-size: 0.85em; color: #94a3b8; margin-bottom: 8px; line-height: 1.4; }
     .card-detail { font-size: 0.8em; color: #cbd5e1; background: #0f172a; padding: 8px; border-radius: 4px; margin-top: 8px; font-family: monospace; }
-    pre { white-space: pre-wrap; background: #0f172a; padding: 15px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; margin: 0; }
-    .meta-empty { color: #94a3b8; font-size: 0.9em; }
+    details { background: var(--card); border-radius: 8px; margin-bottom: 15px; overflow: hidden; }
+    summary { padding: 15px; cursor: pointer; font-weight: bold; color: var(--accent); user-select: none; }
+    summary:hover { background: #334155; }
+    .details-content { padding: 0 15px 15px 15px; }
+    pre { white-space: pre-wrap; background: #0f172a; padding: 15px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; }
+    .stats-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px; }
+    .stat-item { background: var(--card); padding: 8px 12px; border-radius: 20px; font-size: 0.85em; }
+    .notice { background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #bae6fd; padding: 10px 14px; border-radius: 8px; margin-bottom: 18px; font-size: 0.9em; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
       <div>
-        <h1>BetPulse Pro</h1>
+        <h1 style="margin: 0;">Matchs &amp; Pronostics</h1>
         <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }}</span>
       </div>
-      <div style="display: flex; gap: 10px;">
+      <div style="display: flex; flex-wrap: wrap; gap: 8px;">
+        <a href="/" class="btn btn-ghost">Accueil</a>
+        <a href="/bilan" class="btn btn-ghost">Bilan</a>
         <form method="post" action="/refresh" style="margin: 0;">
           <button type="submit">Actualiser</button>
         </form>
@@ -885,103 +958,153 @@ _HTML_PAGE = """<!doctype html>
       </div>
     </div>
 
-    <details class="onglet" open>
-      <summary><span>🏆 Top pronostics (Foot &amp; Tennis) ({{ r.top_sur|length }})</span><span>▾</span></summary>
-      <div class="onglet-body">
-        <div class="grid">
-          {% for it in r.top_sur %}
-          <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
-            <div class="card-title">
-              <span>{{ it.choix }}</span>
-              <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
-            </div>
-            <div class="card-meta">
-              <strong>{{ it.match }}</strong><br>
-              {{ it.date_match }} — {{ it.competition }}
-            </div>
-            {% if it.detail %}
-            <div class="card-detail">{{ it.detail }}</div>
-            {% endif %}
-          </div>
-          {% else %}
-          <div class="card">Aucun pronostic disponible.</div>
-          {% endfor %}
+    {% if en_cours %}
+    <div class="notice">Mise à jour en arrière-plan en cours — les données affichées restent accessibles.</div>
+    {% endif %}
+
+    <h2>Bilan historique</h2>
+    <div class="stats-bar">
+      <span class="stat-item">Total : <strong>{{ r.get("bilan", {}).get("total", 0) }}</strong></span>
+      <span class="stat-item">En attente : <strong>{{ r.get("bilan", {}).get("en_attente", 0) }}</strong></span>
+      <span class="stat-item">Vérifiés : <strong>{{ r.get("bilan", {}).get("verifies", 0) }}</strong></span>
+      <span class="stat-item">Réussite : <strong>{{ r.get("bilan", {}).get("taux", 0.0) }}%</strong></span>
+    </div>
+
+    <h2>Couverture Foot</h2>
+    <div class="stats-bar">
+      {% for k, v in r.get("stats_comp", {}).items() %}
+        <span class="stat-item"><strong>{{ k }}</strong> : {{ v }}</span>
+      {% endfor %}
+    </div>
+
+    <h2>Top pronostics (Foot &amp; Tennis)</h2>
+    <div class="grid">
+      {% for it in r.top_sur %}
+      <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
+        <div class="card-title">
+          <span>{{ it.choix }}</span>
+          <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
+        </div>
+        <div class="card-meta">
+          <strong>{{ it.match }}</strong><br>
+          {{ it.date_match }} — {{ it.competition }}
+        </div>
+        {% if it.detail %}
+        <div class="card-detail">{{ it.detail }}</div>
+        {% endif %}
+      </div>
+      {% else %}
+      <div class="card">Aucun pronostic disponible.</div>
+      {% endfor %}
+    </div>
+
+    <h2>Matchs de Foot à venir — 48h ({{ r.foot|length }})</h2>
+    <div class="grid">
+      {% for it in r.foot %}
+      <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
+        <div class="card-title">
+          <span>{{ it.choix }}</span>
+          <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
+        </div>
+        <div class="card-meta">
+          <strong>{{ it.match }}</strong><br>
+          {{ it.date_match }}
+        </div>
+        <div class="card-detail">{{ it.detail }}</div>
+      </div>
+      {% else %}
+      <div class="card">Aucun match de foot à venir dans les prochaines 48h.</div>
+      {% endfor %}
+    </div>
+
+    <h2>Matchs de Tennis à venir — 48h ({{ r.tennis|length }})</h2>
+    <div class="grid">
+      {% for it in r.tennis %}
+      <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
+        <div class="card-title">
+          <span>{{ it.choix }}</span>
+          <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
+        </div>
+        <div class="card-meta">
+          <strong>{{ it.match }}</strong><br>
+          {{ it.date_match }} — {{ it.competition }}
         </div>
       </div>
-    </details>
+      {% else %}
+      <div class="card">Aucun match de tennis à venir dans les prochaines 48h.</div>
+      {% endfor %}
+    </div>
 
-    <details class="onglet" open>
-      <summary><span>⚽ Matchs de Foot à venir — 48h ({{ r.foot|length }})</span><span>▾</span></summary>
-      <div class="onglet-body">
-        <div class="grid">
-          {% for it in r.foot %}
-          <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
-            <div class="card-title">
-              <span>{{ it.choix }}</span>
-              <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
-            </div>
-            <div class="card-meta">
-              <strong>{{ it.match }}</strong><br>
-              {{ it.date_match }}
-            </div>
-            <div class="card-detail">{{ it.detail }}</div>
-          </div>
-          {% else %}
-          <div class="card">Aucun match de foot à venir dans les prochaines 48h.</div>
-          {% endfor %}
-        </div>
-      </div>
-    </details>
-
-    <details class="onglet" open>
-      <summary><span>🎾 Matchs de Tennis à venir — 48h ({{ r.tennis|length }})</span><span>▾</span></summary>
-      <div class="onglet-body">
-        <div class="grid">
-          {% for it in r.tennis %}
-          <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
-            <div class="card-title">
-              <span>{{ it.choix }}</span>
-              <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
-            </div>
-            <div class="card-meta">
-              <strong>{{ it.match }}</strong><br>
-              {{ it.date_match }} — {{ it.competition }}
-            </div>
-          </div>
-          {% else %}
-          <div class="card">Aucun match de tennis à venir dans les prochaines 48h.</div>
-          {% endfor %}
-        </div>
-      </div>
-    </details>
-
-    <details class="onglet">
-      <summary><span>🚑 Alertes blessures / forfaits (3j)</span><span>▾</span></summary>
-      <div class="onglet-body">
+    <details>
+      <summary>🚑 Alertes blessures / forfaits (3j)</summary>
+      <div class="details-content">
         {% for cible, titres in r.get("alertes", {}).items() %}
           <p style="margin-bottom: 10px;">
             <strong style="color: #fca5a5;">{{ cible }}</strong> :<br>
             <span style="font-size: 0.9em; color: #cbd5e1;">{{ titres | join(" | ") }}</span>
           </p>
         {% else %}
-          <span class="meta-empty">Aucune alerte récente.</span>
+          <span class="meta">Aucune alerte récente.</span>
         {% endfor %}
       </div>
     </details>
 
-    <details class="onglet">
-      <summary><span>🔍 Aperçu données brutes Foot</span><span>▾</span></summary>
-      <div class="onglet-body">
+    <details>
+      <summary>🔍 Aperçu données brutes Foot</summary>
+      <div class="details-content">
         <pre>{{ r.apercu_bruts or "Aucun événement brut." }}</pre>
       </div>
     </details>
 
-    <details class="onglet">
-      <summary><span>📋 Synthèse Textuelle</span><span>▾</span></summary>
-      <div class="onglet-body">
+    <details>
+      <summary>📋 Synthèse Textuelle</summary>
+      <div class="details-content">
         <pre>{{ r.synthese }}</pre>
       </div>
     </details>
+  </div>
+</body>
+</html>
+"""
+
+_HTML_BILAN = """<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BetPulse Pro — Bilan &amp; Synthèse</title>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 24px; background: #0f172a; color: #e2e8f0; }
+    .container { max-width: 960px; margin: 0 auto; }
+    h1, h2 { color: #38bdf8; }
+    .top-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; border-bottom: 1px solid #334155; padding-bottom: 14px; }
+    .btn { background: #38bdf8; color: #0f172a; padding: 8px 14px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 0.9rem; }
+    .btn-ghost { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; }
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .card { background: #1e293b; padding: 16px; border-radius: 8px; border: 1px solid #334155; }
+    .num { font-size: 1.4rem; font-weight: bold; color: #38bdf8; margin-top: 6px; }
+    pre { white-space: pre-wrap; background: #1e293b; padding: 16px; border-radius: 8px; border: 1px solid #334155; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="top-bar">
+      <h1 style="margin: 0;">Bilan &amp; Synthèse</h1>
+      <div style="display: flex; gap: 8px;">
+        <a href="/" class="btn btn-ghost">Accueil</a>
+        <a href="/app" class="btn">Matchs &amp; Pronostics</a>
+      </div>
+    </div>
+
+    <div class="stats">
+      <div class="card"><div>Total enregistrés</div><div class="num">{{ r.get("bilan", {}).get("total", 0) }}</div></div>
+      <div class="card"><div>En attente</div><div class="num">{{ r.get("bilan", {}).get("en_attente", 0) }}</div></div>
+      <div class="card"><div>Vérifiés</div><div class="num">{{ r.get("bilan", {}).get("verifies", 0) }}</div></div>
+      <div class="card"><div>Taux réussite</div><div class="num">{{ r.get("bilan", {}).get("taux", 0.0) }}%</div></div>
+    </div>
+
+    <h2>Synthèse textuelle</h2>
+    <pre>{{ r.synthese or "Aucune synthèse disponible pour le moment." }}</pre>
   </div>
 </body>
 </html>
@@ -1061,14 +1184,32 @@ def api_debug_foot():
 
 @app.route("/refresh", methods=["POST"])
 def refresh():
-    with _STATE_LOCK:
-        _DERNIER_RAPPORT["mis_a_jour"] = None
     _demarrer_analyse_si_besoin(0.0)
-    return redirect(url_for("index"))
+    return redirect(url_for("app_view"))
 
 
 @app.route("/")
 def index():
+    with _STATE_LOCK:
+        rapport = dict(_DERNIER_RAPPORT)
+        en_cours = _ANALYSE_EN_COURS
+
+    if not rapport.get("mis_a_jour") and not en_cours:
+        _demarrer_analyse_si_besoin(0.2)
+
+    resp = make_response(render_template_string(
+        _HTML_HOME,
+        r=rapport,
+        en_cours=en_cours,
+        fenetre_heures=CFG.fenetre_heures,
+        cache_ttl=CFG.cache_ttl_sec,
+    ), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/app")
+def app_view():
     with _STATE_LOCK:
         rapport = dict(_DERNIER_RAPPORT)
         en_cours = _ANALYSE_EN_COURS
@@ -1080,14 +1221,26 @@ def index():
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
 
-    resp = make_response(render_template_string(_HTML_PAGE, r=rapport), 200)
+    resp = make_response(render_template_string(_HTML_PAGE, r=rapport, en_cours=en_cours), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/bilan")
+def bilan_view():
+    with _STATE_LOCK:
+        rapport = dict(_DERNIER_RAPPORT)
+        en_cours = _ANALYSE_EN_COURS
+
+    if not rapport.get("mis_a_jour") and not en_cours:
+        _demarrer_analyse_si_besoin(0.0)
+
+    resp = make_response(render_template_string(_HTML_BILAN, r=rapport), 200)
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
 _charger_rapport_disque()
-if not _DERNIER_RAPPORT.get("mis_a_jour"):
-    _demarrer_analyse_si_besoin(0.5)
 
 
 if __name__ == "__main__":
