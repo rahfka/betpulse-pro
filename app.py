@@ -1,4 +1,5 @@
 import csv
+import inspect
 import math
 import os
 import re
@@ -7,7 +8,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
 import requests
-from flask import Flask, render_template_string
+from flask import Flask, redirect, render_template_string, request, url_for
 
 import sports_skills.betting as bt
 import sports_skills.football as fb
@@ -21,29 +22,31 @@ app = Flask(__name__, static_folder="static", static_url_path="/static")
 _DOSSIER_SCRIPT = os.path.dirname(os.path.abspath(__file__))
 FICHIER_HISTORIQUE = os.path.join(_DOSSIER_SCRIPT, "historique_paris.csv")
 
-# Optionnel : tu peux coller une clé ici ou laisser vide et utiliser
-# les variables d'environnement Render (OPENROUTER_API_KEY / GEMINI_API_KEY).
 OPENROUTER_API_KEY_LOCAL = ""
 GEMINI_API_KEY_LOCAL = ""
 
 COMPETITIONS_FOOT = [
     {
         "slug": "ligue-1",
+        "espn_code": "fra.1",
         "label": "Ligue 1",
         "aliases": {"ligue-1", "fra.1", "french ligue 1", "ligue 1", "ligue 1 mcdonald's"},
     },
     {
         "slug": "la-liga",
+        "espn_code": "esp.1",
         "label": "La Liga",
         "aliases": {"la-liga", "esp.1", "spanish la liga", "la liga", "laliga", "primera division"},
     },
     {
         "slug": "bundesliga",
+        "espn_code": "ger.1",
         "label": "Bundesliga",
         "aliases": {"bundesliga", "ger.1", "german bundesliga", "1. bundesliga"},
     },
     {
         "slug": "portuguese-liga",
+        "espn_code": "por.1",
         "label": "Liga Portugal",
         "aliases": {
             "portuguese-liga", "primeira-liga", "liga-portugal", "por.1",
@@ -52,16 +55,19 @@ COMPETITIONS_FOOT = [
     },
     {
         "slug": "premier-league",
+        "espn_code": "eng.1",
         "label": "Premier League",
         "aliases": {"premier-league", "eng.1", "english premier league", "premier league", "epl"},
     },
     {
         "slug": "serie-a",
+        "espn_code": "ita.1",
         "label": "Serie A",
         "aliases": {"serie-a", "ita.1", "italian serie a", "serie a"},
     },
     {
         "slug": "uefa-champions-league",
+        "espn_code": "uefa.champions",
         "label": "Ligue des Champions",
         "aliases": {
             "uefa-champions-league", "champions-league", "uefa.champions",
@@ -70,6 +76,7 @@ COMPETITIONS_FOOT = [
     },
     {
         "slug": "uefa-europa-league",
+        "espn_code": "uefa.europa",
         "label": "Ligue Europa",
         "aliases": {
             "uefa-europa-league", "europa-league", "uefa.europa",
@@ -133,81 +140,27 @@ def _appeler_avec_signatures(fn, candidats_kwargs):
     if not callable(fn):
         return None
     nom_fn = getattr(fn, "__name__", "fb_fn")
+    try:
+        sig = inspect.signature(fn)
+        params_acceptes = set(sig.parameters.keys())
+        accepte_var_kw = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+    except Exception:
+        params_acceptes = set()
+        accepte_var_kw = True
+
     for kwargs in candidats_kwargs:
+        if not accepte_var_kw and params_acceptes:
+            if not set(kwargs.keys()).issubset(params_acceptes):
+                continue
         try:
             res = fn(**kwargs)
             if res is not None:
                 return res
-        except TypeError as exc:
-            _noter_erreur_foot(f"{nom_fn} TypeError{kwargs}: {exc}")
-            continue
         except Exception as exc:
             _noter_erreur_foot(f"{nom_fn}{kwargs}: {exc}")
     return None
-
-
-def _indexer_seasons_depuis_competitions():
-    mapping = {}
-    if hasattr(fb, "get_competitions"):
-        res = _appeler_avec_signatures(fb.get_competitions, [{}])
-        data = res.get("data", res) if isinstance(res, dict) else {}
-        liste = []
-        if isinstance(data, list):
-            liste = data
-        elif isinstance(data, dict):
-            for cle in ("competitions", "leagues", "items", "data"):
-                if isinstance(data.get(cle), list):
-                    liste = data[cle]
-                    break
-        for item in liste:
-            if not isinstance(item, dict):
-                continue
-            slug = str(item.get("slug") or item.get("id") or "").strip().lower()
-            cur_season = item.get("current_season") or item.get("season") or {}
-            sid = None
-            if isinstance(cur_season, dict):
-                sid = cur_season.get("id") or cur_season.get("season_id")
-            elif cur_season:
-                sid = cur_season
-            if not sid:
-                sid = item.get("season_id")
-            if slug and sid:
-                mapping[slug] = str(sid).strip()
-    return mapping
-
-
-def resoudre_season_id_foot(league_slug):
-    cle = str(league_slug).strip().lower()
-    if cle in _CACHE_SEASON_ID:
-        return _CACHE_SEASON_ID[cle]
-
-    saisons_globales = _indexer_seasons_depuis_competitions()
-    if cle in saisons_globales and saisons_globales[cle]:
-        _CACHE_SEASON_ID[cle] = saisons_globales[cle]
-        return saisons_globales[cle]
-
-    season_id = f"{cle}-{SAISON_FALLBACK_YEAR}"
-    if hasattr(fb, "get_current_season"):
-        res = _appeler_avec_signatures(
-            fb.get_current_season,
-            [
-                {"competition_id": cle},
-                {"league_slug": cle},
-                {"slug": cle},
-            ],
-        )
-        data = res.get("data", res) if isinstance(res, dict) else {}
-        if isinstance(data, dict):
-            candidat = (
-                data.get("season_id")
-                or (data.get("season", {}) if isinstance(data.get("season"), dict) else {}).get("id")
-                or data.get("id")
-            )
-            if candidat:
-                season_id = str(candidat).strip()
-
-    _CACHE_SEASON_ID[cle] = season_id
-    return season_id
 
 
 def _extraire_evenements_depuis_reponse(payload):
@@ -234,7 +187,7 @@ def _extraire_evenements_depuis_reponse(payload):
             for item in val:
                 if not isinstance(item, dict):
                     continue
-                if any(k in item for k in ("competitors", "teams", "home_team", "away_team", "home", "away")):
+                if any(k in item for k in ("competitors", "teams", "home_team", "away_team", "home", "away", "competitions")):
                     evenements.append(item)
                 else:
                     evenements.extend(_extraire_evenements_depuis_reponse(item))
@@ -257,116 +210,135 @@ def _extraire_evenements_depuis_reponse(payload):
     return evenements
 
 
-def _match_appartient_competition(ev, comp_cfg):
-    slug = comp_cfg["slug"].lower()
-    aliases = {a.lower() for a in comp_cfg.get("aliases", set())} | {slug, comp_cfg.get("label", "").lower()}
+def _normaliser_event_espn(ev_brut, comp_cfg):
+    """Normalise un événement brut ESPN Scoreboard vers le format standard attendu."""
+    if not isinstance(ev_brut, dict):
+        return None
+    if ev_brut.get("competitors"):
+        return ev_brut
 
-    for champ in (
-        "league_slug", "competition_id", "competition", "league",
-        "competition_name", "league_name", "tournament", "category",
-        "_bloc_slug", "_bloc_id", "_bloc_name", "_bloc_short_name", "_bloc_abbreviation",
-        "_bloc_league_slug", "_bloc_competition_id",
-    ):
-        val = ev.get(champ)
-        if isinstance(val, dict):
-            for k in ("slug", "id", "name", "short_name", "abbreviation"):
-                v = str(val.get(k) or "").strip().lower()
-                if v in aliases or slug in v:
-                    return True
-        elif val:
-            v = str(val).strip().lower()
-            if v in aliases or slug in v:
-                return True
+    comps_list = ev_brut.get("competitions")
+    if not isinstance(comps_list, list) or not comps_list:
+        return None
+    comp0 = comps_list[0] if isinstance(comps_list[0], dict) else {}
+    competitors_bruts = comp0.get("competitors", [])
+    if len(competitors_bruts) < 2:
+        return None
 
-    sid = str(ev.get("season_id") or "").strip().lower()
-    if sid.startswith(slug):
-        return True
-    return False
-
-
-def _extraire_team_ids_saison(slug, season_id):
-    if not hasattr(fb, "get_season_teams"):
-        return []
-    res = _appeler_avec_signatures(
-        fb.get_season_teams,
-        [
-            {"season_id": season_id},
-            {"competition_id": slug, "season_year": SAISON_FALLBACK_YEAR},
-            {"league_slug": slug, "season_year": SAISON_FALLBACK_YEAR},
-        ],
-    )
-    data = res.get("data", res) if isinstance(res, dict) else {}
-    liste = []
-    if isinstance(data, dict):
-        for cle in ("teams", "competitors", "items"):
-            if isinstance(data.get(cle), list):
-                liste = data[cle]
-                break
-    elif isinstance(data, list):
-        liste = data
-
-    ids = []
-    for item in liste:
-        if not isinstance(item, dict):
+    competitors_norm = []
+    for c in competitors_bruts:
+        if not isinstance(c, dict):
             continue
-        t_obj = item.get("team") if isinstance(item.get("team"), dict) else item
-        tid = t_obj.get("id") or item.get("team_id") or item.get("id")
-        if tid:
-            ids.append(str(tid).strip())
-    return list(dict.fromkeys(ids))
+        t_raw = c.get("team") if isinstance(c.get("team"), dict) else {}
+        qual = str(c.get("homeAway") or c.get("qualifier") or "").lower()
+        competitors_norm.append({
+            "qualifier": qual,
+            "homeAway": qual,
+            "score": c.get("score"),
+            "team": {
+                "id": str(t_raw.get("id") or c.get("id") or ""),
+                "name": t_raw.get("displayName") or t_raw.get("name") or "",
+                "short_name": t_raw.get("shortDisplayName") or t_raw.get("name") or "",
+                "abbreviation": t_raw.get("abbreviation") or "",
+            },
+        })
+
+    status_obj = comp0.get("status") or ev_brut.get("status") or {}
+    statut_type = ""
+    if isinstance(status_obj, dict):
+        t_s = status_obj.get("type")
+        if isinstance(t_s, dict):
+            statut_type = str(t_s.get("name") or t_s.get("state") or t_s.get("description") or "")
+        else:
+            statut_type = str(t_s or status_obj.get("state") or "")
+    else:
+        statut_type = str(status_obj)
+
+    odds_norm = None
+    odds_list = comp0.get("odds")
+    if isinstance(odds_list, list) and odds_list and isinstance(odds_list[0], dict):
+        details = odds_list[0].get("details")
+        if details:
+            odds_norm = {"details": details}
+
+    return {
+        "id": str(ev_brut.get("id") or comp0.get("id") or ""),
+        "start_time": str(comp0.get("date") or ev_brut.get("date") or ""),
+        "status": statut_type,
+        "league_slug": comp_cfg["slug"],
+        "competitors": competitors_norm,
+        "odds": odds_norm,
+    }
+
+
+def _fetch_espn_scoreboard_events(comp_cfg):
+    """Récupère les matchs directement via l'endpoint public ESPN Scoreboard sur [-1j .. +2j]."""
+    espn_code = comp_cfg.get("espn_code")
+    if not espn_code:
+        return []
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+        )
+    }
+    now_utc = datetime.now(timezone.utc)
+    d_start = (now_utc - timedelta(days=1)).strftime("%Y%m%d")
+    d_end = (now_utc + timedelta(days=2)).strftime("%Y%m%d")
+    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{espn_code}/scoreboard?dates={d_start}-{d_end}"
+
+    trouves = []
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            for ev_b in data.get("events", []):
+                ev_n = _normaliser_event_espn(ev_b, comp_cfg)
+                if ev_n:
+                    trouves.append(ev_n)
+        else:
+            _noter_erreur_foot(f"ESPN {espn_code} HTTP {r.status_code}")
+    except Exception as exc:
+        _noter_erreur_foot(f"ESPN {espn_code}: {exc}")
+
+    return trouves
 
 
 def recuperer_evenements_competition(comp_cfg):
     slug = comp_cfg["slug"]
+    espn_code = comp_cfg.get("espn_code", slug)
     if slug in _CACHE_COMP_EVENTS:
         return _CACHE_COMP_EVENTS[slug]
 
-    season_id = resoudre_season_id_foot(slug)
     evenements = []
 
-    if hasattr(fb, "get_season_schedule"):
-        for sid_test in dict.fromkeys([
-            season_id,
-            f"{slug}-{SAISON_FALLBACK_YEAR}",
-            f"{slug}-2026-2027",
-            f"{slug}-2025",
-            slug,
-        ]):
-            res_sched = _appeler_avec_signatures(
-                fb.get_season_schedule,
-                [
-                    {"season_id": sid_test},
-                    {"competition_id": slug, "season_id": sid_test},
-                    {"league_slug": slug, "season_id": sid_test},
-                ],
-            )
-            evs = _extraire_evenements_depuis_reponse(res_sched)
-            if evs:
-                evenements.extend(evs)
-                break
+    # 1. Essai via sports_skills.football (toutes signatures courantes)
+    for fn_name in ("get_scoreboard", "get_matches", "get_fixtures", "get_season_schedule", "get_league_schedule"):
+        fn = getattr(fb, fn_name, None)
+        if not callable(fn):
+            continue
+        res = _appeler_avec_signatures(
+            fn,
+            [
+                {"league_slug": slug},
+                {"competition_id": slug},
+                {"league": espn_code},
+                {"league_slug": espn_code},
+                {"season_id": f"{slug}-{SAISON_FALLBACK_YEAR}"},
+                {},
+            ],
+        )
+        evs = _extraire_evenements_depuis_reponse(res)
+        if evs:
+            for ev in evs:
+                ev_n = _normaliser_event_espn(ev, comp_cfg) or ev
+                evenements.append(ev_n)
+            break
 
-    if hasattr(fb, "get_daily_schedule"):
-        now_utc = datetime.now(timezone.utc)
-        for offset_jours in (-1, 0, 1, 2):
-            jour = (now_utc + timedelta(days=offset_jours)).strftime("%Y-%m-%d")
-            res_day = _appeler_avec_signatures(
-                fb.get_daily_schedule,
-                [
-                    {"date": jour, "season_id": season_id},
-                    {"date": jour, "league_slug": slug},
-                    {"date": jour},
-                    {"day": jour},
-                ],
-            )
-            for ev in _extraire_evenements_depuis_reponse(res_day):
-                if _match_appartient_competition(ev, comp_cfg):
-                    evenements.append(ev)
-
-    if not evenements and hasattr(fb, "get_team_schedule"):
-        team_ids = _extraire_team_ids_saison(slug, season_id)
-        for tid in team_ids[:16]:
-            sched = get_foot_schedule_cached(tid, league_slug=slug, season_year=SAISON_FALLBACK_YEAR)
-            evenements.extend(_extraire_evenements_depuis_reponse(sched))
+    # 2. Fallback fiable : flux direct ESPN Scoreboard pour le championnat / coupe
+    if not evenements:
+        evenements.extend(_fetch_espn_scoreboard_events(comp_cfg))
 
     dedup = {}
     for idx, ev in enumerate(evenements):
@@ -433,33 +405,27 @@ def _extraire_date_evenement(ev):
 def _lire_statut_evenement(ev):
     statut = ev.get("status")
     if isinstance(statut, dict):
-        statut = (
-            statut.get("type")
-            or statut.get("name")
-            or statut.get("state")
-            or statut.get("detail")
-            or statut.get("shortDetail")
-            or ""
-        )
+        t_s = statut.get("type")
+        if isinstance(t_s, dict):
+            statut = t_s.get("name") or t_s.get("state") or t_s.get("description") or ""
+        else:
+            statut = (
+                t_s
+                or statut.get("name")
+                or statut.get("state")
+                or statut.get("detail")
+                or statut.get("shortDetail")
+                or ""
+            )
     return str(statut or "").strip().lower()
 
 
 def _est_match_clos(ev):
     statut = _lire_statut_evenement(ev)
-    if statut in (
-        "closed", "final", "post", "completed",
-        "finished", "status_final", "full_time", "ft", "aet", "pen"
-    ):
-        return True
-    # Si un score numérique existe déjà sur les deux équipes et que le statut n'est pas à venir
-    if statut not in ("", "not_started", "scheduled", "pre", "upcoming", "fixture"):
-        comps = ev.get("competitors", [])
-        if len(comps) >= 2:
-            s0 = _extraire_score_numerique(comps[0].get("score"))
-            s1 = _extraire_score_numerique(comps[1].get("score"))
-            if s0 is not None and s1 is not None and statut in ("end", "ended", "complete"):
-                return True
-    return False
+    return any(
+        mot in statut
+        for mot in ("closed", "final", "post", "completed", "finished", "full_time", "ft", "aet", "pen")
+    )
 
 
 def _est_match_a_venir(ev):
@@ -477,10 +443,9 @@ def dans_fenetre_heures(date_str, heures_max=FENETRE_HEURES):
     try:
         s = str(date_str).strip()
         maintenant = datetime.now(timezone.utc)
-        # Si la date est uniquement YYYY-MM-DD, on compare sur la journée calendaire UTC
         if len(s) == 10 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
             dt_jour = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            jour_debut = maintenant.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+            jour_debut = maintenant.replace(hour=0, minute=0, second=0, microsecond=0)
             jour_fin = maintenant.replace(hour=23, minute=59, second=59, microsecond=0) + timedelta(hours=heures_max)
             return jour_debut <= dt_jour <= jour_fin
 
@@ -489,7 +454,7 @@ def dans_fenetre_heures(date_str, heures_max=FENETRE_HEURES):
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         limite = maintenant + timedelta(hours=heures_max)
-        return (maintenant - timedelta(hours=12)) <= dt <= limite
+        return (maintenant - timedelta(hours=2)) <= dt <= limite
     except Exception:
         return True
 
@@ -641,11 +606,14 @@ def _extraire_score_numerique(val):
         return None
 
 
-def stats_foot_detail(team_id, league_slug="ligue-1", season_year=SAISON_FALLBACK_YEAR, n_derniers=10, events_comp=None):
+def stats_foot_detail(team_id, league_slug="ligue-1", espn_code="fra.1", season_year=SAISON_FALLBACK_YEAR, n_derniers=10, events_comp=None):
     events = []
     if team_id:
         sched = get_foot_schedule_cached(team_id, league_slug=league_slug, season_year=season_year)
         events = _extraire_evenements_depuis_reponse(sched)
+        if not events and espn_code:
+            sched2 = get_foot_schedule_cached(team_id, league_slug=espn_code, season_year=season_year)
+            events = _extraire_evenements_depuis_reponse(sched2)
     if not events and events_comp:
         events = events_comp
 
@@ -694,11 +662,11 @@ def stats_foot_detail(team_id, league_slug="ligue-1", season_year=SAISON_FALLBAC
             else:
                 d += 1
 
-    bp_base = moyenne_ponderee(bp_all, 1.25)
-    bc_base = moyenne_ponderee(bc_all, 1.25)
+    bp_base = moyenne_ponderee(bp_all, 1.30)
+    bc_base = moyenne_ponderee(bc_all, 1.20)
 
     return {
-        "forme": f"{v}V-{n}N-{d}D",
+        "forme": f"{v}V-{n}N-{d}D" if (v + n + d) > 0 else "Forme récente",
         "bp_home": moyenne_ponderee(bp_home, bp_base),
         "bc_home": moyenne_ponderee(bc_home, bc_base),
         "bp_away": moyenne_ponderee(bp_away, bp_base),
@@ -790,7 +758,7 @@ def niveau_prudence(proba_pct, nb_alertes_sante, label_val="Neutre", alerte_grav
         return "PRUDENT (cote courte)"
     if proba_pct >= 72 and nb_alertes_sante == 0:
         return "ELEVE"
-    if proba_pct >= 55 and nb_alertes_sante <= 1:
+    if proba_pct >= 54 and nb_alertes_sante <= 1:
         return "MODERE"
     return "PRUDENT"
 
@@ -825,6 +793,7 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=FENETRE_HE
 
     for comp in competitions:
         slug = comp["slug"]
+        espn_code = comp.get("espn_code", slug)
         label_comp = comp.get("label", slug)
         evenements = recuperer_evenements_competition(comp)
         nb_bruts = len(evenements)
@@ -848,17 +817,17 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=FENETRE_HE
 
             vus_evenements.add(cle_ev)
             nb_retenus_comp += 1
-            matchs_candidats.append((slug, label_comp, evenements, ev, h_info, a_info))
+            matchs_candidats.append((slug, espn_code, label_comp, evenements, ev, h_info, a_info))
 
         diagnostics.append(f"{label_comp}: {nb_retenus_comp}/{nb_bruts}")
 
-    matchs_candidats.sort(key=lambda item: _extraire_date_evenement(item[3]))
+    matchs_candidats.sort(key=lambda item: _extraire_date_evenement(item[4]))
 
     resultats = []
     alertes_globales = {}
     scans_sante_effectues = 0
 
-    for slug, label_comp, evenements_comp, ev, h_info, a_info in matchs_candidats:
+    for slug, espn_code, label_comp, evenements_comp, ev, h_info, a_info in matchs_candidats:
         ev_id = str(ev.get("id") or ev.get("event_id") or "")
         start_str = _extraire_date_evenement(ev)
 
@@ -878,10 +847,18 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=FENETRE_HE
         )
 
         st_h = stats_foot_detail(
-            h_info.get("id", ""), league_slug=slug, n_derniers=n_derniers, events_comp=evenements_comp
+            h_info.get("id", ""),
+            league_slug=slug,
+            espn_code=espn_code,
+            n_derniers=n_derniers,
+            events_comp=evenements_comp,
         )
         st_a = stats_foot_detail(
-            a_info.get("id", ""), league_slug=slug, n_derniers=n_derniers, events_comp=evenements_comp
+            a_info.get("id", ""),
+            league_slug=slug,
+            espn_code=espn_code,
+            n_derniers=n_derniers,
+            events_comp=evenements_comp,
         )
 
         lam_h = max((st_h["bp_home"] + st_a["bc_away"]) / 2, 0.35)
@@ -945,7 +922,7 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=FENETRE_HE
             "fiable": True,
             "event_id": ev_id,
             "match": f"{h_nom} vs {a_nom}",
-            "date_match": start_str[:10] if start_str else "À venir",
+            "date_match": start_str[:16].replace("T", " ") if len(start_str) >= 16 else (start_str[:10] or "À venir"),
             "detail": (
                 f"[{label_comp}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] | "
                 f"xG: {lam_h:.2f}-{lam_a:.2f} (Score type {score_prob}) | "
@@ -1128,7 +1105,7 @@ def selectionner_meilleurs_paris_filtres(principaux, foot_res):
             })
 
     for f in foot_res:
-        if f.get("buts_proba", 0.0) >= 70.0:
+        if f.get("buts_proba", 0.0) >= 68.0:
             filtres.append({
                 "type": "BUTS",
                 "sport": "FOOT",
@@ -1141,7 +1118,7 @@ def selectionner_meilleurs_paris_filtres(principaux, foot_res):
             })
 
     filtres.sort(key=lambda x: (x["type"] != "VALEUR (EV+)", -x["proba"]))
-    return filtres[:10]
+    return filtres[:12]
 
 
 def _calculer_pnl_ligne(row):
@@ -1447,9 +1424,9 @@ def generer_synthese(pistes, alertes_sante, diag_foot=""):
         return rep_ia
 
     lignes = [f"Fenêtre active : {FENETRE_HEURES}h (2 jours) · Compétitions Foot : 8"]
-    if not any(p.get("sport") == "FOOT" for p in pistes) and diag_foot:
-        lignes.append(f"• Diagnostic Foot : {diag_foot}")
-    for p in pistes[:6]:
+    if diag_foot:
+        lignes.append(f"• Couverture Foot : {diag_foot}")
+    for p in pistes[:8]:
         mise_str = f" · Mise {p['mise_u']:.2f}u" if p.get("mise_u", 0.0) > 0 else ""
         lignes.append(f"• [{p['prudence']}] {p['match']} → {p['choix']} ({p['proba']}%{mise_str})")
     for cible, titres in alertes_sante.items():
@@ -1626,7 +1603,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="topbar">
     <div>
       <div class="brand-title">BetPulse Pro</div>
-      <div class="brand-sub">{% if data.maj %}MAJ : {{ data.maj }}{% else %}Prêt pour analyse (48h){% endif %}</div>
+      <div class="brand-sub">{% if data.maj %}MAJ : {{ data.maj }}{% else %}Prêt pour analyse (48h / 2 jours){% endif %}</div>
     </div>
     <form method="post" action="/refresh" style="margin:0;">
       <button type="submit" class="btn-refresh">Actualiser</button>
@@ -1723,9 +1700,11 @@ def index():
     return render_template_string(HTML_TEMPLATE, data=_DERNIER_SNAPSHOT)
 
 
-@app.route("/refresh", methods=["POST"])
+@app.route("/refresh", methods=["GET", "POST"])
 def refresh():
     global _DERNIER_SNAPSHOT
+    if request.method == "GET":
+        return redirect(url_for("index"))
     try:
         _DERNIER_SNAPSHOT = executer_analyse_complete(heures_max=FENETRE_HEURES)
     except Exception as exc:
