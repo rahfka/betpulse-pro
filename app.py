@@ -46,8 +46,8 @@ class Config:
     saison_foot: str = os.getenv("SAISON_FOOT", "2026").strip() or "2026"
     n_derniers_matchs: int = int(os.getenv("N_DERNIERS_MATCHS", "10"))
     fenetre_heures: int = int(os.getenv("FENETRE_HEURES", "48"))
-    timeout_http: int = int(os.getenv("TIMEOUT_HTTP", "6"))
-    cache_ttl_sec: int = int(os.getenv("CACHE_TTL_SEC", "300"))
+    timeout_http: int = int(os.getenv("TIMEOUT_HTTP", "4"))
+    cache_ttl_sec: int = int(os.getenv("CACHE_TTL_SEC", "600"))
 
 
 CFG = Config()
@@ -445,7 +445,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
 
     taches_sb = []
     for comp in competitions:
-        for delta in range(3):
+        for delta in range(2):
             jour = (aujourdhui + timedelta(days=delta)).strftime("%Y%m%d")
             taches_sb.append((comp["slug"], jour))
 
@@ -456,7 +456,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
         except Exception:
             return []
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         res_sb = list(ex.map(charger_sb, taches_sb))
 
     events_upcoming_par_slug = {c["slug"]: [] for c in competitions}
@@ -484,7 +484,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
         except Exception:
             return []
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=10) as ex:
         res_hist = list(ex.map(charger_hist, taches_hist))
 
     events_hist_par_slug = {c["slug"]: [] for c in competitions}
@@ -525,7 +525,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
 
         return label_comp, res_comp, alertes_comp, nb_clos, len(events_comp), apercu_comp
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    with ThreadPoolExecutor(max_workers=6) as ex:
         res_comps = list(ex.map(analyser_comp, competitions))
 
     for label_comp, res_comp, alertes_comp, nb_clos, total_events, apercu_comp in res_comps:
@@ -612,11 +612,13 @@ def _enrichir_sante_top(top_items):
     if not top_items:
         return {}
 
-    equipes_a_scanner = set()
-    for it in top_items:
+    equipes_a_scanner = []
+    vus = set()
+    for it in top_items[:8]:
         for nom in it.get("equipes", []):
-            if nom:
-                equipes_a_scanner.add(nom)
+            if nom and nom not in vus:
+                vus.add(nom)
+                equipes_a_scanner.append(nom)
 
     alertes_globales = {}
     penalites = {}
@@ -627,8 +629,8 @@ def _enrichir_sante_top(top_items):
         except Exception:
             return nom, []
 
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        for nom, titres in ex.map(scanner, equipes_a_scanner):
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for nom, titres in ex.map(scanner, equipes_a_scanner[:8]):
             if titres:
                 alertes_globales[nom] = titres
                 penalites[nom] = len(titres)
@@ -803,14 +805,14 @@ _HTML_LOADING = """<!doctype html>
     body { background: #0f172a; color: #e2e8f0; font-family: sans-serif; text-align: center; padding: 80px; }
     h1 { color: #38bdf8; }
     p { color: #94a3b8; }
-    .loader { border: 4px solid #334155; border-top: 4px solid #38bdf8; border-radius: 50%; width: 42px; height: 42px; animation: spin 1s linear infinite; margin: 24px auto; }
+    .loader { border: 4px solid #334155; border-top: 4px solid #38bdf8; border-radius: 50%; width: 42px; height: 42px; animation: spin 0.9s linear infinite; margin: 24px auto; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
   <h1>BetPulse Pro</h1>
   <div class="loader"></div>
-  <p id="status-msg">Récupération des matchs et analyse des données en cours…</p>
+  <p id="status-msg">Chargement rapide des matchs et analyses…</p>
   <script>
     async function verifierEtat() {
       try {
@@ -823,7 +825,7 @@ _HTML_LOADING = """<!doctype html>
           }
         }
       } catch (e) {}
-      setTimeout(verifierEtat, 2000);
+      setTimeout(verifierEtat, 1000);
     }
     verifierEtat();
   </script>
@@ -840,38 +842,38 @@ _HTML_PAGE = """<!doctype html>
   <style>
     :root { --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --accent: #38bdf8; --green: #10b981; --orange: #f59e0b; --red: #ef4444; }
     body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--text); }
-    h1, h2 { color: var(--accent); margin-bottom: 15px; }
+    h1 { color: var(--accent); margin: 0; }
     .container { max-width: 1200px; margin: 0 auto; }
-    .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #334155; }
+    .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 22px; padding-bottom: 14px; border-bottom: 1px solid #334155; }
     .header .meta { color: #94a3b8; font-size: 0.9em; }
     button, .btn { background: var(--accent); color: var(--bg); border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; }
     button:hover, .btn:hover { opacity: 0.85; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 15px; }
-    .card { background: var(--card); padding: 15px; border-radius: 8px; border-left: 4px solid var(--accent); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+    details.onglet { background: var(--card); border-radius: 8px; margin-bottom: 14px; overflow: hidden; border: 1px solid #293548; }
+    details.onglet > summary { padding: 15px 18px; cursor: pointer; font-weight: bold; font-size: 1.05em; color: var(--accent); user-select: none; list-style: none; display: flex; align-items: center; justify-content: space-between; }
+    details.onglet > summary::-webkit-details-marker { display: none; }
+    details.onglet > summary:hover { background: #273549; }
+    .onglet-body { padding: 6px 16px 18px 16px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(310px, 1fr)); gap: 14px; }
+    .card { background: #162032; padding: 14px; border-radius: 8px; border-left: 4px solid var(--accent); box-shadow: 0 4px 6px rgba(0,0,0,0.12); }
     .card.ELEVE { border-left-color: var(--green); }
     .card.MODERE { border-left-color: var(--orange); }
     .card.PRUDENT { border-left-color: var(--red); }
-    .card-title { font-size: 1.1em; font-weight: bold; margin-bottom: 8px; display: flex; justify-content: space-between; }
-    .badge { font-size: 0.75em; padding: 3px 8px; border-radius: 12px; font-weight: bold; }
+    .card-title { font-size: 1.05em; font-weight: bold; margin-bottom: 8px; display: flex; justify-content: space-between; gap: 8px; }
+    .badge { font-size: 0.75em; padding: 3px 8px; border-radius: 12px; font-weight: bold; white-space: nowrap; }
     .badge.ELEVE { background: var(--green); color: #000; }
     .badge.MODERE { background: var(--orange); color: #000; }
     .badge.PRUDENT { background: var(--red); color: #fff; }
     .card-meta { font-size: 0.85em; color: #94a3b8; margin-bottom: 8px; line-height: 1.4; }
     .card-detail { font-size: 0.8em; color: #cbd5e1; background: #0f172a; padding: 8px; border-radius: 4px; margin-top: 8px; font-family: monospace; }
-    details { background: var(--card); border-radius: 8px; margin-bottom: 15px; overflow: hidden; }
-    summary { padding: 15px; cursor: pointer; font-weight: bold; color: var(--accent); user-select: none; }
-    summary:hover { background: #334155; }
-    .details-content { padding: 0 15px 15px 15px; }
-    pre { white-space: pre-wrap; background: #0f172a; padding: 15px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; }
-    .stats-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px; }
-    .stat-item { background: var(--card); padding: 8px 12px; border-radius: 20px; font-size: 0.85em; }
+    pre { white-space: pre-wrap; background: #0f172a; padding: 15px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; margin: 0; }
+    .meta-empty { color: #94a3b8; font-size: 0.9em; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
       <div>
-        <h1 style="margin: 0;">BetPulse Pro</h1>
+        <h1>BetPulse Pro</h1>
         <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }}</span>
       </div>
       <div style="display: flex; gap: 10px;">
@@ -883,103 +885,100 @@ _HTML_PAGE = """<!doctype html>
       </div>
     </div>
 
-    <h2>Bilan historique</h2>
-    <div class="stats-bar">
-      <span class="stat-item">Total : <strong>{{ r.get("bilan", {}).get("total", 0) }}</strong></span>
-      <span class="stat-item">En attente : <strong>{{ r.get("bilan", {}).get("en_attente", 0) }}</strong></span>
-      <span class="stat-item">Vérifiés : <strong>{{ r.get("bilan", {}).get("verifies", 0) }}</strong></span>
-      <span class="stat-item">Réussite : <strong>{{ r.get("bilan", {}).get("taux", 0.0) }}%</strong></span>
-    </div>
-
-    <h2>Couverture Foot</h2>
-    <div class="stats-bar">
-      {% for k, v in r.get("stats_comp", {}).items() %}
-        <span class="stat-item"><strong>{{ k }}</strong> : {{ v }}</span>
-      {% endfor %}
-    </div>
-
-    <h2>Top pronostics (Foot &amp; Tennis)</h2>
-    <div class="grid">
-      {% for it in r.top_sur %}
-      <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
-        <div class="card-title">
-          <span>{{ it.choix }}</span>
-          <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
-        </div>
-        <div class="card-meta">
-          <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} — {{ it.competition }}
-        </div>
-        {% if it.detail %}
-        <div class="card-detail">{{ it.detail }}</div>
-        {% endif %}
-      </div>
-      {% else %}
-      <div class="card">Aucun pronostic disponible.</div>
-      {% endfor %}
-    </div>
-
-    <h2>Matchs de Foot à venir — 48h ({{ r.foot|length }})</h2>
-    <div class="grid">
-      {% for it in r.foot %}
-      <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
-        <div class="card-title">
-          <span>{{ it.choix }}</span>
-          <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
-        </div>
-        <div class="card-meta">
-          <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }}
-        </div>
-        <div class="card-detail">{{ it.detail }}</div>
-      </div>
-      {% else %}
-      <div class="card">Aucun match de foot à venir dans les prochaines 48h.</div>
-      {% endfor %}
-    </div>
-
-    <h2>Matchs de Tennis à venir — 48h ({{ r.tennis|length }})</h2>
-    <div class="grid">
-      {% for it in r.tennis %}
-      <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
-        <div class="card-title">
-          <span>{{ it.choix }}</span>
-          <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
-        </div>
-        <div class="card-meta">
-          <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} — {{ it.competition }}
+    <details class="onglet" open>
+      <summary><span>🏆 Top pronostics (Foot &amp; Tennis) ({{ r.top_sur|length }})</span><span>▾</span></summary>
+      <div class="onglet-body">
+        <div class="grid">
+          {% for it in r.top_sur %}
+          <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
+            <div class="card-title">
+              <span>{{ it.choix }}</span>
+              <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
+            </div>
+            <div class="card-meta">
+              <strong>{{ it.match }}</strong><br>
+              {{ it.date_match }} — {{ it.competition }}
+            </div>
+            {% if it.detail %}
+            <div class="card-detail">{{ it.detail }}</div>
+            {% endif %}
+          </div>
+          {% else %}
+          <div class="card">Aucun pronostic disponible.</div>
+          {% endfor %}
         </div>
       </div>
-      {% else %}
-      <div class="card">Aucun match de tennis à venir dans les prochaines 48h.</div>
-      {% endfor %}
-    </div>
+    </details>
 
-    <details>
-      <summary>🚑 Alertes blessures / forfaits (3j)</summary>
-      <div class="details-content">
+    <details class="onglet" open>
+      <summary><span>⚽ Matchs de Foot à venir — 48h ({{ r.foot|length }})</span><span>▾</span></summary>
+      <div class="onglet-body">
+        <div class="grid">
+          {% for it in r.foot %}
+          <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
+            <div class="card-title">
+              <span>{{ it.choix }}</span>
+              <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
+            </div>
+            <div class="card-meta">
+              <strong>{{ it.match }}</strong><br>
+              {{ it.date_match }}
+            </div>
+            <div class="card-detail">{{ it.detail }}</div>
+          </div>
+          {% else %}
+          <div class="card">Aucun match de foot à venir dans les prochaines 48h.</div>
+          {% endfor %}
+        </div>
+      </div>
+    </details>
+
+    <details class="onglet" open>
+      <summary><span>🎾 Matchs de Tennis à venir — 48h ({{ r.tennis|length }})</span><span>▾</span></summary>
+      <div class="onglet-body">
+        <div class="grid">
+          {% for it in r.tennis %}
+          <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
+            <div class="card-title">
+              <span>{{ it.choix }}</span>
+              <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
+            </div>
+            <div class="card-meta">
+              <strong>{{ it.match }}</strong><br>
+              {{ it.date_match }} — {{ it.competition }}
+            </div>
+          </div>
+          {% else %}
+          <div class="card">Aucun match de tennis à venir dans les prochaines 48h.</div>
+          {% endfor %}
+        </div>
+      </div>
+    </details>
+
+    <details class="onglet">
+      <summary><span>🚑 Alertes blessures / forfaits (3j)</span><span>▾</span></summary>
+      <div class="onglet-body">
         {% for cible, titres in r.get("alertes", {}).items() %}
           <p style="margin-bottom: 10px;">
             <strong style="color: #fca5a5;">{{ cible }}</strong> :<br>
             <span style="font-size: 0.9em; color: #cbd5e1;">{{ titres | join(" | ") }}</span>
           </p>
         {% else %}
-          <span class="meta">Aucune alerte récente.</span>
+          <span class="meta-empty">Aucune alerte récente.</span>
         {% endfor %}
       </div>
     </details>
 
-    <details>
-      <summary>🔍 Aperçu données brutes Foot</summary>
-      <div class="details-content">
+    <details class="onglet">
+      <summary><span>🔍 Aperçu données brutes Foot</span><span>▾</span></summary>
+      <div class="onglet-body">
         <pre>{{ r.apercu_bruts or "Aucun événement brut." }}</pre>
       </div>
     </details>
 
-    <details>
-      <summary>📋 Synthèse Textuelle</summary>
-      <div class="details-content">
+    <details class="onglet">
+      <summary><span>📋 Synthèse Textuelle</span><span>▾</span></summary>
+      <div class="onglet-body">
         <pre>{{ r.synthese }}</pre>
       </div>
     </details>
@@ -1088,7 +1087,7 @@ def index():
 
 _charger_rapport_disque()
 if not _DERNIER_RAPPORT.get("mis_a_jour"):
-    _demarrer_analyse_si_besoin(1.5)
+    _demarrer_analyse_si_besoin(0.5)
 
 
 if __name__ == "__main__":
