@@ -88,7 +88,7 @@ STATUTS_TERMINES_OU_EN_COURS = STATUTS_TERMINES | {"in_progress", "live"}
 
 _CACHE_FOOT_SCHED = {}
 _CACHE_SANTE = {}
-_ANALYSE_LOCK = threading.Lock()
+_STATE_LOCK = threading.Lock()
 _ANALYSE_EN_COURS = False
 
 _DERNIER_RAPPORT = {
@@ -117,16 +117,17 @@ def _charger_rapport_disque():
         if os.path.exists(FICHIER_RAPPORT):
             with open(FICHIER_RAPPORT, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if isinstance(data, dict):
-                    _DERNIER_RAPPORT.update(data)
+                if isinstance(data, dict) and data.get("mis_a_jour"):
+                    with _STATE_LOCK:
+                        _DERNIER_RAPPORT = data
     except Exception:
         pass
 
 
-def _sauvegarder_rapport_disque():
+def _sauvegarder_rapport_disque(rapport):
     try:
         with open(FICHIER_RAPPORT, "w", encoding="utf-8") as f:
-            json.dump(_DERNIER_RAPPORT, f, ensure_ascii=False)
+            json.dump(rapport, f, ensure_ascii=False)
     except Exception:
         pass
 
@@ -720,7 +721,7 @@ def mettre_a_jour_historique(items):
 
 def executer_analyse():
     global _DERNIER_RAPPORT, _ANALYSE_EN_COURS
-    with _ANALYSE_LOCK:
+    with _STATE_LOCK:
         if _ANALYSE_EN_COURS:
             return _DERNIER_RAPPORT
         _ANALYSE_EN_COURS = True
@@ -750,7 +751,22 @@ def executer_analyse():
             bilan = mettre_a_jour_historique([x for x in top_sur if x.get("fiable", True)])
         except Exception as e:
             print(f"[ERREUR] Historique: {e}", flush=True)
-            bilan = _DERNIER_RAPPORT.get("bilan") or {}
+            with _STATE_LOCK:
+                bilan = dict(_DERNIER_RAPPORT.get("bilan") or {})
+
+        alertes_combines = {**alertes_f, **alertes_t}
+        try:
+            alertes_sante = _enrichir_sante_top(top_sur)
+            alertes_combines.update(alertes_sante)
+            top_sur = sorted(top_sur, key=lambda x: x["proba"], reverse=True)
+            foot_sorted = sorted(foot_sorted, key=lambda x: x["proba"], reverse=True)
+        except Exception as e:
+            print(f"[ERREUR] Santé: {e}", flush=True)
+
+        synthese = "\n".join(
+            f"• [{x['sport']} | {x['prudence']}] {x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
+            for x in top_sur[:8]
+        ) or "Aucun match à venir dans les prochaines 48h."
 
         nouveau_rapport = {
             "mis_a_jour": datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M %Z"),
@@ -759,34 +775,61 @@ def executer_analyse():
             "top_sur": top_sur,
             "foot": foot_sorted,
             "tennis": tennis_sorted,
-            "alertes": {**alertes_f, **alertes_t},
+            "alertes": alertes_combines,
             "bilan": bilan,
-            "synthese": "",
+            "synthese": synthese,
         }
 
-        try:
-            alertes_sante = _enrichir_sante_top(top_sur)
-            nouveau_rapport["alertes"] = {**nouveau_rapport["alertes"], **alertes_sante}
-            nouveau_rapport["top_sur"] = sorted(top_sur, key=lambda x: x["proba"], reverse=True)
-            nouveau_rapport["foot"] = sorted(foot_sorted, key=lambda x: x["proba"], reverse=True)
-        except Exception as e:
-            print(f"[ERREUR] Santé: {e}", flush=True)
+        with _STATE_LOCK:
+            _DERNIER_RAPPORT = nouveau_rapport
 
-        nouveau_rapport["synthese"] = "\n".join(
-            f"• [{x['sport']} | {x['prudence']}] {x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
-            for x in nouveau_rapport["top_sur"][:8]
-        ) or "Aucun match à venir dans les prochaines 48h."
-
-        _DERNIER_RAPPORT = nouveau_rapport
-        _sauvegarder_rapport_disque()
+        _sauvegarder_rapport_disque(nouveau_rapport)
         print("Analyse terminée et rapport mis à jour.", flush=True)
-        return _DERNIER_RAPPORT
+        return nouveau_rapport
     finally:
-        with _ANALYSE_LOCK:
+        with _STATE_LOCK:
             _ANALYSE_EN_COURS = False
 
 
 app = Flask(__name__, static_folder="statique", static_url_path="/statique")
+
+_HTML_LOADING = """<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BetPulse Pro — Analyse en cours…</title>
+  <style>
+    body { background: #0f172a; color: #e2e8f0; font-family: sans-serif; text-align: center; padding: 80px; }
+    h1 { color: #38bdf8; }
+    p { color: #94a3b8; }
+    .loader { border: 4px solid #334155; border-top: 4px solid #38bdf8; border-radius: 50%; width: 42px; height: 42px; animation: spin 1s linear infinite; margin: 24px auto; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1>BetPulse Pro</h1>
+  <div class="loader"></div>
+  <p id="status-msg">Récupération des matchs et analyse des données en cours…</p>
+  <script>
+    async function verifierEtat() {
+      try {
+        const res = await fetch("/api/status", { cache: "no-store" });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.ready) {
+            window.location.replace("/");
+            return;
+          }
+        }
+      } catch (e) {}
+      setTimeout(verifierEtat, 2000);
+    }
+    verifierEtat();
+  </script>
+</body>
+</html>
+"""
 
 _HTML_PAGE = """<!doctype html>
 <html lang="fr">
@@ -802,7 +845,7 @@ _HTML_PAGE = """<!doctype html>
     .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #334155; }
     .header .meta { color: #94a3b8; font-size: 0.9em; }
     button, .btn { background: var(--accent); color: var(--bg); border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; }
-    button:hover, .btn:hover { opacity: 0.8; }
+    button:hover, .btn:hover { opacity: 0.85; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 15px; }
     .card { background: var(--card); padding: 15px; border-radius: 8px; border-left: 4px solid var(--accent); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
     .card.ELEVE { border-left-color: var(--green); }
@@ -946,16 +989,46 @@ _HTML_PAGE = """<!doctype html>
 """
 
 
+def _demarrer_analyse_si_besoin(delai_sec=0.0):
+    def _runner():
+        if delai_sec > 0:
+            time.sleep(delai_sec)
+        try:
+            executer_analyse()
+        except Exception as e:
+            print(f"[ERREUR FATALE] analyse background: {e}", flush=True)
+
+    threading.Thread(target=_runner, daemon=True).start()
+
+
 @app.route("/health")
 def health():
     return "ok", 200
 
 
+@app.route("/api/status")
+def api_status():
+    with _STATE_LOCK:
+        maj = _DERNIER_RAPPORT.get("mis_a_jour")
+        en_cours = _ANALYSE_EN_COURS
+    if not maj and not en_cours:
+        _demarrer_analyse_si_besoin(0.0)
+    resp = make_response(jsonify({
+        "ready": bool(maj),
+        "mis_a_jour": maj,
+        "en_cours": en_cours,
+    }), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.route("/api/analyse")
 def api_analyse():
-    if not _DERNIER_RAPPORT.get("mis_a_jour"):
-        executer_analyse()
-    return jsonify(_DERNIER_RAPPORT)
+    with _STATE_LOCK:
+        rapport = dict(_DERNIER_RAPPORT)
+    if not rapport.get("mis_a_jour"):
+        rapport = executer_analyse()
+    return jsonify(rapport)
 
 
 @app.route("/api/debug-foot")
@@ -989,55 +1062,33 @@ def api_debug_foot():
 
 @app.route("/refresh", methods=["POST"])
 def refresh():
-    global _DERNIER_RAPPORT
-    _DERNIER_RAPPORT["mis_a_jour"] = None
-    threading.Thread(target=executer_analyse, daemon=True).start()
+    with _STATE_LOCK:
+        _DERNIER_RAPPORT["mis_a_jour"] = None
+    _demarrer_analyse_si_besoin(0.0)
     return redirect(url_for("index"))
 
 
 @app.route("/")
 def index():
-    if not _DERNIER_RAPPORT.get("mis_a_jour"):
-        resp = make_response(render_template_string("""
-        <!doctype html>
-        <html><head>
-          <meta charset="utf-8">
-          <meta http-equiv="refresh" content="4">
-          <title>BetPulse Pro — Analyse en cours…</title>
-          <style>
-            body { background: #0f172a; color: #e2e8f0; font-family: sans-serif; text-align: center; padding: 80px; }
-            h1 { color: #38bdf8; }
-            p { color: #94a3b8; }
-            .loader { border: 4px solid #334155; border-top: 4px solid #38bdf8; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto; }
-            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-          </style>
-        </head><body>
-          <h1>BetPulse Pro</h1>
-          <div class="loader"></div>
-          <p>Récupération des matchs et analyse des données en cours…</p>
-          <p style="font-size: 0.85em;">La page se rafraîchit automatiquement toutes les 4 secondes.</p>
-        </body></html>
-        """), 200)
+    with _STATE_LOCK:
+        rapport = dict(_DERNIER_RAPPORT)
+        en_cours = _ANALYSE_EN_COURS
+
+    if not rapport.get("mis_a_jour"):
+        if not en_cours:
+            _demarrer_analyse_si_besoin(0.0)
+        resp = make_response(render_template_string(_HTML_LOADING), 200)
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
 
-    resp = make_response(render_template_string(_HTML_PAGE, r=_DERNIER_RAPPORT), 200)
+    resp = make_response(render_template_string(_HTML_PAGE, r=rapport), 200)
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
-def _lancer_analyse_background():
-    time.sleep(2)  # Laisse Gunicorn finir de s'initialiser
-    try:
-        executer_analyse()
-    except Exception as e:
-        print(f"[ERREUR FATALE] analyse background: {e}", flush=True)
-
-
 _charger_rapport_disque()
-
 if not _DERNIER_RAPPORT.get("mis_a_jour"):
-    threading.Thread(target=_lancer_analyse_background, daemon=True).start()
+    _demarrer_analyse_si_besoin(1.5)
 
 
 if __name__ == "__main__":
