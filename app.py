@@ -27,19 +27,60 @@ OPENROUTER_API_KEY_LOCAL = ""
 GEMINI_API_KEY_LOCAL = ""
 
 COMPETITIONS_FOOT = [
-    {"slug": "ligue-1", "label": "Ligue 1", "aliases": {"ligue-1", "fra.1", "french ligue 1", "ligue 1", "ligue 1 mcdonald's"}},
-    {"slug": "premier-league", "label": "Premier League", "aliases": {"premier-league", "eng.1", "english premier league", "premier league", "epl"}},
-    {"slug": "la-liga", "label": "La Liga", "aliases": {"la-liga", "esp.1", "spanish la liga", "la liga", "laliga"}},
-    {"slug": "bundesliga", "label": "Bundesliga", "aliases": {"bundesliga", "ger.1", "german bundesliga", "1. bundesliga"}},
-    {"slug": "serie-a", "label": "Serie A", "aliases": {"serie-a", "ita.1", "italian serie a", "serie a"}},
-    {"slug": "portuguese-liga", "label": "Liga Portugal", "aliases": {"portuguese-liga", "primeira-liga", "por.1", "portuguese liga", "liga portugal", "primeira liga", "liga portugal betclic"}},
-    {"slug": "uefa-champions-league", "label": "Ligue des Champions", "aliases": {"uefa-champions-league", "champions-league", "uefa.champions", "uefa champions league", "ligue des champions", "ucl"}},
-    {"slug": "uefa-europa-league", "label": "Ligue Europa", "aliases": {"uefa-europa-league", "europa-league", "uefa.europa", "uefa europa league", "ligue europa", "uel"}},
+    {
+        "slug": "ligue-1",
+        "label": "Ligue 1",
+        "aliases": {"ligue-1", "fra.1", "french ligue 1", "ligue 1", "ligue 1 mcdonald's"},
+    },
+    {
+        "slug": "la-liga",
+        "label": "La Liga",
+        "aliases": {"la-liga", "esp.1", "spanish la liga", "la liga", "laliga", "primera division"},
+    },
+    {
+        "slug": "bundesliga",
+        "label": "Bundesliga",
+        "aliases": {"bundesliga", "ger.1", "german bundesliga", "1. bundesliga"},
+    },
+    {
+        "slug": "portuguese-liga",
+        "label": "Liga Portugal",
+        "aliases": {
+            "portuguese-liga", "primeira-liga", "liga-portugal", "por.1",
+            "portuguese liga", "liga portugal", "primeira liga", "liga portugal betclic",
+        },
+    },
+    {
+        "slug": "premier-league",
+        "label": "Premier League",
+        "aliases": {"premier-league", "eng.1", "english premier league", "premier league", "epl"},
+    },
+    {
+        "slug": "serie-a",
+        "label": "Serie A",
+        "aliases": {"serie-a", "ita.1", "italian serie a", "serie a"},
+    },
+    {
+        "slug": "uefa-champions-league",
+        "label": "Ligue des Champions",
+        "aliases": {
+            "uefa-champions-league", "champions-league", "uefa.champions",
+            "uefa champions league", "ligue des champions", "ucl",
+        },
+    },
+    {
+        "slug": "uefa-europa-league",
+        "label": "Ligue Europa",
+        "aliases": {
+            "uefa-europa-league", "europa-league", "uefa.europa",
+            "uefa europa league", "ligue europa", "uel",
+        },
+    },
 ]
 
 SAISON_FALLBACK_YEAR = "2026"
 N_DERNIERS_MATCHS = 10
-FENETRE_HEURES = 72
+FENETRE_HEURES = 48  # Matchs à venir sur 2 jours (48h)
 MAX_SCAN_SANTE_MATCHS = 25
 
 FRACTION_KELLY = 0.25
@@ -70,7 +111,7 @@ _DERNIER_SNAPSHOT = {
         "bilan_buts": "0/0 (0.0%)",
         "bilan_tennis": "0/0 (0.0%)",
     },
-    "synthese": "Clique sur « Actualiser » pour lancer l'analyse complète (fenêtre 72h).",
+    "synthese": "Clique sur « Actualiser » pour lancer l'analyse complète (fenêtre 48h / 2 jours).",
 }
 
 
@@ -224,7 +265,7 @@ def _match_appartient_competition(ev, comp_cfg):
         "league_slug", "competition_id", "competition", "league",
         "competition_name", "league_name", "tournament", "category",
         "_bloc_slug", "_bloc_id", "_bloc_name", "_bloc_short_name", "_bloc_abbreviation",
-        "_bloc_league_slug", "_bloc_competition_id"
+        "_bloc_league_slug", "_bloc_competition_id",
     ):
         val = ev.get(champ)
         if isinstance(val, dict):
@@ -284,7 +325,13 @@ def recuperer_evenements_competition(comp_cfg):
     evenements = []
 
     if hasattr(fb, "get_season_schedule"):
-        for sid_test in dict.fromkeys([season_id, f"{slug}-{SAISON_FALLBACK_YEAR}", f"{slug}-2026-2027", f"{slug}-2025"]):
+        for sid_test in dict.fromkeys([
+            season_id,
+            f"{slug}-{SAISON_FALLBACK_YEAR}",
+            f"{slug}-2026-2027",
+            f"{slug}-2025",
+            slug,
+        ]):
             res_sched = _appeler_avec_signatures(
                 fb.get_season_schedule,
                 [
@@ -300,12 +347,13 @@ def recuperer_evenements_competition(comp_cfg):
 
     if hasattr(fb, "get_daily_schedule"):
         now_utc = datetime.now(timezone.utc)
-        for offset_jours in (-1, 0, 1, 2, 3):
+        for offset_jours in (-1, 0, 1, 2):
             jour = (now_utc + timedelta(days=offset_jours)).strftime("%Y-%m-%d")
             res_day = _appeler_avec_signatures(
                 fb.get_daily_schedule,
                 [
                     {"date": jour, "season_id": season_id},
+                    {"date": jour, "league_slug": slug},
                     {"date": jour},
                     {"day": jour},
                 ],
@@ -316,7 +364,7 @@ def recuperer_evenements_competition(comp_cfg):
 
     if not evenements and hasattr(fb, "get_team_schedule"):
         team_ids = _extraire_team_ids_saison(slug, season_id)
-        for tid in team_ids[:12]:
+        for tid in team_ids[:16]:
             sched = get_foot_schedule_cached(tid, league_slug=slug, season_year=SAISON_FALLBACK_YEAR)
             evenements.extend(_extraire_evenements_depuis_reponse(sched))
 
@@ -385,39 +433,61 @@ def _extraire_date_evenement(ev):
 def _lire_statut_evenement(ev):
     statut = ev.get("status")
     if isinstance(statut, dict):
-        statut = statut.get("type") or statut.get("name") or statut.get("state") or statut.get("detail") or ""
+        statut = (
+            statut.get("type")
+            or statut.get("name")
+            or statut.get("state")
+            or statut.get("detail")
+            or statut.get("shortDetail")
+            or ""
+        )
     return str(statut or "").strip().lower()
 
 
 def _est_match_clos(ev):
     statut = _lire_statut_evenement(ev)
-    return statut in (
+    if statut in (
         "closed", "final", "post", "completed",
-        "finished", "status_final", "full_time", "ft"
-    )
+        "finished", "status_final", "full_time", "ft", "aet", "pen"
+    ):
+        return True
+    # Si un score numérique existe déjà sur les deux équipes et que le statut n'est pas à venir
+    if statut not in ("", "not_started", "scheduled", "pre", "upcoming", "fixture"):
+        comps = ev.get("competitors", [])
+        if len(comps) >= 2:
+            s0 = _extraire_score_numerique(comps[0].get("score"))
+            s1 = _extraire_score_numerique(comps[1].get("score"))
+            if s0 is not None and s1 is not None and statut in ("end", "ended", "complete"):
+                return True
+    return False
 
 
 def _est_match_a_venir(ev):
     if _est_match_clos(ev):
         return False
     statut = _lire_statut_evenement(ev)
-    if statut in ("in_progress", "live", "halftime", "ht", "canceled", "cancelled", "postponed"):
+    if any(mot in statut for mot in ("in_progress", "live", "halftime", "cancel", "postpon", "abandon", "suspend")):
         return False
     return True
 
 
-def dans_fenetre_heures(date_str, heures_max):
+def dans_fenetre_heures(date_str, heures_max=FENETRE_HEURES):
     if heures_max is None or not date_str:
         return True
     try:
         s = str(date_str).strip()
+        maintenant = datetime.now(timezone.utc)
+        # Si la date est uniquement YYYY-MM-DD, on compare sur la journée calendaire UTC
         if len(s) == 10 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-            s = f"{s}T12:00:00+00:00"
+            dt_jour = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            jour_debut = maintenant.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+            jour_fin = maintenant.replace(hour=23, minute=59, second=59, microsecond=0) + timedelta(hours=heures_max)
+            return jour_debut <= dt_jour <= jour_fin
+
         s = s.replace("Z", "+00:00")
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        maintenant = datetime.now(timezone.utc)
         limite = maintenant + timedelta(hours=heures_max)
         return (maintenant - timedelta(hours=12)) <= dt <= limite
     except Exception:
@@ -510,11 +580,11 @@ def scanner_sante_cible(cible, max_titres=3, autres_cibles=None):
     mots_alerte = [
         "bless", "forfait", "incertain", "infirmerie", "absent", "pépin", "pepin",
         "ischio", "genou", "cheville", "cuisse", "mollet", "suspend", "abandon",
-        "injury", "injured", "doubt", "withdraw"
+        "injury", "injured", "doubt", "withdraw",
     ]
     mots_exclus = [
         "roland-garros", "roland garros", "rétrospective", "retrospective",
-        "histoire", "archive", "2022", "2023", "2024", "2025"
+        "histoire", "archive", "2022", "2023", "2024", "2025",
     ]
     headers = {
         "User-Agent": (
@@ -720,7 +790,7 @@ def niveau_prudence(proba_pct, nb_alertes_sante, label_val="Neutre", alerte_grav
         return "PRUDENT (cote courte)"
     if proba_pct >= 72 and nb_alertes_sante == 0:
         return "ELEVE"
-    if proba_pct >= 56 and nb_alertes_sante <= 1:
+    if proba_pct >= 55 and nb_alertes_sante <= 1:
         return "MODERE"
     return "PRUDENT"
 
@@ -748,7 +818,7 @@ def _extraire_home_away(ev):
     return h_info or {}, a_info or {}
 
 
-def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=72):
+def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=FENETRE_HEURES):
     vus_evenements = set()
     matchs_candidats = []
     diagnostics = []
@@ -792,8 +862,20 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=72):
         ev_id = str(ev.get("id") or ev.get("event_id") or "")
         start_str = _extraire_date_evenement(ev)
 
-        h_nom = h_info.get("short_name") or h_info.get("shortDisplayName") or h_info.get("name") or h_info.get("displayName") or "Home"
-        a_nom = a_info.get("short_name") or a_info.get("shortDisplayName") or a_info.get("name") or a_info.get("displayName") or "Away"
+        h_nom = (
+            h_info.get("short_name")
+            or h_info.get("shortDisplayName")
+            or h_info.get("name")
+            or h_info.get("displayName")
+            or "Home"
+        )
+        a_nom = (
+            a_info.get("short_name")
+            or a_info.get("shortDisplayName")
+            or a_info.get("name")
+            or a_info.get("displayName")
+            or "Away"
+        )
 
         st_h = stats_foot_detail(
             h_info.get("id", ""), league_slug=slug, n_derniers=n_derniers, events_comp=evenements_comp
@@ -887,7 +969,7 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=72):
     return resultats, alertes_globales, diag_txt
 
 
-def analyser_tennis(heures_max=72):
+def analyser_tennis(heures_max=FENETRE_HEURES):
     atp_rk = {
         " ".join(p["name"].lower().split()): p["rank"]
         for p in tn.get_rankings(tour="atp").get("data", {}).get("rankings", [])
@@ -1020,7 +1102,7 @@ def selectionner_meilleurs_paris_filtres(principaux, foot_res):
     filtres = []
     for it in principaux:
         pr = it.get("prudence", "")
-        if "cote courte" in pr.lower() or "alerte blessure" in pr.lower():
+        if "blessure" in pr.lower():
             continue
         if it.get("a_valeur") and it.get("mise_u", 0.0) > 0:
             filtres.append({
@@ -1033,22 +1115,22 @@ def selectionner_meilleurs_paris_filtres(principaux, foot_res):
                 "prudence": pr,
                 "mise_u": it.get("mise_u", 0.0),
             })
-        elif it.get("cote_dec") is None and pr in ("ELEVE", "MODERE"):
+        elif pr in ("ELEVE", "MODERE"):
             filtres.append({
-                "type": "WATCH-LIST (SANS COTE)",
+                "type": "SÉLECTION" if it.get("cote_dec") else "WATCH-LIST",
                 "sport": it["sport"],
                 "match": it["match"],
                 "date_match": it["date_match"],
                 "choix": it["choix"],
                 "proba": it["proba"],
                 "prudence": pr,
-                "mise_u": 0.0,
+                "mise_u": it.get("mise_u", 0.0),
             })
 
     for f in foot_res:
-        if f.get("buts_proba", 0.0) >= 75.0:
+        if f.get("buts_proba", 0.0) >= 70.0:
             filtres.append({
-                "type": "BUTS FORT",
+                "type": "BUTS",
                 "sport": "FOOT",
                 "match": f["match"],
                 "date_match": f["date_match"],
@@ -1059,7 +1141,7 @@ def selectionner_meilleurs_paris_filtres(principaux, foot_res):
             })
 
     filtres.sort(key=lambda x: (x["type"] != "VALEUR (EV+)", -x["proba"]))
-    return filtres[:8]
+    return filtres[:10]
 
 
 def _calculer_pnl_ligne(row):
@@ -1084,7 +1166,7 @@ def _calculer_pnl_ligne(row):
 def mettre_a_jour_et_sauver_historique(pistes, foot_res, competitions):
     champs = [
         "date_analyse", "sport", "event_id", "match", "date_match",
-        "choix", "proba", "prudence", "cote_dec", "mise_u", "pnl_u", "statut"
+        "choix", "proba", "prudence", "cote_dec", "mise_u", "pnl_u", "statut",
     ]
     lignes_existantes = []
     cles_deja_enregistrees = set()
@@ -1364,9 +1446,9 @@ def generer_synthese(pistes, alertes_sante, diag_foot=""):
     if rep_ia:
         return rep_ia
 
-    lignes = ["Mode synthétique local (ajoute GEMINI_API_KEY ou OPENROUTER_API_KEY sur Render pour le texte IA)."]
+    lignes = [f"Fenêtre active : {FENETRE_HEURES}h (2 jours) · Compétitions Foot : 8"]
     if not any(p.get("sport") == "FOOT" for p in pistes) and diag_foot:
-        lignes.append(f"• Diagnostic Foot ({FENETRE_HEURES}h) : {diag_foot}")
+        lignes.append(f"• Diagnostic Foot : {diag_foot}")
     for p in pistes[:6]:
         mise_str = f" · Mise {p['mise_u']:.2f}u" if p.get("mise_u", 0.0) > 0 else ""
         lignes.append(f"• [{p['prudence']}] {p['match']} → {p['choix']} ({p['proba']}%{mise_str})")
@@ -1544,7 +1626,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="topbar">
     <div>
       <div class="brand-title">BetPulse Pro</div>
-      <div class="brand-sub">{% if data.maj %}MAJ : {{ data.maj }}{% else %}Prêt pour analyse (72h){% endif %}</div>
+      <div class="brand-sub">{% if data.maj %}MAJ : {{ data.maj }}{% else %}Prêt pour analyse (48h){% endif %}</div>
     </div>
     <form method="post" action="/refresh" style="margin:0;">
       <button type="submit" class="btn-refresh">Actualiser</button>
