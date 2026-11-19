@@ -67,7 +67,6 @@ def _resoudre_chemin_historique():
 
 
 FICHIER_HISTORIQUE = _resoudre_chemin_historique()
-EQUIPES_FOOT_IDS = ["160", "174", "176", "166"]
 
 COMPETITIONS_CIBLES = [
     {"slug": "ligue-1", "label": "Ligue 1", "mots": ("ligue 1", "ligue-1", "fra.1", "france"), "equipes": ["160", "174", "176", "166"]},
@@ -365,9 +364,10 @@ def scanner_sante_cible(cible, max_titres=2):
     if cached is not None:
         return list(cached)
 
-    res = _requete_rss(f'"{cible}" (blessure OR forfait OR incertain) when:3d', max_titres)
+    # Requête améliorée pour éviter les compositions probables
+    res = _requete_rss(f'"{cible}" (blessure OR forfait OR incertain OR absent) -composition when:3d', max_titres)
     if not res:
-        res = _requete_rss(f'{cible} (blessure OR forfait OR cuisse OR genou OR cheville OR retrait) when:5d', max_titres)
+        res = _requete_rss(f'{cible} (blessure OR forfait OR cuisse OR genou OR cheville) when:5d', max_titres)
 
     _cache_set(_CACHE_SANTE, cle, res)
     return list(res)
@@ -394,9 +394,16 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         key=lambda x: x[1],
     )
 
-    titres_sante = scanner_sante_cible(h_nom, 1) + scanner_sante_cible(a_nom, 1)
-    titres_sante = list(dict.fromkeys(titres_sante))[:2]
-    proba_pct = round(max(0.05, prob - min(len(titres_sante) * 0.02, 0.08)) * 100, 1)
+    titres_h = scanner_sante_cible(h_nom, 1)
+    titres_a = scanner_sante_cible(a_nom, 1)
+    
+    # On sépare les alertes par équipe pour plus de clarté
+    alertes_eq = {}
+    if titres_h: alertes_eq[h_nom] = titres_h
+    if titres_a: alertes_eq[a_nom] = titres_a
+    
+    nb_alertes = len(titres_h) + len(titres_a)
+    proba_pct = round(max(0.05, prob - min(nb_alertes * 0.02, 0.08)) * 100, 1)
 
     buts_label = "+2.5 buts" if p_ov25 >= p_un25 else "-2.5 buts"
     buts_proba = round(max(p_ov25, p_un25) * 100, 1)
@@ -408,18 +415,15 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "event_id": ev_id,
         "match": f"{h_nom} vs {a_nom}",
         "date_match": _formater_date_locale(start_str),
-        "detail": (
-            f"[{label_comp} | {statut_raw}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] "
-            f"| Buts: {buts_label} ({buts_proba:.0f}%)"
-        ),
+        "detail": f"[{label_comp}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] | Buts: {buts_label} ({buts_proba:.0f}%)",
         "choix": choix,
         "proba": proba_pct,
         "prudence": "ELEVE" if proba_pct >= 72 else ("MODERE" if proba_pct >= 56 else "PRUDENT"),
         "mise_u": 0.0,
-    }, titres_sante
+    }, alertes_eq
 
 
-def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
+def analyser_foot_competitions(competitions, heures_max=48):
     resultats_a_venir = []
     alertes_globales = {}
     stats_par_comp = {}
@@ -431,51 +435,45 @@ def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
     for comp in competitions:
         slug = comp["slug"]
         label_comp = comp["label"]
-        ids_equipes = list(dict.fromkeys(comp.get("equipes") or []))
-
-        raw_comp_events = []
-
-        # 1) Historique (matchs passés) pour calculer la forme
-        for tid in ids_equipes:
-            sched = get_foot_schedule_cached(tid, slug, CFG.saison_foot)
-            evs = _extraire_events(sched)
-            raw_comp_events.extend(evs)
-
-        # 2) Matchs à venir : scoreboard ESPN sur J, J+1, J+2
+        
+        # 1) Récupérer les matchs à venir via le scoreboard (J, J+1, J+2)
+        upcoming_events = []
         for delta in range(3):
             jour = (aujourdhui + timedelta(days=delta)).strftime("%Y%m%d")
             try:
                 fixtures = fb.get_fixtures_by_date(slug, jour)
                 evs_futur = _extraire_events(fixtures)
-                raw_comp_events.extend(evs_futur)
-                if len(apercu_lignes) < 12 and evs_futur:
-                    ev0 = evs_futur[0]
-                    hi, ai = _normaliser_home_away(ev0)
-                    apercu_lignes.append(
-                        f"{slug} [{jour}] | {ev0.get('start_time') or ev0.get('date')} | "
-                        f"{hi.get('short_name') or hi.get('name') or '?'} vs "
-                        f"{ai.get('short_name') or ai.get('name') or '?'}"
-                    )
+                upcoming_events.extend(evs_futur)
             except Exception as e:
                 print(f"[FOOT] scoreboard {slug} {jour} erreur: {e}", flush=True)
 
-        # --- suite identique (dédup, filtrage compétition, stats, etc.) ---
+        # 2) Identifier TOUTES les équipes qui jouent pour récupérer leur historique
+        equipes_a_analyser = set(comp.get("equipes") or [])
+        for ev in upcoming_events:
+            h, a = _normaliser_home_away(ev)
+            if h.get("id"): equipes_a_analyser.add(str(h["id"]))
+            if a.get("id"): equipes_a_analyser.add(str(a["id"]))
+
+        # 3) Charger l'historique de ces équipes
+        raw_comp_events = []
+        for tid in equipes_a_analyser:
+            sched = get_foot_schedule_cached(tid, slug, CFG.saison_foot)
+            evs = _extraire_events(sched)
+            raw_comp_events.extend(evs)
+
+        # 4) Ajouter les matchs à venir à la liste globale des événements
+        raw_comp_events.extend(upcoming_events)
+
+        # 5) Déduplication
         dedup_comp = {}
         for idx, ev in enumerate(raw_comp_events):
-            comp_obj = ev.get("competition") or ev.get("league") or ev.get("tournament") or {}
-            comp_txt = (
-                " ".join(str(comp_obj.get(k) or "").lower() for k in ("id", "slug", "name", "short_name"))
-                if isinstance(comp_obj, dict)
-                else str(comp_obj).lower()
-            )
-            # Filtre assoupli : on garde si pas de champ compétition OU si mot-clé trouvé
-            if comp_txt.strip() and not any(m in comp_txt for m in comp["mots"]):
-                continue
             eid = str(ev.get("id") or f"{slug}_{idx}")
             if eid not in dedup_comp:
                 dedup_comp[eid] = ev
 
         events_comp = list(dedup_comp.values())
+        
+        # 6) Filtrage pour ne garder que ceux dans la fenêtre
         a_venir_48h = [ev for ev in events_comp if _est_match_a_venir_dans_fenetre(ev, heures_max)]
         a_venir_48h.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
 
@@ -490,16 +488,26 @@ def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
             if cle_globale in vus_globaux:
                 continue
             vus_globaux.add(cle_globale)
-            entree, titres_s = _construire_entree_foot(ev, label_comp, events_comp)
+            
+            entree, alertes_eq = _construire_entree_foot(ev, label_comp, events_comp)
             resultats_a_venir.append(entree)
             ajoutes_comp += 1
-            if titres_s:
-                alertes_globales[entree["match"]] = titres_s
+            
+            if alertes_eq:
+                alertes_globales.update(alertes_eq)
 
-        stats_par_comp[label_comp] = f"48h:{ajoutes_comp} | clos:{nb_clos} (bruts:{len(events_comp)})"
+            if len(apercu_lignes) < 12:
+                h, a = _normaliser_home_away(ev)
+                apercu_lignes.append(
+                    f"{slug} | {_formater_date_locale(ev.get('start_time') or ev.get('date'))} | "
+                    f"{h.get('short_name') or h.get('name') or '?'} vs "
+                    f"{a.get('short_name') or a.get('name') or '?'}"
+                )
+
+        stats_par_comp[label_comp] = f"À venir: {ajoutes_comp} | Terminés: {nb_clos}"
 
     print("Couverture Foot :", " • ".join(f"{k}: {v}" for k, v in stats_par_comp.items()), flush=True)
-    return resultats_a_venir, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12])
+    return resultats_a_venir, alertes_globales, stats_par_comp, "\n".join(apercu_lignes)
 
 
 def trouver_rang(nom, rk_map):
@@ -560,10 +568,10 @@ def analyser_tennis(heures_max=48):
                     "event_id": str(m.get("id", "")),
                     "match": f"{j1} (#{r1 or 'NC'}) vs {j2} (#{r2 or 'NC'})",
                     "date_match": _formater_date_locale(str(m.get("date", ""))),
-                    "detail": f"{t_name} | Alertes 3j: {len(sante)}",
+                    "detail": f"{t_name}",
                     "choix": f"Victoire {favori}",
                     "proba": proba_pct,
-                    "prudence": "PRUDENT (alerte blessure)" if sante else ("MODERE" if proba_pct >= 56 else "PRUDENT"),
+                    "prudence": "PRUDENT (alerte)" if sante else ("MODERE" if proba_pct >= 56 else "PRUDENT"),
                     "mise_u": 0.0,
                 })
     return simples, alertes_tennis
@@ -646,9 +654,9 @@ def mettre_a_jour_historique(items):
 def executer_analyse():
     global _DERNIER_RAPPORT
     with _ANALYSE_LOCK:
-        print(f"Analyse en cours (fenetre: {CFG.fenetre_heures}h, matchs a venir uniquement)...", flush=True)
+        print(f"Analyse en cours (fenetre: {CFG.fenetre_heures}h)...", flush=True)
         foot_res, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
-            COMPETITIONS_CIBLES, EQUIPES_FOOT_IDS, CFG.fenetre_heures
+            COMPETITIONS_CIBLES, CFG.fenetre_heures
         )
         tennis_res, alertes_t = analyser_tennis(CFG.fenetre_heures)
 
@@ -686,82 +694,152 @@ _HTML_PAGE = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>BetPulse Pro — Matchs à venir (48h)</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 16px; background: #0f172a; color: #e2e8f0; }
-    h1, h2 { color: #38bdf8; }
-    .card { background: #1e293b; padding: 12px 14px; border-radius: 8px; margin-bottom: 10px; }
-    .meta { color: #94a3b8; font-size: 0.9em; }
-    a { color: #38bdf8; }
-    button { background: #38bdf8; color: #0f172a; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-weight: bold; }
-    pre { white-space: pre-wrap; background: #1e293b; padding: 12px; border-radius: 8px; }
+    :root { --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --accent: #38bdf8; --green: #10b981; --orange: #f59e0b; --red: #ef4444; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--text); }
+    h1, h2 { color: var(--accent); margin-bottom: 15px; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #334155; }
+    .header .meta { color: #94a3b8; font-size: 0.9em; }
+    button, .btn { background: var(--accent); color: var(--bg); border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; }
+    button:hover, .btn:hover { opacity: 0.8; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 15px; }
+    .card { background: var(--card); padding: 15px; border-radius: 8px; border-left: 4px solid var(--accent); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+    .card.ELEVE { border-left-color: var(--green); }
+    .card.MODERE { border-left-color: var(--orange); }
+    .card.PRUDENT { border-left-color: var(--red); }
+    .card-title { font-size: 1.1em; font-weight: bold; margin-bottom: 8px; display: flex; justify-content: space-between; }
+    .badge { font-size: 0.75em; padding: 3px 8px; border-radius: 12px; font-weight: bold; }
+    .badge.ELEVE { background: var(--green); color: #000; }
+    .badge.MODERE { background: var(--orange); color: #000; }
+    .badge.PRUDENT { background: var(--red); color: #fff; }
+    .card-meta { font-size: 0.85em; color: #94a3b8; margin-bottom: 8px; line-height: 1.4; }
+    .card-detail { font-size: 0.8em; color: #cbd5e1; background: #0f172a; padding: 8px; border-radius: 4px; margin-top: 8px; font-family: monospace; }
+    details { background: var(--card); border-radius: 8px; margin-bottom: 15px; overflow: hidden; }
+    summary { padding: 15px; cursor: pointer; font-weight: bold; color: var(--accent); user-select: none; }
+    summary:hover { background: #334155; }
+    .details-content { padding: 0 15px 15px 15px; }
+    pre { white-space: pre-wrap; background: #0f172a; padding: 15px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; }
+    .stats-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px; }
+    .stat-item { background: var(--card); padding: 8px 12px; border-radius: 20px; font-size: 0.85em; }
   </style>
 </head>
 <body>
-  <h1>BetPulse Pro</h1>
-  <form method="post" action="/refresh" style="display:inline;">
-    <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }} —</span>
-    <button type="submit">Actualiser maintenant</button>
-    <span class="meta">· <a href="/api/analyse">JSON</a> · <a href="/api/debug-foot">Debug Foot</a></span>
-  </form>
+  <div class="container">
+    <div class="header">
+      <div>
+        <h1 style="margin: 0;">BetPulse Pro</h1>
+        <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }}</span>
+      </div>
+      <div style="display: flex; gap: 10px;">
+        <form method="post" action="/refresh" style="margin: 0;">
+          <button type="submit">Actualiser</button>
+        </form>
+        <a href="/api/analyse" class="btn">JSON</a>
+        <a href="/api/debug-foot" class="btn">Debug</a>
+      </div>
+    </div>
 
-  <h2>Bilan historique</h2>
-  <div class="card">
-    <strong>Total suivis</strong> : {{ r.get("bilan", {}).get("total", 0) }} ·
-    <strong>En attente</strong> : {{ r.get("bilan", {}).get("en_attente", 0) }} ·
-    <strong>Vérifiés</strong> : {{ r.get("bilan", {}).get("verifies", 0) }} ·
-    <strong>Réussite</strong> : {{ r.get("bilan", {}).get("taux", 0.0) }}%
+    <h2>Bilan historique</h2>
+    <div class="stats-bar">
+      <span class="stat-item">Total : <strong>{{ r.get("bilan", {}).get("total", 0) }}</strong></span>
+      <span class="stat-item">En attente : <strong>{{ r.get("bilan", {}).get("en_attente", 0) }}</strong></span>
+      <span class="stat-item">Vérifiés : <strong>{{ r.get("bilan", {}).get("verifies", 0) }}</strong></span>
+      <span class="stat-item">Réussite : <strong>{{ r.get("bilan", {}).get("taux", 0.0) }}%</strong></span>
+    </div>
+
+    <h2>Couverture Foot</h2>
+    <div class="stats-bar">
+      {% for k, v in r.get("stats_comp", {}).items() %}
+        <span class="stat-item"><strong>{{ k }}</strong> : {{ v }}</span>
+      {% endfor %}
+    </div>
+
+    <h2>Top pronostics (Foot &amp; Tennis)</h2>
+    <div class="grid">
+      {% for it in r.top_sur %}
+      <div class="card {{ it.prudence.split(' ')[0] }}">
+        <div class="card-title">
+          <span>{{ it.choix }}</span>
+          <span class="badge {{ it.prudence.split(' ')[0] }}">{{ it.proba }}%</span>
+        </div>
+        <div class="card-meta">
+          <strong>{{ it.match }}</strong><br>
+          {{ it.date_match }} — {{ it.competition }}
+        </div>
+        {% if it.detail %}
+        <div class="card-detail">{{ it.detail }}</div>
+        {% endif %}
+      </div>
+      {% else %}
+      <div class="card">Aucun pronostic disponible.</div>
+      {% endfor %}
+    </div>
+
+    <h2>Matchs de Foot à venir — 48h ({{ r.foot|length }})</h2>
+    <div class="grid">
+      {% for it in r.foot %}
+      <div class="card {{ it.prudence.split(' ')[0] }}">
+        <div class="card-title">
+          <span>{{ it.choix }}</span>
+          <span class="badge {{ it.prudence.split(' ')[0] }}">{{ it.proba }}%</span>
+        </div>
+        <div class="card-meta">
+          <strong>{{ it.match }}</strong><br>
+          {{ it.date_match }}
+        </div>
+        <div class="card-detail">{{ it.detail }}</div>
+      </div>
+      {% else %}
+      <div class="card">Aucun match de foot à venir dans les prochaines 48h.</div>
+      {% endfor %}
+    </div>
+
+    <h2>Matchs de Tennis à venir — 48h ({{ r.tennis|length }})</h2>
+    <div class="grid">
+      {% for it in r.tennis %}
+      <div class="card {{ it.prudence.split(' ')[0] }}">
+        <div class="card-title">
+          <span>{{ it.choix }}</span>
+          <span class="badge {{ it.prudence.split(' ')[0] }}">{{ it.proba }}%</span>
+        </div>
+        <div class="card-meta">
+          <strong>{{ it.match }}</strong><br>
+          {{ it.date_match }} — {{ it.competition }}
+        </div>
+      </div>
+      {% else %}
+      <div class="card">Aucun match de tennis à venir dans les prochaines 48h.</div>
+      {% endfor %}
+    </div>
+
+    <details>
+      <summary>🚑 Alertes blessures / forfaits (3j)</summary>
+      <div class="details-content">
+        {% for cible, titres in r.get("alertes", {}).items() %}
+          <p style="margin-bottom: 10px;">
+            <strong style="color: #fca5a5;">{{ cible }}</strong> :<br>
+            <span style="font-size: 0.9em; color: #cbd5e1;">{{ titres | join(" | ") }}</span>
+          </p>
+        {% else %}
+          <span class="meta">Aucune alerte récente.</span>
+        {% endfor %}
+      </div>
+    </details>
+
+    <details>
+      <summary>🔍 Aperçu données brutes Foot</summary>
+      <div class="details-content">
+        <pre>{{ r.apercu_bruts or "Aucun événement brut." }}</pre>
+      </div>
+    </details>
+
+    <details>
+      <summary>📋 Synthèse Textuelle</summary>
+      <div class="details-content">
+        <pre>{{ r.synthese }}</pre>
+      </div>
+    </details>
   </div>
-
-  <h2>Couverture Foot</h2>
-  <div class="card">
-    {% for k, v in r.get("stats_comp", {}).items() %}
-      <strong>{{ k }}</strong> : {{ v }}{% if not loop.last %} · {% endif %}
-    {% endfor %}
-  </div>
-
-  <h2>Matchs de Foot à venir — 48h ({{ r.foot|length }})</h2>
-  {% for it in r.foot %}
-  <div class="card">
-    <strong>{{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong><br>
-    <span class="meta">{{ it.match }} ({{ it.date_match }}) — {{ it.detail }}</span>
-  </div>
-  {% else %}
-  <div class="card">Aucun match de foot à venir dans les prochaines 48h.</div>
-  {% endfor %}
-
-  <h2>Matchs de Tennis à venir — 48h ({{ r.tennis|length }})</h2>
-  {% for it in r.tennis %}
-  <div class="card">
-    <strong>{{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong><br>
-    <span class="meta">{{ it.match }} ({{ it.date_match }}) — {{ it.detail }}</span>
-  </div>
-  {% else %}
-  <div class="card">Aucun match de tennis à venir dans les prochaines 48h.</div>
-  {% endfor %}
-
-  <h2>Top pronostics à venir (Foot &amp; Tennis)</h2>
-  {% for it in r.top_sur %}
-  <div class="card">
-    <strong>[{{ it.sport }}] {{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong><br>
-    <span class="meta">{{ it.match }} ({{ it.date_match }})</span>
-  </div>
-  {% else %}
-  <div class="card">Aucun pronostic disponible sur les prochaines 48h.</div>
-  {% endfor %}
-
-  <h2>Alertes blessures / forfaits (3j)</h2>
-  <div class="card">
-    {% for cible, titres in r.get("alertes", {}).items() %}
-      <p><strong>{{ cible }}</strong> : {{ titres | join(" | ") }}</p>
-    {% else %}
-      <span class="meta">Aucune alerte récente.</span>
-    {% endfor %}
-  </div>
-
-  <h2>Aperçu données brutes Foot</h2>
-  <pre>{{ r.apercu_bruts or "Aucun événement brut." }}</pre>
-
-  <h2>Synthèse</h2>
-  <pre>{{ r.synthese }}</pre>
 </body>
 </html>
 """
