@@ -16,16 +16,29 @@ import sports_skills.tennis as tn
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 
 # =====================================================================
-# CONFIGURATION GENERALE (Render / Web App)
+# CONFIGURATION GENERALE (Toutes compétitions + Tennis, fenêtre 48h)
 # =====================================================================
 _DOSSIER_SCRIPT = os.path.dirname(os.path.abspath(__file__))
 FICHIER_HISTORIQUE = os.path.join(_DOSSIER_SCRIPT, "historique_paris.csv")
 
-EQUIPES_FOOT_IDS = ["160", "174", "176", "166"]  # PSG, Monaco, Marseille, Lille
-LIGUE_SLUG = "ligue-1"
-SAISON_FOOT = "2026"
+# Optionnel : tu peux laisser vide et definir OPENROUTER_API_KEY / GEMINI_API_KEY
+# dans les variables d'environnement Render (recommande) ou en local.
+OPENROUTER_API_KEY_DEFAULT = ""
+GEMINI_API_KEY_DEFAULT = ""
+
+COMPETITIONS_FOOT = [
+    {"slug": "ligue-1", "label": "Ligue 1", "season_year": "2026"},
+    {"slug": "premier-league", "label": "Premier League", "season_year": "2026"},
+    {"slug": "la-liga", "label": "La Liga", "season_year": "2026"},
+    {"slug": "bundesliga", "label": "Bundesliga", "season_year": "2026"},
+    {"slug": "portuguese-liga", "label": "Liga Portugal", "season_year": "2026"},
+    {"slug": "uefa-champions-league", "label": "Ligue des Champions", "season_year": "2026"},
+    {"slug": "uefa-europa-league", "label": "Ligue Europa", "season_year": "2026"},
+]
+
 N_DERNIERS_MATCHS = 10
-FENETRE_HEURES = 72
+FENETRE_HEURES = 48
+MAX_SCAN_SANTE_MATCHS = 25
 
 FRACTION_KELLY = 0.25
 MISE_MIN_UNITES = 0.25
@@ -33,6 +46,7 @@ MISE_MAX_UNITES = 2.0
 SEUIL_EV_POSITIF_PCT = 3.0
 
 _CACHE_FOOT_SCHED = {}
+_CACHE_SAISON_ACTIVE = {}
 _DERNIER_SNAPSHOT = {
     "maj": None,
     "principaux": [],
@@ -52,20 +66,111 @@ _DERNIER_SNAPSHOT = {
         "bilan_buts": "0/0 (0.0%)",
         "bilan_tennis": "0/0 (0.0%)",
     },
-    "synthese": "Clique sur « Actualiser » pour lancer l'analyse et charger les pistes.",
+    "synthese": "Clique sur « Actualiser » pour lancer l'analyse complète (fenêtre 48h).",
 }
 
 
-def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year="2026"):
-    cle = (str(team_id), str(league_slug), str(season_year))
+def _get_openrouter_key():
+    return (os.getenv("OPENROUTER_API_KEY") or OPENROUTER_API_KEY_DEFAULT or "").strip()
+
+
+def _get_gemini_key():
+    return (os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY_DEFAULT or "").strip()
+
+
+def resoudre_saison_foot(league_slug, season_fallback="2026"):
+    cle = str(league_slug)
+    if cle in _CACHE_SAISON_ACTIVE:
+        return _CACHE_SAISON_ACTIVE[cle]
+
+    saison = str(season_fallback)
+    if hasattr(fb, "get_current_season"):
+        try:
+            res = fb.get_current_season(competition_id=cle)
+            data = res.get("data", {}) if isinstance(res, dict) else {}
+            sid = str(data.get("season_id") or data.get("id") or data.get("year") or "").strip()
+            if sid:
+                m = re.search(r"(20\d{2})", sid)
+                saison = m.group(1) if m else sid
+        except Exception:
+            pass
+
+    _CACHE_SAISON_ACTIVE[cle] = saison
+    return saison
+
+
+def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year=None):
+    saison = season_year or resoudre_saison_foot(league_slug)
+    cle = (str(team_id), str(league_slug), str(saison))
     if cle not in _CACHE_FOOT_SCHED:
-        _CACHE_FOOT_SCHED[cle] = fb.get_team_schedule(
-            team_id=cle[0],
-            league_slug=cle[1],
-            season_year=cle[2],
-            competition_id=cle[1],
-        )
+        try:
+            _CACHE_FOOT_SCHED[cle] = fb.get_team_schedule(
+                team_id=cle[0],
+                league_slug=cle[1],
+                season_year=cle[2],
+                competition_id=cle[1],
+            )
+        except Exception:
+            _CACHE_FOOT_SCHED[cle] = {"data": {"events": []}}
     return _CACHE_FOOT_SCHED[cle]
+
+
+def _extraire_evenements_depuis_reponse(payload):
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data", payload)
+    if not isinstance(data, dict):
+        return []
+    for cle in ("events", "matches", "fixtures", "games"):
+        val = data.get(cle)
+        if isinstance(val, list):
+            return val
+    return []
+
+
+def recuperer_evenements_competition(league_slug, season_year=None):
+    saison = season_year or resoudre_saison_foot(league_slug)
+    evenements = []
+
+    for nom_fn in ("get_competition_schedule", "get_league_schedule", "get_scoreboard", "get_events"):
+        fn = getattr(fb, nom_fn, None)
+        if callable(fn):
+            for kwargs in (
+                {"competition_id": league_slug, "league_slug": league_slug, "season_year": saison},
+                {"league_slug": league_slug, "season_year": saison},
+                {"competition_id": league_slug},
+            ):
+                try:
+                    evs = _extraire_evenements_depuis_reponse(fn(**kwargs))
+                    if evs:
+                        return evs
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+
+    team_ids = []
+    if hasattr(fb, "get_season_teams"):
+        try:
+            res_teams = fb.get_season_teams(
+                competition_id=league_slug,
+                league_slug=league_slug,
+                season_year=saison,
+            )
+            data_t = res_teams.get("data", {}) if isinstance(res_teams, dict) else {}
+            teams_list = data_t.get("teams") or data_t.get("competitors") or []
+            for t in teams_list:
+                tid = t.get("id") or (t.get("team", {}) if isinstance(t.get("team"), dict) else {}).get("id")
+                if tid:
+                    team_ids.append(str(tid))
+        except Exception:
+            pass
+
+    for tid in dict.fromkeys(team_ids):
+        sched = get_foot_schedule_cached(tid, league_slug=league_slug, season_year=saison)
+        evenements.extend(_extraire_evenements_depuis_reponse(sched))
+
+    return evenements
 
 
 def poisson_prob(k, lam):
@@ -245,13 +350,13 @@ def moyenne_ponderee(valeurs, defaut):
     return sum(v * p for v, p in zip(valeurs, poids)) / sum(poids)
 
 
-def stats_foot_detail(team_id, league_slug="ligue-1", season_year="2026", n_derniers=10):
+def stats_foot_detail(team_id, league_slug="ligue-1", season_year=None, n_derniers=10):
     sched = get_foot_schedule_cached(team_id, league_slug=league_slug, season_year=season_year)
-    events = sched.get("data", {}).get("events", [])
+    events = _extraire_evenements_depuis_reponse(sched)
     joues = [ev for ev in events if ev.get("status") == "closed"]
     joues.sort(key=lambda ev: str(ev.get("start_time", "")))
 
-    a_venir = [ev for ev in events if ev.get("status") == "not_started"]
+    a_venir = [ev for ev in events if ev.get("status") in ("not_started", "scheduled")]
     a_venir.sort(key=lambda ev: str(ev.get("start_time", "")))
 
     bp_all, bc_all = [], []
@@ -292,8 +397,8 @@ def stats_foot_detail(team_id, league_slug="ligue-1", season_year="2026", n_dern
             else:
                 d += 1
 
-    bp_base = moyenne_ponderee(bp_all, 1.2)
-    bc_base = moyenne_ponderee(bc_all, 1.2)
+    bp_base = moyenne_ponderee(bp_all, 1.25)
+    bc_base = moyenne_ponderee(bc_all, 1.25)
 
     return {
         "forme": f"{v}V-{n}N-{d}D",
@@ -306,7 +411,9 @@ def stats_foot_detail(team_id, league_slug="ligue-1", season_year="2026", n_dern
 
 
 def simuler_poisson_foot(lam_h, lam_a):
-    p_h = p_n = p_a = p_over_25 = 0.0
+    p_h = p_n = p_a = p_over_25 = p_btts = 0.0
+    meilleur_score = ("1-0", 0.0)
+
     for h in range(8):
         for a in range(8):
             pr = poisson_prob(h, lam_h) * poisson_prob(a, lam_a)
@@ -318,9 +425,14 @@ def simuler_poisson_foot(lam_h, lam_a):
                 p_a += pr
             if (h + a) > 2:
                 p_over_25 += pr
+            if h > 0 and a > 0:
+                p_btts += pr
+            if pr > meilleur_score[1]:
+                meilleur_score = (f"{h}-{a}", pr)
+
     tot = p_h + p_n + p_a
     p_h, p_n, p_a = p_h / tot, p_n / tot, p_a / tot
-    return p_h, p_n, p_a, p_over_25, max(0.0, 1.0 - p_over_25)
+    return p_h, p_n, p_a, p_over_25, max(0.0, 1.0 - p_over_25), p_btts, meilleur_score[0]
 
 
 def calculer_mise_kelly(prob, cote_dec, ev_pct, alerte_grave=False):
@@ -387,56 +499,75 @@ def niveau_prudence(proba_pct, nb_alertes_sante, label_val="Neutre", alerte_grav
     return "PRUDENT"
 
 
-def analyser_foot_equipes(equipes_ids, league_slug="ligue-1", n_derniers=10, heures_max=72):
-    vus = set()
+def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=48):
+    vus_evenements = set()
+    matchs_candidats = []
+
+    for comp in competitions:
+        slug = comp["slug"]
+        label_comp = comp.get("label", slug)
+        season_year = comp.get("season_year")
+
+        evenements = recuperer_evenements_competition(slug, season_year=season_year)
+        for ev in evenements:
+            if ev.get("status") not in ("not_started", "scheduled"):
+                continue
+            ev_id = str(ev.get("id", ""))
+            cle_ev = f"{slug}_{ev_id}" if ev_id else f"{slug}_{ev.get('start_time', '')}_{len(vus_evenements)}"
+            if cle_ev in vus_evenements:
+                continue
+
+            start_str = str(ev.get("start_time", ""))
+            if not dans_fenetre_heures(start_str, heures_max):
+                continue
+
+            comps = {c.get("qualifier"): c.get("team") for c in ev.get("competitors", [])}
+            h_info = comps.get("home") or {}
+            a_info = comps.get("away") or {}
+            if not h_info or not a_info:
+                continue
+
+            vus_evenements.add(cle_ev)
+            matchs_candidats.append((slug, label_comp, season_year, ev, h_info, a_info))
+
+    matchs_candidats.sort(key=lambda item: str(item[3].get("start_time", "")))
+
     resultats = []
     alertes_globales = {}
+    scans_sante_effectues = 0
 
-    for tid in equipes_ids:
-        base = stats_foot_detail(
-            tid, league_slug=league_slug, season_year=SAISON_FOOT, n_derniers=n_derniers
-        )
-        if not base["a_venir"]:
-            continue
-        ev = base["a_venir"][0]
-        ev_id = ev.get("id")
-        if ev_id in vus:
-            continue
-        vus.add(ev_id)
-
+    for slug, label_comp, season_year, ev, h_info, a_info in matchs_candidats:
+        ev_id = str(ev.get("id", ""))
         start_str = str(ev.get("start_time", ""))
-        if not dans_fenetre_heures(start_str, heures_max):
-            continue
 
-        comps = {c.get("qualifier"): c.get("team") for c in ev.get("competitors", [])}
-        h_info = comps.get("home", {})
-        a_info = comps.get("away", {})
         h_nom = h_info.get("short_name") or h_info.get("name") or "Home"
         a_nom = a_info.get("short_name") or a_info.get("name") or "Away"
 
         st_h = stats_foot_detail(
-            h_info["id"], league_slug=league_slug, season_year=SAISON_FOOT, n_derniers=n_derniers
+            h_info.get("id", ""), league_slug=slug, season_year=season_year, n_derniers=n_derniers
         )
         st_a = stats_foot_detail(
-            a_info["id"], league_slug=league_slug, season_year=SAISON_FOOT, n_derniers=n_derniers
+            a_info.get("id", ""), league_slug=slug, season_year=season_year, n_derniers=n_derniers
         )
 
         lam_h = max((st_h["bp_home"] + st_a["bc_away"]) / 2, 0.35)
         lam_a = max((st_a["bp_away"] + st_h["bc_home"]) / 2, 0.35)
-        p_h, p_n, p_a, p_ov25, p_un25 = simuler_poisson_foot(lam_h, lam_a)
+        p_h, p_n, p_a, p_ov25, p_un25, p_btts, score_prob = simuler_poisson_foot(lam_h, lam_a)
 
         options = [
-            (f"Victoire {h_nom}", p_h, h_nom),
-            ("Match nul", p_n, None),
-            (f"Victoire {a_nom}", p_a, a_nom),
+            (f"Victoire {h_nom}", p_h),
+            ("Match nul", p_n),
+            (f"Victoire {a_nom}", p_a),
         ]
-        choix, prob, _ = max(options, key=lambda x: x[1])
+        choix, prob = max(options, key=lambda x: x[1])
 
         titres_sante = []
-        for cible in [h_nom, a_nom]:
-            autres = [x for x in [h_nom, a_nom] if x != cible]
-            titres_sante += scanner_sante_cible(cible, max_titres=2, autres_cibles=autres)
-        titres_sante = list(dict.fromkeys(titres_sante))[:3]
+        if scans_sante_effectues < MAX_SCAN_SANTE_MATCHS:
+            scans_sante_effectues += 1
+            for cible in [h_nom, a_nom]:
+                autres = [x for x in [h_nom, a_nom] if x != cible]
+                titres_sante += scanner_sante_cible(cible, max_titres=2, autres_cibles=autres)
+            titres_sante = list(dict.fromkeys(titres_sante))[:3]
 
         grave = alerte_grave_detectee(titres_sante)
         malus_sante = min(len(titres_sante) * 0.02 + (0.04 if grave else 0.0), 0.10)
@@ -458,6 +589,8 @@ def analyser_foot_equipes(equipes_ids, league_slug="ligue-1", n_derniers=10, heu
 
         ov_pct = round(p_ov25 * 100, 1)
         un_pct = round(p_un25 * 100, 1)
+        btts_pct = round(p_btts * 100, 1)
+
         if ov_pct >= un_pct:
             buts_label = "+2.5 buts"
             buts_proba = ov_pct
@@ -473,13 +606,17 @@ def analyser_foot_equipes(equipes_ids, league_slug="ligue-1", n_derniers=10, heu
 
         resultats.append({
             "sport": "FOOT",
+            "competition": label_comp,
+            "competition_slug": slug,
             "fiable": True,
-            "event_id": str(ev_id),
+            "event_id": ev_id,
             "match": f"{h_nom} vs {a_nom}",
             "date_match": start_str[:10],
             "detail": (
-                f"{h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] | "
-                f"Buts: {buts_opt}{focus_buts} | Alertes 3j: {len(titres_sante)}{cote_txt}"
+                f"[{label_comp}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] | "
+                f"xG: {lam_h:.2f}-{lam_a:.2f} (Score type {score_prob}) | "
+                f"Buts: {buts_opt}{focus_buts} | BTTS: {btts_pct:.0f}% | "
+                f"Alertes 3j: {len(titres_sante)}{cote_txt}"
             ),
             "choix": choix,
             "proba": proba_pct,
@@ -495,7 +632,7 @@ def analyser_foot_equipes(equipes_ids, league_slug="ligue-1", n_derniers=10, heu
     return resultats, alertes_globales
 
 
-def analyser_tennis(heures_max=72):
+def analyser_tennis(heures_max=48):
     atp_rk = {
         " ".join(p["name"].lower().split()): p["rank"]
         for p in tn.get_rankings(tour="atp").get("data", {}).get("rankings", [])
@@ -599,6 +736,7 @@ def analyser_tennis(heures_max=72):
 
                 entree = {
                     "sport": "TENNIS",
+                    "competition": t_name or "Tennis",
                     "fiable": donnees_completes,
                     "event_id": str(m.get("id", "")),
                     "match": f"{j1} ({lbl1}) vs {j2} ({lbl2})",
@@ -666,7 +804,7 @@ def selectionner_meilleurs_paris_filtres(principaux, foot_res):
             })
 
     filtres.sort(key=lambda x: (x["type"] != "VALEUR (EV+)", -x["proba"]))
-    return filtres[:6]
+    return filtres[:8]
 
 
 def _calculer_pnl_ligne(row):
@@ -688,7 +826,7 @@ def _calculer_pnl_ligne(row):
     return round(-mise, 2)
 
 
-def mettre_a_jour_et_sauver_historique(pistes, foot_res, equipes_ids, league_slug="ligue-1"):
+def mettre_a_jour_et_sauver_historique(pistes, foot_res, competitions):
     champs = [
         "date_analyse", "sport", "event_id", "match", "date_match",
         "choix", "proba", "prudence", "cote_dec", "mise_u", "pnl_u", "statut"
@@ -732,12 +870,12 @@ def mettre_a_jour_et_sauver_historique(pistes, foot_res, equipes_ids, league_slu
         pass
 
     resultats_foot_clos = {}
-    for tid in equipes_ids:
+    for comp in competitions:
+        slug = comp["slug"]
+        season_year = comp.get("season_year")
         try:
-            sched = get_foot_schedule_cached(
-                tid, league_slug=league_slug, season_year=SAISON_FOOT
-            )
-            for ev in sched.get("data", {}).get("events", []):
+            events = recuperer_evenements_competition(slug, season_year=season_year)
+            for ev in events:
                 if ev.get("status") == "closed":
                     eid = str(ev.get("id", ""))
                     comps = ev.get("competitors", [])
@@ -887,7 +1025,7 @@ def mettre_a_jour_et_sauver_historique(pistes, foot_res, equipes_ids, league_slu
 
 
 def appeler_ia_gratuite(prompt_texte):
-    or_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    or_key = _get_openrouter_key()
     if or_key:
         try:
             r = requests.post(
@@ -920,7 +1058,7 @@ def appeler_ia_gratuite(prompt_texte):
         except Exception:
             pass
 
-    gm_key = os.getenv("GEMINI_API_KEY", "").strip()
+    gm_key = _get_gemini_key()
     if gm_key:
         try:
             url = (
@@ -955,7 +1093,7 @@ def appeler_ia_gratuite(prompt_texte):
 def generer_synthese(pistes, alertes_sante):
     lignes_pistes = [
         f"- [{p['sport']}] {p['match']} -> {p['choix']} ({p['proba']}%, niveau {p['prudence']}) | {p['detail']}"
-        for p in pistes[:6]
+        for p in pistes[:8]
     ]
     lignes_sante = [
         f"- {cible} : {' // '.join(titres)}"
@@ -974,7 +1112,7 @@ def generer_synthese(pistes, alertes_sante):
         return rep_ia
 
     lignes = ["Mode synthétique local (ajoute GEMINI_API_KEY ou OPENROUTER_API_KEY sur Render pour le texte IA)."]
-    for p in pistes[:5]:
+    for p in pistes[:6]:
         mise_str = f" · Mise {p['mise_u']:.2f}u" if p.get("mise_u", 0.0) > 0 else ""
         lignes.append(f"• [{p['prudence']}] {p['match']} → {p['choix']} ({p['proba']}%{mise_str})")
     for cible, titres in alertes_sante.items():
@@ -984,9 +1122,9 @@ def generer_synthese(pistes, alertes_sante):
 
 def executer_analyse_complete(heures_max=FENETRE_HEURES):
     _CACHE_FOOT_SCHED.clear()
-    foot_res, alertes_f = analyser_foot_equipes(
-        EQUIPES_FOOT_IDS,
-        league_slug=LIGUE_SLUG,
+    _CACHE_SAISON_ACTIVE.clear()
+    foot_res, alertes_f = analyser_tous_matchs_foot(
+        COMPETITIONS_FOOT,
         n_derniers=N_DERNIERS_MATCHS,
         heures_max=heures_max,
     )
@@ -995,7 +1133,7 @@ def executer_analyse_complete(heures_max=FENETRE_HEURES):
     principaux = sorted(foot_res + t_simples_ok, key=lambda x: x["proba"], reverse=True)
     partiels = sorted(t_simples_nc, key=lambda x: x["proba"], reverse=True)
     filtres = selectionner_meilleurs_paris_filtres(principaux, foot_res)
-    bilan = mettre_a_jour_et_sauver_historique(principaux, foot_res, EQUIPES_FOOT_IDS, league_slug=LIGUE_SLUG)
+    bilan = mettre_a_jour_et_sauver_historique(principaux, foot_res, COMPETITIONS_FOOT)
     toutes_alertes = filtrer_alertes_uniques({**alertes_f, **alertes_t})
     synthese = generer_synthese(principaux, toutes_alertes)
 
@@ -1148,7 +1286,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="topbar">
     <div>
       <div class="brand-title">BetPulse Pro</div>
-      <div class="brand-sub">{% if data.maj %}MAJ : {{ data.maj }}{% else %}Prêt pour analyse{% endif %}</div>
+      <div class="brand-sub">{% if data.maj %}MAJ : {{ data.maj }}{% else %}Prêt pour analyse (48h){% endif %}</div>
     </div>
     <form method="post" action="/refresh" style="margin:0;">
       <button type="submit" class="btn-refresh">Actualiser</button>
@@ -1201,7 +1339,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     {% for it in data.principaux %}
     <div class="card">
       <div class="card-head">
-        <span class="badge">{{ it.sport }}</span>
+        <span class="badge">{{ it.sport }}{% if it.competition %} · {{ it.competition }}{% endif %}</span>
         <span class="badge {% if 'blessure' in it.prudence|lower or 'courte' in it.prudence|lower %}badge-danger{% elif it.prudence == 'ELEVE' %}badge-ev{% else %}badge-warn{% endif %}">
           {{ it.proba }}% · {{ it.prudence }}
         </span>
