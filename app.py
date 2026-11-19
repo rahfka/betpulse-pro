@@ -8,11 +8,11 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
 import requests
+from flask import Flask, jsonify, render_template_string
 import sports_skills.betting as bt
 import sports_skills.football as fb
 import sports_skills.tennis as tn
 
-# Forcer UTF-8 proprement si disponible (utile sur Linux / Render)
 if hasattr(sys.stdout, "reconfigure"):
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -20,7 +20,7 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 # =====================================================================
-# CONFIGURATION GENERALE (GitHub + Render / 8 compétitions / 48h)
+# CONFIGURATION GENERALE (GitHub + Render — 8 compétitions / 48h)
 # =====================================================================
 def _resoudre_chemin_historique():
     env_path = os.getenv("FICHIER_HISTORIQUE", "").strip()
@@ -109,6 +109,7 @@ _CACHE_SEASON_ID = {}
 _CACHE_COMP_EVENTS = {}
 _CACHE_SANTE = {}
 _CACHE_MAPPING_IDS = None
+_DERNIER_RAPPORT = {"mis_a_jour": None, "top_sur": [], "foot": [], "tennis": [], "bilan": {}, "synthese": ""}
 
 _HTTP_SESSION = requests.Session()
 _HTTP_SESSION.headers.update({
@@ -1356,6 +1357,7 @@ def generer_synthese(pistes, alertes_sante):
 
 
 def executer_analyse():
+    global _DERNIER_RAPPORT
     print(f"Analyse en cours (fenetre: {FENETRE_HEURES}h)...", flush=True)
     mapping_ids = _resoudre_ids_competitions()
     foot_res, alertes_f, stats_comp = analyser_foot_competitions(
@@ -1377,73 +1379,103 @@ def executer_analyse():
     top_sur = sorted(tous_matchs_foot + toutes_simples_tennis, key=lambda x: x["proba"], reverse=True)
     toutes_alertes = filtrer_alertes_uniques({**alertes_f, **alertes_t})
 
-    print(f"\nMatchs Foot trouves : {len(foot_res)} (dont {len(foot_complets)} avec historique)", flush=True)
-    print("Couverture Foot :", " • ".join(f"{k}: {v}" for k, v in stats_comp.items()), flush=True)
-
-    print("\n=== 1. PRONOSTICS LES PLUS SÛRS (FOOT & TENNIS) ===", flush=True)
-    if top_sur:
-        for i, it in enumerate(top_sur[:10], 1):
-            mise_txt = f" | Mise: {it['mise_u']:.2f}u" if it.get("mise_u", 0.0) > 0 else ""
-            print(
-                f"{i}. [{it['sport']}] {it['proba']}% [{it['prudence']}] -> {it['choix']}{mise_txt}",
-                flush=True,
-            )
-            print(f"    Match : {it['match']} ({it['date_match']})", flush=True)
-    else:
-        print("Aucun match trouvé sur cette fenêtre.", flush=True)
-
-    print("\n=== 2. TOUS LES MATCHS DE FOOT (PRONOSTIC, FORME & SYNTHÈSE) ===", flush=True)
-    if tous_matchs_foot:
-        for i, it in enumerate(tous_matchs_foot, 1):
-            print(f"{i}. {it['proba']}% [{it['prudence']}] -> {it['choix']}", flush=True)
-            print(f"    Match : {it['match']} ({it['date_match']})", flush=True)
-            print(f"    Forme / Infos : {it['detail']}", flush=True)
-            if it["match"] in toutes_alertes:
-                print(f"    Synthèse santé : {' // '.join(toutes_alertes[it['match']])}", flush=True)
-    else:
-        print("Aucun match de foot trouvé sur cette fenêtre.", flush=True)
-
-    print("\n=== 3. TOUS LES MATCHS DE TENNIS (PRONOSTIC, FORME & SYNTHÈSE) ===", flush=True)
-    if toutes_simples_tennis:
-        for i, it in enumerate(toutes_simples_tennis, 1):
-            print(f"{i}. {it['proba']}% [{it['prudence']}] -> {it['choix']}", flush=True)
-            print(f"    Match : {it['match']} ({it['date_match']})", flush=True)
-            print(f"    Forme / Infos : {it['detail']}", flush=True)
-            alertes_match = []
-            for cible, titres in toutes_alertes.items():
-                if cible.lower() in it["match"].lower() or cible.lower() in it["choix"].lower():
-                    alertes_match.extend(titres)
-            if alertes_match:
-                print(f"    Synthèse santé : {' // '.join(dict.fromkeys(alertes_match))}", flush=True)
-    else:
-        print("Aucun match de tennis en simple trouvé sur cette fenêtre.", flush=True)
-
     bilan = mettre_a_jour_et_sauver_historique(
         principaux_complets,
         foot_res,
         COMPETITIONS_CIBLES,
         mapping_ids=mapping_ids,
     )
-    print("\n=== HISTORIQUE & BILAN (RAPPEL : ERREUR TOUJOURS POSSIBLE) ===", flush=True)
-    print(
-        f"Total suivis : {bilan['total']} | En attente : {bilan['en_attente']} | "
-        f"Vérifiés : {bilan['verifies']} | Gagnés : {bilan['gagnes']} ({bilan['taux']}%)",
-        flush=True,
-    )
-    print(
-        f"Bankroll -> Mises : {bilan['mises_engagees']:.2f}u | PnL : {bilan['pnl_total']:+.2f}u | "
-        f"ROI : {bilan['roi_pct']:+.1f}%",
-        flush=True,
-    )
-    print(
-        f"Détail -> Foot 1X2 : {bilan['bilan_foot']} | Buts Foot : {bilan['bilan_buts']} | "
-        f"Tennis : {bilan['bilan_tennis']}",
-        flush=True,
-    )
+    synthese = generer_synthese(top_sur or foot_partiels, toutes_alertes)
 
-    print("\n=== SYNTHESE GLOBALE FORME & SANTE ===", flush=True)
-    print(generer_synthese(top_sur or foot_partiels, toutes_alertes), flush=True)
+    _DERNIER_RAPPORT = {
+        "mis_a_jour": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "stats_comp": stats_comp,
+        "top_sur": top_sur[:10],
+        "foot": tous_matchs_foot,
+        "tennis": toutes_simples_tennis,
+        "alertes": toutes_alertes,
+        "bilan": bilan,
+        "synthese": synthese,
+    }
+    return _DERNIER_RAPPORT
+
+
+# =====================================================================
+# APPLICATION FLASK POUR GUNCORN (gunicorn app:app sur Render)
+# =====================================================================
+app = Flask(__name__, static_folder="statique", static_url_path="/statique")
+
+_HTML_PAGE = """<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BetPulse Pro</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 16px; background: #0f172a; color: #e2e8f0; }
+    h1, h2 { color: #38bdf8; }
+    .card { background: #1e293b; padding: 12px 14px; border-radius: 8px; margin-bottom: 10px; }
+    .meta { color: #94a3b8; font-size: 0.9em; }
+    a { color: #38bdf8; }
+    pre { white-space: pre-wrap; background: #1e293b; padding: 12px; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <h1>BetPulse Pro</h1>
+  <p class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }} — <a href="/refresh">Actualiser maintenant</a> · <a href="/api/analyse">JSON</a></p>
+
+  <h2>Bilan historique</h2>
+  <div class="card">
+    Total suivis : {{ r.bilan.get("total", 0) }} | En attente : {{ r.bilan.get("en_attente", 0) }} | Vérifiés : {{ r.bilan.get("verifies", 0) }} | Gagnés : {{ r.bilan.get("gagnes", 0) }} ({{ r.bilan.get("taux", 0) }}%)<br>
+    Mises : {{ r.bilan.get("mises_engagees", 0) }}u | PnL : {{ r.bilan.get("pnl_total", 0) }}u | ROI : {{ r.bilan.get("roi_pct", 0) }}%
+  </div>
+
+  <h2>Top pronostics</h2>
+  {% for it in r.top_sur %}
+  <div class="card">
+    <strong>[{{ it.sport }}] {{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong>{% if it.mise_u %} | Mise: {{ it.mise_u }}u{% endif %}<br>
+    <span class="meta">{{ it.match }} ({{ it.date_match }}) — {{ it.detail }}</span>
+  </div>
+  {% else %}
+  <div class="card">Aucun match disponible sur cette fenêtre.</div>
+  {% endfor %}
+
+  <h2>Synthèse</h2>
+  <pre>{{ r.synthese }}</pre>
+</body>
+</html>
+"""
+
+
+@app.route("/health")
+def health():
+    return "ok", 200
+
+
+@app.route("/api/analyse")
+def api_analyse():
+    if not _DERNIER_RAPPORT["mis_a_jour"]:
+        executer_analyse()
+    return jsonify(_DERNIER_RAPPORT)
+
+
+@app.route("/refresh")
+def refresh():
+    executer_analyse()
+    return render_template_string(_HTML_PAGE, r=_DERNIER_RAPPORT)
+
+
+@app.route("/")
+def index():
+    if not _DERNIER_RAPPORT["mis_a_jour"]:
+        try:
+            executer_analyse()
+        except Exception as e:
+            _DERNIER_RAPPORT["synthese"] = f"Erreur lors de l'analyse : {e}"
+    return render_template_string(_HTML_PAGE, r=_DERNIER_RAPPORT)
 
 
 if __name__ == "__main__":
     executer_analyse()
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
