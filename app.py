@@ -4,12 +4,15 @@ import math
 import os
 import re
 import sys
+import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import requests
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, redirect, render_template_string, url_for
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -32,6 +35,19 @@ fb = _charger_module_sport("sports_skills.football", "compétences_sportives.foo
 tn = _charger_module_sport("sports_skills.tennis", "compétences_sportives.tennis")
 
 
+@dataclass(frozen=True)
+class Config:
+    saison_foot: str = os.getenv("SAISON_FOOT", "2026").strip() or "2026"
+    n_derniers_matchs: int = int(os.getenv("N_DERNIERS_MATCHS", "10"))
+    fenetre_heures: int = int(os.getenv("FENETRE_HEURES", "48"))
+    timeout_http: int = int(os.getenv("TIMEOUT_HTTP", "8"))
+    cache_ttl_sec: int = int(os.getenv("CACHE_TTL_SEC", "900"))
+    max_workers: int = int(os.getenv("MAX_WORKERS", "6"))
+
+
+CFG = Config()
+
+
 def _resoudre_chemin_historique():
     env_path = os.getenv("FICHIER_HISTORIQUE", "").strip()
     if env_path:
@@ -49,76 +65,28 @@ def _resoudre_chemin_historique():
 
 
 FICHIER_HISTORIQUE = _resoudre_chemin_historique()
-
 EQUIPES_FOOT_IDS = ["160", "174", "176", "166"]
-SAISON_FOOT = os.getenv("SAISON_FOOT", "2026").strip() or "2026"
-N_DERNIERS_MATCHS = int(os.getenv("N_DERNIERS_MATCHS", "10"))
-FENETRE_HEURES = int(os.getenv("FENETRE_HEURES", "48"))
-TIMEOUT_HTTP = int(os.getenv("TIMEOUT_HTTP", "8"))
 
 COMPETITIONS_CIBLES = [
-    {
-        "slug": "ligue-1",
-        "label": "Ligue 1",
-        "mots": ("ligue 1", "ligue-1", "fra.1", "france"),
-        "equipes": ["160", "174", "176", "166"],
-    },
-    {
-        "slug": "la-liga",
-        "label": "Liga Espagnole",
-        "mots": ("la liga", "laliga", "la-liga", "esp.1", "spain"),
-        "equipes": ["86", "83", "81", "89"],
-    },
-    {
-        "slug": "bundesliga",
-        "label": "Bundesliga",
-        "mots": ("bundesliga", "ger.1", "germany"),
-        "equipes": ["132", "124", "167", "129"],
-    },
-    {
-        "slug": "portuguese-liga",
-        "label": "Liga Portugaise",
-        "mots": ("liga portugal", "primeira liga", "portuguese-liga", "por.1", "portugal"),
-        "equipes": ["1929", "1927", "1930", "1936", "160", "86", "110"],
-    },
-    {
-        "slug": "premier-league",
-        "label": "Premier League",
-        "mots": ("premier league", "premier-league", "eng.1", "england"),
-        "equipes": ["364", "359", "360", "382"],
-    },
-    {
-        "slug": "serie-a",
-        "label": "Serie A",
-        "mots": ("serie a", "serie-a", "ita.1", "italy"),
-        "equipes": ["111", "110", "103", "114"],
-    },
-    {
-        "slug": "uefa-champions-league",
-        "label": "Ligue des Champions",
-        "mots": ("champions league", "champions-league", "uefa.champions", "ucl"),
-        "equipes": ["160", "86", "83", "364", "132", "110"],
-    },
-    {
-        "slug": "uefa-europa-league",
-        "label": "Europa League",
-        "mots": ("europa league", "europa-league", "uefa.europa", "uel"),
-        "equipes": ["176", "174", "360", "111", "129", "166"],
-    },
+    {"slug": "ligue-1", "label": "Ligue 1", "mots": ("ligue 1", "ligue-1", "fra.1", "france"), "equipes": ["160", "174", "176", "166"]},
+    {"slug": "la-liga", "label": "Liga Espagnole", "mots": ("la liga", "laliga", "la-liga", "esp.1", "spain"), "equipes": ["86", "83", "81", "89"]},
+    {"slug": "bundesliga", "label": "Bundesliga", "mots": ("bundesliga", "ger.1", "germany"), "equipes": ["132", "124", "167", "129"]},
+    {"slug": "portuguese-liga", "label": "Liga Portugaise", "mots": ("liga portugal", "primeira liga", "portuguese-liga", "por.1", "portugal"), "equipes": ["1929", "1927", "1930", "1936"]},
+    {"slug": "premier-league", "label": "Premier League", "mots": ("premier league", "premier-league", "eng.1", "england"), "equipes": ["364", "359", "360", "382"]},
+    {"slug": "serie-a", "label": "Serie A", "mots": ("serie a", "serie-a", "ita.1", "italy"), "equipes": ["111", "110", "103", "114"]},
+    {"slug": "uefa-champions-league", "label": "Ligue des Champions", "mots": ("champions league", "champions-league", "uefa.champions", "ucl"), "equipes": ["160", "86", "83", "364", "132", "110"]},
+    {"slug": "uefa-europa-league", "label": "Europa League", "mots": ("europa league", "europa-league", "uefa.europa", "uel"), "equipes": ["176", "174", "360", "111", "1929", "129"]},
 ]
-
-STATUTS_CLOS = ("closed", "final", "post", "completed")
-STATUTS_LIVE = ("in_progress", "live")
 
 _CACHE_FOOT_SCHED = {}
 _CACHE_SANTE = {}
+_ANALYSE_LOCK = threading.Lock()
 _DERNIER_RAPPORT = {
     "mis_a_jour": None,
     "stats_comp": {},
     "apercu_bruts": "",
     "top_sur": [],
     "foot": [],
-    "foot_clos": [],
     "tennis": [],
     "alertes": {},
     "bilan": {},
@@ -132,6 +100,21 @@ _HTTP_SESSION.headers.update({
         "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
     )
 })
+
+
+def _cache_get(cache_dict, cle):
+    entree = cache_dict.get(cle)
+    if not entree:
+        return None
+    ts, val = entree
+    if (datetime.now(timezone.utc).timestamp() - ts) > CFG.cache_ttl_sec:
+        cache_dict.pop(cle, None)
+        return None
+    return val
+
+
+def _cache_set(cache_dict, cle, val):
+    cache_dict[cle] = (datetime.now(timezone.utc).timestamp(), val)
 
 
 def _extraire_events(payload):
@@ -185,27 +168,25 @@ def _normaliser_home_away(ev):
 
 def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year="2026"):
     cle = (str(team_id), str(league_slug), str(season_year))
-    if cle not in _CACHE_FOOT_SCHED:
-        fn = getattr(fb, "get_team_schedule", None)
-        if callable(fn):
+    cached = _cache_get(_CACHE_FOOT_SCHED, cle)
+    if cached is not None:
+        return cached
+
+    fn = getattr(fb, "get_team_schedule", None)
+    res = {"data": {"events": []}}
+    if callable(fn):
+        try:
+            res = fn(team_id=cle[0], league_slug=cle[1], season_year=cle[2], competition_id=cle[1])
+        except TypeError:
             try:
-                _CACHE_FOOT_SCHED[cle] = fn(
-                    team_id=cle[0],
-                    league_slug=cle[1],
-                    season_year=cle[2],
-                    competition_id=cle[1],
-                )
-            except TypeError:
-                try:
-                    _CACHE_FOOT_SCHED[cle] = fn(cle[0], cle[1], cle[2])
-                except Exception:
-                    _CACHE_FOOT_SCHED[cle] = {"data": {"events": []}}
-            except Exception as e:
-                print(f"[FOOT] get_team_schedule({cle}) erreur: {e}", flush=True)
-                _CACHE_FOOT_SCHED[cle] = {"data": {"events": []}}
-        else:
-            _CACHE_FOOT_SCHED[cle] = {"data": {"events": []}}
-    return _CACHE_FOOT_SCHED[cle]
+                res = fn(cle[0], cle[1], cle[2])
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[FOOT] get_team_schedule({cle}) erreur: {e}", flush=True)
+
+    _cache_set(_CACHE_FOOT_SCHED, cle, res)
+    return res
 
 
 def _parse_date_utc(date_str):
@@ -215,11 +196,8 @@ def _parse_date_utc(date_str):
     try:
         if len(s) == 10 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
             return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        s = s.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
 
@@ -231,8 +209,7 @@ def dans_fenetre_heures(date_str, heures_max):
     if dt is None:
         return True
     maintenant = datetime.now(timezone.utc)
-    limite = maintenant + timedelta(hours=heures_max)
-    return (maintenant - timedelta(hours=2)) <= dt <= limite
+    return (maintenant - timedelta(hours=2)) <= dt <= (maintenant + timedelta(hours=heures_max))
 
 
 def poisson_prob(k, lam):
@@ -269,8 +246,8 @@ def moyenne_ponderee(valeurs, defaut):
 
 def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=10):
     events = list(events_override or [])
-    joues = [ev for ev in events if str(ev.get("status", "")).lower() in STATUTS_CLOS]
-    joues.sort(key=lambda ev: str(ev.get("start_time", "") or ev.get("date", "")))
+    joues = [ev for ev in events if str(ev.get("status", "")).lower() in ("closed", "final", "post", "completed")]
+    joues.sort(key=lambda ev: str(ev.get("start_time") or ev.get("date") or ""))
 
     bp_all, bc_all = [], []
     v = n = d = 0
@@ -288,7 +265,8 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=10
         else:
             comps_liste = []
 
-        moi = adv = None
+        scores_par_role = []
+        moi = None
         for c in comps_liste:
             if not isinstance(c, dict):
                 continue
@@ -302,14 +280,25 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=10
                 sc_int = int(float(sc))
             except Exception:
                 continue
-            est_moi = (
-                (team_id and tid and tid == str(team_id))
-                or (nom_l and tnm and (tnm == nom_l or nom_l in tnm or tnm in nom_l))
-            )
-            if est_moi and moi is None:
-                moi = sc_int
-            elif adv is None:
-                adv = sc_int
+            scores_par_role.append((tid, tnm, sc_int))
+            if (team_id and tid and tid == str(team_id)) or (nom_l and tnm and (tnm == nom_l or nom_l in tnm or tnm in nom_l)):
+                if moi is None:
+                    moi = sc_int
+
+        adv = None
+        if moi is not None and len(scores_par_role) >= 2:
+            for tid, tnm, sc_int in scores_par_role:
+                if not ((team_id and tid and tid == str(team_id)) or (nom_l and tnm and tnm == nom_l)):
+                    adv = sc_int
+                    break
+            if adv is None:
+                # Fallback si un seul match sur le nom partiel
+                for _, _, sc_int in scores_par_role:
+                    if sc_int != moi:
+                        adv = sc_int
+                        break
+                if adv is None:
+                    adv = moi
 
         if moi is not None and adv is not None:
             bp_all.append(moi)
@@ -326,26 +315,26 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=10
     bp_all.reverse()
     bc_all.reverse()
     a_historique = (v + n + d) > 0
-    bp_base = moyenne_ponderee(bp_all, 1.25)
-    bc_base = moyenne_ponderee(bc_all, 1.20)
 
     return {
         "forme": f"{v}V-{n}N-{d}D" if a_historique else "Forme récente",
         "a_historique": a_historique,
-        "bp": bp_base,
-        "bc": bc_base,
+        "bp": moyenne_ponderee(bp_all, 1.25),
+        "bc": moyenne_ponderee(bc_all, 1.20),
     }
 
 
 def scanner_sante_cible(cible, max_titres=2):
     cle = (str(cible).strip().lower(), max_titres)
-    if cle in _CACHE_SANTE:
-        return list(_CACHE_SANTE[cle])
+    cached = _cache_get(_CACHE_SANTE, cle)
+    if cached is not None:
+        return list(cached)
+
     q = urllib.parse.quote(f'"{cible}" (blessure OR forfait OR incertain) when:3d')
     url = f"https://news.google.com/rss/search?q={q}&hl=fr&gl=FR&ceid=FR:fr"
     titres = []
     try:
-        r = _HTTP_SESSION.get(url, timeout=TIMEOUT_HTTP)
+        r = _HTTP_SESSION.get(url, timeout=CFG.timeout_http)
         if r.status_code == 200:
             root = ET.fromstring(r.text)
             for item in root.findall(".//item")[:5]:
@@ -354,31 +343,10 @@ def scanner_sante_cible(cible, max_titres=2):
                     titres.append(t)
     except Exception:
         pass
-    _CACHE_SANTE[cle] = titres[:max_titres]
-    return list(_CACHE_SANTE[cle])
 
-
-def _formater_resultat_clos(ev, label_comp, events_comp):
-    start_str = str(ev.get("start_time") or ev.get("date") or "")
-    h_info, a_info = _normaliser_home_away(ev)
-    h_nom = h_info.get("short_name") or h_info.get("name") or "Home"
-    a_nom = a_info.get("short_name") or a_info.get("name") or "Away"
-    sc_h = h_info.get("score")
-    sc_a = a_info.get("score")
-    score_txt = f"{sc_h} - {sc_a}" if (sc_h is not None and sc_a is not None) else "Terminé"
-
-    st_h = stats_foot_detail(h_info.get("id", ""), h_nom, events_comp, N_DERNIERS_MATCHS)
-    st_a = stats_foot_detail(a_info.get("id", ""), a_nom, events_comp, N_DERNIERS_MATCHS)
-
-    return {
-        "sport": "FOOT",
-        "competition": label_comp,
-        "event_id": str(ev.get("id") or ""),
-        "match": f"{h_nom} vs {a_nom}",
-        "date_match": start_str[:16].replace("T", " "),
-        "score": score_txt,
-        "detail": f"[{label_comp}] Score final : {score_txt} | {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}]",
-    }
+    res = titres[:max_titres]
+    _cache_set(_CACHE_SANTE, cle, res)
+    return list(res)
 
 
 def _construire_entree_foot(ev, label_comp, events_comp, hors_fenetre=False):
@@ -389,12 +357,13 @@ def _construire_entree_foot(ev, label_comp, events_comp, hors_fenetre=False):
     h_nom = h_info.get("short_name") or h_info.get("name") or "Home"
     a_nom = a_info.get("short_name") or a_info.get("name") or "Away"
 
-    st_h = stats_foot_detail(h_info.get("id", ""), h_nom, events_comp, N_DERNIERS_MATCHS)
-    st_a = stats_foot_detail(a_info.get("id", ""), a_nom, events_comp, N_DERNIERS_MATCHS)
+    st_h = stats_foot_detail(h_info.get("id", ""), h_nom, events_comp, CFG.n_derniers_matchs)
+    st_a = stats_foot_detail(a_info.get("id", ""), a_nom, events_comp, CFG.n_derniers_matchs)
     fiable = st_h["a_historique"] or st_a["a_historique"]
 
-    lam_h = max((st_h["bp"] + st_a["bc"]) / 2, 0.35)
-    lam_a = max((st_a["bp"] + st_h["bc"]) / 2, 0.35)
+    # Léger avantage domicile (+10% attaque domicile / -10% attaque extérieure)
+    lam_h = max(((st_h["bp"] * 1.10) + st_a["bc"]) / 2, 0.35)
+    lam_a = max(((st_a["bp"] * 0.90) + st_h["bc"]) / 2, 0.35)
     p_h, p_n, p_a, p_ov25, p_un25 = simuler_poisson_foot(lam_h, lam_a)
 
     choix, prob = max(
@@ -429,8 +398,7 @@ def _construire_entree_foot(ev, label_comp, events_comp, hors_fenetre=False):
 
 
 def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
-    resultats_a_jouer = []
-    resultats_clos = []
+    resultats = []
     alertes_globales = {}
     stats_par_comp = {}
     apercu_lignes = []
@@ -443,7 +411,7 @@ def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
 
         raw_comp_events = []
         for tid in ids_equipes:
-            sched = get_foot_schedule_cached(tid, slug, SAISON_FOOT)
+            sched = get_foot_schedule_cached(tid, slug, CFG.saison_foot)
             evs = _extraire_events(sched)
             raw_comp_events.extend(evs)
             if len(apercu_lignes) < 12 and evs:
@@ -469,48 +437,39 @@ def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
                 dedup_comp[eid] = ev
 
         events_comp = list(dedup_comp.values())
-        retenus_fenetre = []
-        a_venir_tous = []
-        clos_tous = []
-
-        for ev in events_comp:
-            statut = str(ev.get("status") or "").lower()
-            if statut in STATUTS_CLOS:
-                clos_tous.append(ev)
-                continue
-            if statut in STATUTS_LIVE:
-                continue
-            a_venir_tous.append(ev)
-            if dans_fenetre_heures(str(ev.get("start_time") or ev.get("date") or ""), heures_max):
-                retenus_fenetre.append(ev)
+        retenus_fenetre = [
+            ev for ev in events_comp
+            if str(ev.get("status") or "").lower() not in ("closed", "final", "post", "completed", "in_progress", "live")
+            and dans_fenetre_heures(str(ev.get("start_time") or ev.get("date") or ""), heures_max)
+        ]
 
         hors_fenetre_mode = False
-        candidats_a_jouer = retenus_fenetre
-        if not candidats_a_jouer and a_venir_tous:
-            a_venir_tous.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
-            candidats_a_jouer = a_venir_tous[:3]
+        candidats = retenus_fenetre
+        if not candidats and events_comp:
+            a_venir = [
+                ev for ev in events_comp
+                if str(ev.get("status") or "").lower() not in ("closed", "final", "post", "completed")
+            ]
+            a_venir.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
+            candidats = a_venir[:3] if a_venir else events_comp[-3:]
             hors_fenetre_mode = True
 
         ajoutes_comp = 0
-        for ev in candidats_a_jouer:
-            cle_unique = f"{slug}_{ev.get('id') or ev.get('start_time')}_{ajoutes_comp}"
-            if cle_unique in vus_globaux:
+        for ev in candidats:
+            cle_globale = str(ev.get("id") or f"{ev.get('start_time')}_{ajoutes_comp}")
+            if cle_globale in vus_globaux:
                 continue
-            vus_globaux.add(cle_unique)
+            vus_globaux.add(cle_globale)
             entree, titres_s = _construire_entree_foot(ev, label_comp, events_comp, hors_fenetre=hors_fenetre_mode)
-            resultats_a_jouer.append(entree)
+            resultats.append(entree)
             ajoutes_comp += 1
             if titres_s:
                 alertes_globales[entree["match"]] = titres_s
 
-        clos_tous.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""), reverse=True)
-        for ev in clos_tous[:2]:
-            resultats_clos.append(_formater_resultat_clos(ev, label_comp, events_comp))
-
-        stats_par_comp[label_comp] = f"48h:{len(retenus_fenetre)} | à jouer:{ajoutes_comp} | clos:{len(clos_tous)} (bruts:{len(events_comp)})"
+        stats_par_comp[label_comp] = f"{len(retenus_fenetre)}/{ajoutes_comp} (bruts: {len(events_comp)})"
 
     print("Couverture Foot :", " • ".join(f"{k}: {v}" for k, v in stats_par_comp.items()), flush=True)
-    return resultats_a_jouer, resultats_clos, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12])
+    return resultats, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12])
 
 
 def trouver_rang(nom, rk_map):
@@ -583,6 +542,35 @@ def analyser_tennis(heures_max=48):
     return simples, alertes_tennis
 
 
+def _calculer_bilan(lignes):
+    verifies = [r for r in lignes if r.get("statut") in ("GAGNE", "PERDU")]
+    gagnes = [r for r in verifies if r.get("statut") == "GAGNE"]
+    mises = 0.0
+    pnl = 0.0
+    for r in verifies:
+        try:
+            m = float(r.get("mise_u") or 0.0)
+        except Exception:
+            m = 0.0
+        mises += m
+        if r.get("statut") == "GAGNE":
+            pnl += m
+        elif r.get("statut") == "PERDU":
+            pnl -= m
+    taux = round((len(gagnes) / len(verifies)) * 100, 1) if verifies else 0.0
+    roi = round((pnl / mises) * 100, 1) if mises > 0 else 0.0
+    return {
+        "total": len(lignes),
+        "en_attente": sum(1 for r in lignes if r.get("statut") == "EN_ATTENTE"),
+        "verifies": len(verifies),
+        "gagnes": len(gagnes),
+        "taux": taux,
+        "mises_engagees": round(mises, 2),
+        "pnl_total": round(pnl, 2),
+        "roi_pct": roi,
+    }
+
+
 def mettre_a_jour_historique(items):
     champs = ["date_analyse", "sport", "event_id", "match", "date_match", "choix", "proba", "prudence", "mise_u", "statut"]
     lignes = []
@@ -625,50 +613,41 @@ def mettre_a_jour_historique(items):
     except Exception:
         pass
 
-    return {
-        "total": len(lignes),
-        "en_attente": sum(1 for r in lignes if r.get("statut") == "EN_ATTENTE"),
-        "verifies": sum(1 for r in lignes if r.get("statut") in ("GAGNE", "PERDU")),
-        "gagnes": sum(1 for r in lignes if r.get("statut") == "GAGNE"),
-        "taux": 0.0,
-        "mises_engagees": 0.0,
-        "pnl_total": 0.0,
-        "roi_pct": 0.0,
-    }
+    return _calculer_bilan(lignes)
 
 
 def executer_analyse():
     global _DERNIER_RAPPORT
-    print(f"Analyse en cours (fenetre: {FENETRE_HEURES}h)...", flush=True)
-    foot_res, foot_clos, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
-        COMPETITIONS_CIBLES, EQUIPES_FOOT_IDS, FENETRE_HEURES
-    )
-    tennis_res, alertes_t = analyser_tennis(FENETRE_HEURES)
+    with _ANALYSE_LOCK:
+        print(f"Analyse en cours (fenetre: {CFG.fenetre_heures}h)...", flush=True)
+        foot_res, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
+            COMPETITIONS_CIBLES, EQUIPES_FOOT_IDS, CFG.fenetre_heures
+        )
+        tennis_res, alertes_t = analyser_tennis(CFG.fenetre_heures)
 
-    foot_sorted = sorted(foot_res, key=lambda x: x["proba"], reverse=True)
-    tennis_sorted = sorted(tennis_res, key=lambda x: x["proba"], reverse=True)
-    top_sur = sorted(foot_sorted + tennis_sorted, key=lambda x: x["proba"], reverse=True)[:10]
-    alertes = {**alertes_f, **alertes_t}
-    bilan = mettre_a_jour_historique([x for x in top_sur if x.get("fiable", True)])
+        foot_sorted = sorted(foot_res, key=lambda x: x["proba"], reverse=True)
+        tennis_sorted = sorted(tennis_res, key=lambda x: x["proba"], reverse=True)
+        top_sur = sorted(foot_sorted + tennis_sorted, key=lambda x: x["proba"], reverse=True)[:10]
+        alertes = {**alertes_f, **alertes_t}
+        bilan = mettre_a_jour_historique([x for x in top_sur if x.get("fiable", True)])
 
-    synthese = "\n".join(
-        f"• [{x['sport']} | {x['prudence']}] {x['match']} -> {x['choix']} ({x['proba']}%)"
-        for x in top_sur[:8]
-    ) or "Aucun pronostic à venir disponible sur cette fenêtre."
+        synthese = "\n".join(
+            f"• [{x['sport']} | {x['prudence']}] {x['match']} -> {x['choix']} ({x['proba']}%)"
+            for x in top_sur[:8]
+        ) or "Aucun pronostic disponible."
 
-    _DERNIER_RAPPORT = {
-        "mis_a_jour": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "stats_comp": stats_comp,
-        "apercu_bruts": apercu_bruts,
-        "top_sur": top_sur,
-        "foot": foot_sorted,
-        "foot_clos": foot_clos,
-        "tennis": tennis_sorted,
-        "alertes": alertes,
-        "bilan": bilan,
-        "synthese": synthese,
-    }
-    return _DERNIER_RAPPORT
+        _DERNIER_RAPPORT = {
+            "mis_a_jour": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "stats_comp": stats_comp,
+            "apercu_bruts": apercu_bruts,
+            "top_sur": top_sur,
+            "foot": foot_sorted,
+            "tennis": tennis_sorted,
+            "alertes": alertes,
+            "bilan": bilan,
+            "synthese": synthese,
+        }
+        return _DERNIER_RAPPORT
 
 
 app = Flask(__name__, static_folder="statique", static_url_path="/statique")
@@ -685,12 +664,17 @@ _HTML_PAGE = """<!doctype html>
     .card { background: #1e293b; padding: 12px 14px; border-radius: 8px; margin-bottom: 10px; }
     .meta { color: #94a3b8; font-size: 0.9em; }
     a { color: #38bdf8; }
+    button { background: #38bdf8; color: #0f172a; border: none; padding: 6px 12px; border-radius: 6px; cursor: pointer; font-weight: bold; }
     pre { white-space: pre-wrap; background: #1e293b; padding: 12px; border-radius: 8px; }
   </style>
 </head>
 <body>
   <h1>BetPulse Pro</h1>
-  <p class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }} — <a href="/refresh">Actualiser maintenant</a> · <a href="/api/analyse">JSON</a></p>
+  <form method="post" action="/refresh" style="display:inline;">
+    <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }} —</span>
+    <button type="submit">Actualiser maintenant</button>
+    <span class="meta">· <a href="/api/analyse">JSON</a></span>
+  </form>
 
   <h2>Couverture Foot</h2>
   <div class="card">
@@ -699,35 +683,42 @@ _HTML_PAGE = """<!doctype html>
     {% endfor %}
   </div>
 
-  <h2>Matchs de Foot à jouer ({{ r.foot|length }})</h2>
+  <h2>Matchs de Foot ({{ r.foot|length }})</h2>
   {% for it in r.foot %}
   <div class="card">
     <strong>{{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong><br>
     <span class="meta">{{ it.match }} ({{ it.date_match }}) — {{ it.detail }}</span>
   </div>
   {% else %}
-  <div class="card">Aucun match de foot à venir trouvé (les matchs retournés par la source sont clos).</div>
+  <div class="card">Aucun match de foot trouvé.</div>
   {% endfor %}
 
-  <h2>Derniers résultats Foot (référence forme — {{ r.foot_clos|length }})</h2>
-  {% for it in r.foot_clos %}
+  <h2>Matchs de Tennis ({{ r.tennis|length }})</h2>
+  {% for it in r.tennis %}
   <div class="card">
-    <strong>{{ it.match }} ({{ it.score }})</strong><br>
-    <span class="meta">{{ it.date_match }} — {{ it.detail }}</span>
+    <strong>{{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong><br>
+    <span class="meta">{{ it.match }} ({{ it.date_match }}) — {{ it.detail }}</span>
   </div>
   {% else %}
-  <div class="card">Aucun résultat récent disponible.</div>
+  <div class="card">Aucun match de tennis trouvé.</div>
   {% endfor %}
 
-  <h2>Top pronostics à jouer (Foot &amp; Tennis)</h2>
+  <h2>Top pronostics (Foot &amp; Tennis)</h2>
   {% for it in r.top_sur %}
   <div class="card">
     <strong>[{{ it.sport }}] {{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong><br>
     <span class="meta">{{ it.match }} ({{ it.date_match }})</span>
   </div>
-  {% else %}
-  <div class="card">Aucun pronostic à venir sur cette fenêtre.</div>
   {% endfor %}
+
+  <h2>Alertes blessures / forfaits (3j)</h2>
+  <div class="card">
+    {% for cible, titres in r.get("alertes", {}).items() %}
+      <p><strong>{{ cible }}</strong> : {{ titres | join(" | ") }}</p>
+    {% else %}
+      <span class="meta">Aucune alerte récente.</span>
+    {% endfor %}
+  </div>
 
   <h2>Aperçu données brutes Foot</h2>
   <pre>{{ r.apercu_bruts or "Aucun événement brut." }}</pre>
@@ -751,10 +742,10 @@ def api_analyse():
     return jsonify(_DERNIER_RAPPORT)
 
 
-@app.route("/refresh")
+@app.route("/refresh", methods=["POST"])
 def refresh():
     executer_analyse()
-    return render_template_string(_HTML_PAGE, r=_DERNIER_RAPPORT)
+    return redirect(url_for("index"))
 
 
 @app.route("/")
