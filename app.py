@@ -44,7 +44,7 @@ class Config:
     saison_foot: str = os.getenv("SAISON_FOOT", "2026").strip() or "2026"
     n_derniers_matchs: int = int(os.getenv("N_DERNIERS_MATCHS", "10"))
     fenetre_heures: int = int(os.getenv("FENETRE_HEURES", "48"))
-    timeout_http: int = int(os.getenv("TIMEOUT_HTTP", "8"))
+    timeout_http: int = int(os.getenv("TIMEOUT_HTTP", "6"))
     cache_ttl_sec: int = int(os.getenv("CACHE_TTL_SEC", "300"))
 
 
@@ -98,13 +98,12 @@ _DERNIER_RAPPORT = {
     "synthese": "",
 }
 
-_HTTP_SESSION = requests.Session()
-_HTTP_SESSION.headers.update({
+_HTTP_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
     )
-})
+}
 
 
 def _cache_get(cache_dict, cle):
@@ -347,7 +346,8 @@ def _requete_rss(requete_brute, max_titres=2):
     url = f"https://news.google.com/rss/search?q={q}&hl=fr&gl=FR&ceid=FR:fr"
     titres = []
     try:
-        r = _HTTP_SESSION.get(url, timeout=CFG.timeout_http)
+        # On utilise requests.get au lieu de _HTTP_SESSION pour être thread-safe
+        r = requests.get(url, headers=_HTTP_HEADERS, timeout=CFG.timeout_http)
         if r.status_code == 200:
             root = ET.fromstring(r.text)
             for item in root.findall(".//item")[:5]:
@@ -365,9 +365,8 @@ def scanner_sante_cible(cible, max_titres=2):
     if cached is not None:
         return list(cached)
 
-    res = _requete_rss(f'"{cible}" (blessure OR forfait OR incertain OR absent) -composition when:3d', max_titres)
-    if not res:
-        res = _requete_rss(f'{cible} (blessure OR forfait OR cuisse OR genou OR cheville) when:5d', max_titres)
+    # Une seule requête pour limiter le temps d'exécution
+    res = _requete_rss(f'"{cible}" (blessure OR forfait OR incertain OR absent) when:3d', max_titres)
 
     _cache_set(_CACHE_SANTE, cle, res)
     return list(res)
@@ -393,16 +392,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         key=lambda x: x[1],
     )
 
-    titres_h = scanner_sante_cible(h_nom, 1)
-    titres_a = scanner_sante_cible(a_nom, 1)
-    
-    alertes_eq = {}
-    if titres_h: alertes_eq[h_nom] = titres_h
-    if titres_a: alertes_eq[a_nom] = titres_a
-    
-    nb_alertes = len(titres_h) + len(titres_a)
-    proba_pct = round(max(0.05, prob - min(nb_alertes * 0.02, 0.08)) * 100, 1)
-
+    proba_pct = round(max(0.05, prob) * 100, 1)
     buts_label = "+2.5 buts" if p_ov25 >= p_un25 else "-2.5 buts"
     buts_proba = round(max(p_ov25, p_un25) * 100, 1)
 
@@ -418,7 +408,8 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "proba": proba_pct,
         "prudence": "ELEVE" if proba_pct >= 72 else ("MODERE" if proba_pct >= 56 else "PRUDENT"),
         "mise_u": 0.0,
-    }, alertes_eq
+        "equipes": [h_nom, a_nom],
+    }, {}
 
 
 def analyser_foot_competitions(competitions, heures_max=48):
@@ -430,7 +421,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
 
     aujourdhui = datetime.now(timezone.utc).date()
 
-    # --- ÉTAPE 1 : Récupérer les scoreboards en parallèle ---
+    # --- ÉTAPE 1 : Récupérer les scoreboards (matchs à venir) en parallèle ---
     taches_sb = []
     for comp in competitions:
         for delta in range(3):
@@ -474,7 +465,6 @@ def analyser_foot_competitions(competitions, heures_max=48):
     with ThreadPoolExecutor(max_workers=20) as ex:
         res_hist = list(ex.map(charger_hist, taches_hist))
 
-    # Regrouper les historiques par slug
     events_hist_par_slug = {c["slug"]: [] for c in competitions}
     for i, (tid, slug) in enumerate(taches_hist):
         events_hist_par_slug[slug].extend(res_hist[i])
@@ -484,7 +474,6 @@ def analyser_foot_competitions(competitions, heures_max=48):
         slug = comp["slug"]
         label_comp = comp["label"]
         
-        # Fusionner et dédupliquer
         raw_comp_events = events_hist_par_slug[slug] + events_upcoming_par_slug[slug]
         dedup_comp = {}
         for idx, ev in enumerate(raw_comp_events):
@@ -503,9 +492,8 @@ def analyser_foot_competitions(competitions, heures_max=48):
         apercu_comp = []
 
         for ev in a_venir_48h:
-            entree, alertes_eq = _construire_entree_foot(ev, label_comp, events_comp)
+            entree, _ = _construire_entree_foot(ev, label_comp, events_comp)
             res_comp.append(entree)
-            alertes_comp.update(alertes_eq)
 
             if len(apercu_comp) < 2:
                 h, a = _normaliser_home_away(ev)
@@ -580,10 +568,8 @@ def analyser_tennis(heures_max=48):
                 favori, prob = (j1, p1) if p1 >= 0.5 else (j2, 1 - p1)
                 if complet:
                     prob = min(max(prob, 0.50), 0.82)
-                sante = scanner_sante_cible(favori, 1) if complet else []
-                if sante:
-                    alertes_tennis[favori] = sante
-                proba_pct = round(max(0.05, prob - len(sante) * 0.03) * 100, 1)
+                
+                proba_pct = round(max(0.05, prob) * 100, 1)
                 simples.append({
                     "sport": "TENNIS",
                     "competition": t_name or "Tennis",
@@ -594,10 +580,49 @@ def analyser_tennis(heures_max=48):
                     "detail": f"{t_name}",
                     "choix": f"Victoire {favori}",
                     "proba": proba_pct,
-                    "prudence": "PRUDENT (alerte)" if sante else ("MODERE" if proba_pct >= 56 else "PRUDENT"),
+                    "prudence": "MODERE" if proba_pct >= 56 else "PRUDENT",
                     "mise_u": 0.0,
+                    "equipes": [favori]
                 })
     return simples, alertes_tennis
+
+
+def _enrichir_sante_top(top_items):
+    """Scanne la santé UNIQUEMENT pour les N meilleurs pronostics."""
+    if not top_items:
+        return {}
+    
+    equipes_a_scanner = set()
+    for it in top_items:
+        for nom in it.get("equipes", []):
+            if nom:
+                equipes_a_scanner.add(nom)
+    
+    alertes_globales = {}
+    penalites = {}
+
+    def scanner(nom):
+        try:
+            return nom, scanner_sante_cible(nom, 1)
+        except Exception:
+            return nom, []
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for nom, titres in ex.map(scanner, equipes_a_scanner):
+            if titres:
+                alertes_globales[nom] = titres
+                penalites[nom] = len(titres)
+
+    for it in top_items:
+        nb = sum(penalites.get(n, 0) for n in it.get("equipes", []))
+        if nb:
+            it["proba"] = round(max(0.05, it["proba"] / 100 - min(nb * 0.02, 0.08)) * 100, 1)
+            it["prudence"] = (
+                "ELEVE" if it["proba"] >= 72
+                else ("MODERE" if it["proba"] >= 56 else "PRUDENT (alerte)")
+            )
+
+    return alertes_globales
 
 
 def _calculer_bilan(lignes):
@@ -696,14 +721,8 @@ def executer_analyse():
         foot_sorted = sorted(foot_res, key=lambda x: x["proba"], reverse=True)
         tennis_sorted = sorted(tennis_res, key=lambda x: x["proba"], reverse=True)
         top_sur = sorted(foot_sorted + tennis_sorted, key=lambda x: x["proba"], reverse=True)[:10]
-        alertes = {**alertes_f, **alertes_t}
-        bilan = mettre_a_jour_historique([x for x in top_sur if x.get("fiable", True)])
-
-        synthese = "\n".join(
-            f"• [{x['sport']} | {x['prudence']}] {x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
-            for x in top_sur[:8]
-        ) or "Aucun match à venir dans les prochaines 48h."
-
+        
+        # Publication d'un rapport rapide sans les blessures
         _DERNIER_RAPPORT = {
             "mis_a_jour": datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M %Z"),
             "stats_comp": stats_comp,
@@ -711,10 +730,26 @@ def executer_analyse():
             "top_sur": top_sur,
             "foot": foot_sorted,
             "tennis": tennis_sorted,
-            "alertes": alertes,
-            "bilan": bilan,
-            "synthese": synthese,
+            "alertes": {**alertes_f, **alertes_t},
+            "bilan": mettre_a_jour_historique([x for x in top_sur if x.get("fiable", True)]),
+            "synthese": "",
         }
+        
+        # Enrichissement blessures (seulement top 10)
+        try:
+            alertes_sante = _enrichir_sante_top(top_sur)
+            _DERNIER_RAPPORT["alertes"] = {**_DERNIER_RAPPORT["alertes"], **alertes_sante}
+            _DERNIER_RAPPORT["top_sur"] = sorted(top_sur, key=lambda x: x["proba"], reverse=True)
+            _DERNIER_RAPPORT["foot"] = sorted(foot_sorted, key=lambda x: x["proba"], reverse=True)
+        except Exception as e:
+            print(f"[ERREUR] Santé: {e}", flush=True)
+            
+        _DERNIER_RAPPORT["synthese"] = "\n".join(
+            f"• [{x['sport']} | {x['prudence']}] {x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
+            for x in _DERNIER_RAPPORT["top_sur"][:8]
+        ) or "Aucun match à venir dans les prochaines 48h."
+
+        print("Analyse terminée et rapport mis à jour.", flush=True)
         return _DERNIER_RAPPORT
 
 
@@ -928,10 +963,40 @@ def refresh():
 @app.route("/")
 def index():
     if not _DERNIER_RAPPORT["mis_a_jour"]:
-        executer_analyse()
+        # Écran d'attente pour éviter de faire planter Gunicorn au démarrage
+        return render_template_string("""
+        <!doctype html>
+        <html><head>
+          <meta charset="utf-8">
+          <meta http-equiv="refresh" content="5">
+          <title>BetPulse Pro — Analyse en cours…</title>
+          <style>
+            body { background: #0f172a; color: #e2e8f0; font-family: sans-serif; text-align: center; padding: 80px; }
+            h1 { color: #38bdf8; }
+            p { color: #94a3b8; }
+            .loader { border: 4px solid #334155; border-top: 4px solid #38bdf8; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto; }
+            @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+          </style>
+        </head><body>
+          <h1>BetPulse Pro</h1>
+          <div class="loader"></div>
+          <p>Récupération des matchs et analyse des données en cours…</p>
+          <p style="font-size: 0.85em;">La page se rafraîchit automatiquement toutes les 5 secondes.</p>
+        </body></html>
+        """), 200
     return render_template_string(_HTML_PAGE, r=_DERNIER_RAPPORT)
 
 
+def _lancer_analyse_background():
+    try:
+        executer_analyse()
+    except Exception as e:
+        print(f"[ERREUR FATALE] analyse background: {e}", flush=True)
+
+
+# Lance l'analyse dès le démarrage du serveur, en arrière-plan
+threading.Thread(target=_lancer_analyse_background, daemon=True).start()
+
+
 if __name__ == "__main__":
-    executer_analyse()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
