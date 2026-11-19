@@ -79,7 +79,7 @@ COMPETITIONS_CIBLES = [
         "slug": "portuguese-liga",
         "label": "Liga Portugaise",
         "mots": ("liga portugal", "primeira liga", "portuguese-liga", "por.1", "portugal"),
-        "equipes": ["1929", "1927", "1930", "1936"],
+        "equipes": ["1929", "1927", "1930", "1936", "160", "86", "110"],
     },
     {
         "slug": "premier-league",
@@ -103,9 +103,12 @@ COMPETITIONS_CIBLES = [
         "slug": "uefa-europa-league",
         "label": "Europa League",
         "mots": ("europa league", "europa-league", "uefa.europa", "uel"),
-        "equipes": ["176", "174", "360", "111", "1929", "129"],
+        "equipes": ["176", "174", "360", "111", "129", "166"],
     },
 ]
+
+STATUTS_CLOS = ("closed", "final", "post", "completed")
+STATUTS_LIVE = ("in_progress", "live")
 
 _CACHE_FOOT_SCHED = {}
 _CACHE_SANTE = {}
@@ -115,6 +118,7 @@ _DERNIER_RAPPORT = {
     "apercu_bruts": "",
     "top_sur": [],
     "foot": [],
+    "foot_clos": [],
     "tennis": [],
     "alertes": {},
     "bilan": {},
@@ -265,7 +269,7 @@ def moyenne_ponderee(valeurs, defaut):
 
 def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=10):
     events = list(events_override or [])
-    joues = [ev for ev in events if str(ev.get("status", "")).lower() in ("closed", "final", "post", "completed")]
+    joues = [ev for ev in events if str(ev.get("status", "")).lower() in STATUTS_CLOS]
     joues.sort(key=lambda ev: str(ev.get("start_time", "") or ev.get("date", "")))
 
     bp_all, bc_all = [], []
@@ -354,6 +358,29 @@ def scanner_sante_cible(cible, max_titres=2):
     return list(_CACHE_SANTE[cle])
 
 
+def _formater_resultat_clos(ev, label_comp, events_comp):
+    start_str = str(ev.get("start_time") or ev.get("date") or "")
+    h_info, a_info = _normaliser_home_away(ev)
+    h_nom = h_info.get("short_name") or h_info.get("name") or "Home"
+    a_nom = a_info.get("short_name") or a_info.get("name") or "Away"
+    sc_h = h_info.get("score")
+    sc_a = a_info.get("score")
+    score_txt = f"{sc_h} - {sc_a}" if (sc_h is not None and sc_a is not None) else "Terminé"
+
+    st_h = stats_foot_detail(h_info.get("id", ""), h_nom, events_comp, N_DERNIERS_MATCHS)
+    st_a = stats_foot_detail(a_info.get("id", ""), a_nom, events_comp, N_DERNIERS_MATCHS)
+
+    return {
+        "sport": "FOOT",
+        "competition": label_comp,
+        "event_id": str(ev.get("id") or ""),
+        "match": f"{h_nom} vs {a_nom}",
+        "date_match": start_str[:16].replace("T", " "),
+        "score": score_txt,
+        "detail": f"[{label_comp}] Score final : {score_txt} | {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}]",
+    }
+
+
 def _construire_entree_foot(ev, label_comp, events_comp, hors_fenetre=False):
     ev_id = str(ev.get("id") or "")
     start_str = str(ev.get("start_time") or ev.get("date") or "")
@@ -402,7 +429,8 @@ def _construire_entree_foot(ev, label_comp, events_comp, hors_fenetre=False):
 
 
 def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
-    resultats = []
+    resultats_a_jouer = []
+    resultats_clos = []
     alertes_globales = {}
     stats_par_comp = {}
     apercu_lignes = []
@@ -434,7 +462,6 @@ def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
                 if isinstance(comp_obj, dict)
                 else str(comp_obj).lower()
             )
-            # Garde l'événement s'il correspond à la compétition ou si le champ compétition est vide
             if comp_txt.strip() and not any(m in comp_txt for m in comp["mots"]):
                 continue
             eid = str(ev.get("id") or f"{slug}_{idx}")
@@ -443,40 +470,47 @@ def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
 
         events_comp = list(dedup_comp.values())
         retenus_fenetre = []
+        a_venir_tous = []
+        clos_tous = []
+
         for ev in events_comp:
             statut = str(ev.get("status") or "").lower()
-            if statut in ("closed", "final", "post", "completed", "in_progress", "live"):
+            if statut in STATUTS_CLOS:
+                clos_tous.append(ev)
                 continue
+            if statut in STATUTS_LIVE:
+                continue
+            a_venir_tous.append(ev)
             if dans_fenetre_heures(str(ev.get("start_time") or ev.get("date") or ""), heures_max):
                 retenus_fenetre.append(ev)
 
         hors_fenetre_mode = False
-        candidats = retenus_fenetre
-        if not candidats and events_comp:
-            a_venir = [
-                ev for ev in events_comp
-                if str(ev.get("status") or "").lower() not in ("closed", "final", "post", "completed")
-            ]
-            a_venir.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
-            candidats = a_venir[:3] if a_venir else events_comp[-3:]
+        candidats_a_jouer = retenus_fenetre
+        if not candidats_a_jouer and a_venir_tous:
+            a_venir_tous.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
+            candidats_a_jouer = a_venir_tous[:3]
             hors_fenetre_mode = True
 
         ajoutes_comp = 0
-        for ev in candidats:
+        for ev in candidats_a_jouer:
             cle_unique = f"{slug}_{ev.get('id') or ev.get('start_time')}_{ajoutes_comp}"
             if cle_unique in vus_globaux:
                 continue
             vus_globaux.add(cle_unique)
             entree, titres_s = _construire_entree_foot(ev, label_comp, events_comp, hors_fenetre=hors_fenetre_mode)
-            resultats.append(entree)
+            resultats_a_jouer.append(entree)
             ajoutes_comp += 1
             if titres_s:
                 alertes_globales[entree["match"]] = titres_s
 
-        stats_par_comp[label_comp] = f"{len(retenus_fenetre)}/{ajoutes_comp} (bruts: {len(events_comp)})"
+        clos_tous.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""), reverse=True)
+        for ev in clos_tous[:2]:
+            resultats_clos.append(_formater_resultat_clos(ev, label_comp, events_comp))
+
+        stats_par_comp[label_comp] = f"48h:{len(retenus_fenetre)} | à jouer:{ajoutes_comp} | clos:{len(clos_tous)} (bruts:{len(events_comp)})"
 
     print("Couverture Foot :", " • ".join(f"{k}: {v}" for k, v in stats_par_comp.items()), flush=True)
-    return resultats, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12])
+    return resultats_a_jouer, resultats_clos, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12])
 
 
 def trouver_rang(nom, rk_map):
@@ -606,7 +640,7 @@ def mettre_a_jour_historique(items):
 def executer_analyse():
     global _DERNIER_RAPPORT
     print(f"Analyse en cours (fenetre: {FENETRE_HEURES}h)...", flush=True)
-    foot_res, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
+    foot_res, foot_clos, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
         COMPETITIONS_CIBLES, EQUIPES_FOOT_IDS, FENETRE_HEURES
     )
     tennis_res, alertes_t = analyser_tennis(FENETRE_HEURES)
@@ -620,7 +654,7 @@ def executer_analyse():
     synthese = "\n".join(
         f"• [{x['sport']} | {x['prudence']}] {x['match']} -> {x['choix']} ({x['proba']}%)"
         for x in top_sur[:8]
-    ) or "Aucun pronostic disponible."
+    ) or "Aucun pronostic à venir disponible sur cette fenêtre."
 
     _DERNIER_RAPPORT = {
         "mis_a_jour": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -628,6 +662,7 @@ def executer_analyse():
         "apercu_bruts": apercu_bruts,
         "top_sur": top_sur,
         "foot": foot_sorted,
+        "foot_clos": foot_clos,
         "tennis": tennis_sorted,
         "alertes": alertes,
         "bilan": bilan,
@@ -664,22 +699,34 @@ _HTML_PAGE = """<!doctype html>
     {% endfor %}
   </div>
 
-  <h2>Matchs de Foot ({{ r.foot|length }})</h2>
+  <h2>Matchs de Foot à jouer ({{ r.foot|length }})</h2>
   {% for it in r.foot %}
   <div class="card">
     <strong>{{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong><br>
     <span class="meta">{{ it.match }} ({{ it.date_match }}) — {{ it.detail }}</span>
   </div>
   {% else %}
-  <div class="card">Aucun match de foot trouvé.</div>
+  <div class="card">Aucun match de foot à venir trouvé (les matchs retournés par la source sont clos).</div>
   {% endfor %}
 
-  <h2>Top pronostics (Foot &amp; Tennis)</h2>
+  <h2>Derniers résultats Foot (référence forme — {{ r.foot_clos|length }})</h2>
+  {% for it in r.foot_clos %}
+  <div class="card">
+    <strong>{{ it.match }} ({{ it.score }})</strong><br>
+    <span class="meta">{{ it.date_match }} — {{ it.detail }}</span>
+  </div>
+  {% else %}
+  <div class="card">Aucun résultat récent disponible.</div>
+  {% endfor %}
+
+  <h2>Top pronostics à jouer (Foot &amp; Tennis)</h2>
   {% for it in r.top_sur %}
   <div class="card">
     <strong>[{{ it.sport }}] {{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong><br>
     <span class="meta">{{ it.match }} ({{ it.date_match }})</span>
   </div>
+  {% else %}
+  <div class="card">Aucun pronostic à venir sur cette fenêtre.</div>
   {% endfor %}
 
   <h2>Aperçu données brutes Foot</h2>
