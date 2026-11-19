@@ -49,6 +49,7 @@ SEUIL_EV_POSITIF_PCT = 3.0
 _CACHE_FOOT_SCHED = {}
 _CACHE_SEASON_ID = {}
 _CACHE_COMP_EVENTS = {}
+_DERNIERES_ERREURS_FOOT = []
 _DERNIER_SNAPSHOT = {
     "maj": None,
     "principaux": [],
@@ -80,36 +81,52 @@ def _get_gemini_key():
     return (os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY_LOCAL or "").strip()
 
 
+def _noter_erreur_foot(msg):
+    texte = str(msg).strip()
+    if texte and texte not in _DERNIERES_ERREURS_FOOT and len(_DERNIERES_ERREURS_FOOT) < 4:
+        _DERNIERES_ERREURS_FOOT.append(texte)
+
+
+def _appeler_avec_signatures(fn, candidats_kwargs):
+    if not callable(fn):
+        return None
+    for kwargs in candidats_kwargs:
+        try:
+            return fn(**kwargs)
+        except TypeError:
+            continue
+        except Exception as exc:
+            _noter_erreur_foot(f"{getattr(fn, '__name__', 'fb_fn')}: {exc}")
+    return None
+
+
 def _indexer_seasons_depuis_competitions():
     mapping = {}
     if hasattr(fb, "get_competitions"):
-        try:
-            res = fb.get_competitions()
-            data = res.get("data", res) if isinstance(res, dict) else {}
-            liste = []
-            if isinstance(data, list):
-                liste = data
-            elif isinstance(data, dict):
-                for cle in ("competitions", "leagues", "items", "data"):
-                    if isinstance(data.get(cle), list):
-                        liste = data[cle]
-                        break
-            for item in liste:
-                if not isinstance(item, dict):
-                    continue
-                slug = str(item.get("slug") or item.get("id") or "").strip().lower()
-                cur_season = item.get("current_season") or item.get("season") or {}
-                sid = None
-                if isinstance(cur_season, dict):
-                    sid = cur_season.get("id") or cur_season.get("season_id")
-                elif cur_season:
-                    sid = cur_season
-                if not sid:
-                    sid = item.get("season_id")
-                if slug and sid:
-                    mapping[slug] = str(sid).strip()
-        except Exception:
-            pass
+        res = _appeler_avec_signatures(fb.get_competitions, [{}])
+        data = res.get("data", res) if isinstance(res, dict) else {}
+        liste = []
+        if isinstance(data, list):
+            liste = data
+        elif isinstance(data, dict):
+            for cle in ("competitions", "leagues", "items", "data"):
+                if isinstance(data.get(cle), list):
+                    liste = data[cle]
+                    break
+        for item in liste:
+            if not isinstance(item, dict):
+                continue
+            slug = str(item.get("slug") or item.get("id") or "").strip().lower()
+            cur_season = item.get("current_season") or item.get("season") or {}
+            sid = None
+            if isinstance(cur_season, dict):
+                sid = cur_season.get("id") or cur_season.get("season_id")
+            elif cur_season:
+                sid = cur_season
+            if not sid:
+                sid = item.get("season_id")
+            if slug and sid:
+                mapping[slug] = str(sid).strip()
     return mapping
 
 
@@ -125,19 +142,23 @@ def resoudre_season_id_foot(league_slug):
 
     season_id = f"{cle}-{SAISON_FALLBACK_YEAR}"
     if hasattr(fb, "get_current_season"):
-        try:
-            res = fb.get_current_season(competition_id=cle)
-            data = res.get("data", res) if isinstance(res, dict) else {}
-            if isinstance(data, dict):
-                candidat = (
-                    data.get("season_id")
-                    or (data.get("season", {}) if isinstance(data.get("season"), dict) else {}).get("id")
-                    or data.get("id")
-                )
-                if candidat:
-                    season_id = str(candidat).strip()
-        except Exception:
-            pass
+        res = _appeler_avec_signatures(
+            fb.get_current_season,
+            [
+                {"competition_id": cle},
+                {"league_slug": cle},
+                {"slug": cle},
+            ],
+        )
+        data = res.get("data", res) if isinstance(res, dict) else {}
+        if isinstance(data, dict):
+            candidat = (
+                data.get("season_id")
+                or (data.get("season", {}) if isinstance(data.get("season"), dict) else {}).get("id")
+                or data.get("id")
+            )
+            if candidat:
+                season_id = str(candidat).strip()
 
     _CACHE_SEASON_ID[cle] = season_id
     return season_id
@@ -208,6 +229,38 @@ def _match_appartient_competition(ev, comp_cfg):
     return False
 
 
+def _extraire_team_ids_saison(slug, season_id):
+    if not hasattr(fb, "get_season_teams"):
+        return []
+    res = _appeler_avec_signatures(
+        fb.get_season_teams,
+        [
+            {"season_id": season_id},
+            {"competition_id": slug, "season_year": SAISON_FALLBACK_YEAR},
+            {"league_slug": slug, "season_year": SAISON_FALLBACK_YEAR},
+        ],
+    )
+    data = res.get("data", res) if isinstance(res, dict) else {}
+    liste = []
+    if isinstance(data, dict):
+        for cle in ("teams", "competitors", "items"):
+            if isinstance(data.get(cle), list):
+                liste = data[cle]
+                break
+    elif isinstance(data, list):
+        liste = data
+
+    ids = []
+    for item in liste:
+        if not isinstance(item, dict):
+            continue
+        t_obj = item.get("team") if isinstance(item.get("team"), dict) else item
+        tid = t_obj.get("id") or item.get("team_id") or item.get("id")
+        if tid:
+            ids.append(str(tid).strip())
+    return list(dict.fromkeys(ids))
+
+
 def recuperer_evenements_competition(comp_cfg):
     slug = comp_cfg["slug"]
     if slug in _CACHE_COMP_EVENTS:
@@ -217,27 +270,39 @@ def recuperer_evenements_competition(comp_cfg):
     evenements = []
 
     if hasattr(fb, "get_season_schedule"):
-        for sid_test in dict.fromkeys([season_id, f"{slug}-{SAISON_FALLBACK_YEAR}", f"{slug}-2025"]):
-            try:
-                res_sched = fb.get_season_schedule(season_id=sid_test)
-                evs = _extraire_evenements_depuis_reponse(res_sched)
-                if evs:
-                    evenements.extend(evs)
-                    break
-            except Exception:
-                pass
+        for sid_test in dict.fromkeys([season_id, f"{slug}-{SAISON_FALLBACK_YEAR}", f"{slug}-2026-2027", f"{slug}-2025"]):
+            res_sched = _appeler_avec_signatures(
+                fb.get_season_schedule,
+                [
+                    {"season_id": sid_test},
+                    {"competition_id": slug, "season_id": sid_test},
+                ],
+            )
+            evs = _extraire_evenements_depuis_reponse(res_sched)
+            if evs:
+                evenements.extend(evs)
+                break
 
     if hasattr(fb, "get_daily_schedule"):
         now_utc = datetime.now(timezone.utc)
         for offset_jours in (-1, 0, 1, 2):
             jour = (now_utc + timedelta(days=offset_jours)).strftime("%Y-%m-%d")
-            try:
-                res_day = fb.get_daily_schedule(date=jour)
-                for ev in _extraire_evenements_depuis_reponse(res_day):
-                    if _match_appartient_competition(ev, comp_cfg):
-                        evenements.append(ev)
-            except Exception:
-                pass
+            res_day = _appeler_avec_signatures(
+                fb.get_daily_schedule,
+                [
+                    {"date": jour},
+                    {"day": jour},
+                ],
+            )
+            for ev in _extraire_evenements_depuis_reponse(res_day):
+                if _match_appartient_competition(ev, comp_cfg):
+                    evenements.append(ev)
+
+    if not evenements and hasattr(fb, "get_team_schedule"):
+        team_ids = _extraire_team_ids_saison(slug, season_id)
+        for tid in team_ids[:12]:
+            sched = get_foot_schedule_cached(tid, league_slug=slug, season_year=SAISON_FALLBACK_YEAR)
+            evenements.extend(_extraire_evenements_depuis_reponse(sched))
 
     dedup = {}
     for idx, ev in enumerate(evenements):
@@ -254,15 +319,15 @@ def recuperer_evenements_competition(comp_cfg):
 def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year=SAISON_FALLBACK_YEAR):
     cle = (str(team_id), str(league_slug), str(season_year))
     if cle not in _CACHE_FOOT_SCHED:
-        try:
-            _CACHE_FOOT_SCHED[cle] = fb.get_team_schedule(
-                team_id=cle[0],
-                league_slug=cle[1],
-                season_year=cle[2],
-                competition_id=cle[1],
-            )
-        except Exception:
-            _CACHE_FOOT_SCHED[cle] = {"data": {"events": []}}
+        res = _appeler_avec_signatures(
+            fb.get_team_schedule,
+            [
+                {"team_id": cle[0], "league_slug": cle[1], "season_year": cle[2], "competition_id": cle[1]},
+                {"team_id": cle[0], "competition_id": cle[1]},
+                {"team_id": cle[0]},
+            ],
+        )
+        _CACHE_FOOT_SCHED[cle] = res if isinstance(res, dict) else {"data": {"events": []}}
     return _CACHE_FOOT_SCHED[cle]
 
 
@@ -797,7 +862,10 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=48):
             "buts_proba": buts_proba,
         })
 
-    return resultats, alertes_globales, " · ".join(diagnostics)
+    diag_txt = " · ".join(diagnostics)
+    if _DERNIERES_ERREURS_FOOT:
+        diag_txt += f" | Err: {' / '.join(_DERNIERES_ERREURS_FOOT)}"
+    return resultats, alertes_globales, diag_txt
 
 
 def analyser_tennis(heures_max=48):
@@ -1292,6 +1360,7 @@ def executer_analyse_complete(heures_max=FENETRE_HEURES):
     _CACHE_FOOT_SCHED.clear()
     _CACHE_SEASON_ID.clear()
     _CACHE_COMP_EVENTS.clear()
+    _DERNIERES_ERREURS_FOOT.clear()
 
     foot_res, alertes_f, diag_foot = analyser_tous_matchs_foot(
         COMPETITIONS_FOOT,
@@ -1514,7 +1583,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           {{ it.proba }}% · {{ it.prudence }}
         </span>
       </div>
-      <div class="choix">{{ it.choix }}{% if it.mise_u and mf_mise is defined %} — Mise {{ "%.2f"|format(it.mise_u) }}u{% elif it.mise_u and it.mise_u > 0 %} — Mise {{ "%.2f"|format(it.mise_u) }}u{% endif %}</div>
+      <div class="choix">{{ it.choix }}{% if it.mise_u and it.mise_u > 0 %} — Mise {{ "%.2f"|format(it.mise_u) }}u{% endif %}</div>
       <div class="match">{{ it.match }} ({{ it.date_match }})</div>
       <div class="meta">{{ it.detail }}</div>
     </div>
