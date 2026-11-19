@@ -7,7 +7,6 @@ import sys
 import threading
 import urllib.parse
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -21,18 +20,18 @@ if hasattr(sys.stdout, "reconfigure"):
         pass
 
 
-def _charger_module_sport(nom_anglais, nom_francais):
-    for mod_name in (nom_anglais, nom_francais):
+def _charger_module_sport(nom_francais, nom_anglais):
+    for mod_name in (nom_francais, nom_anglais):
         try:
             return importlib.import_module(mod_name)
         except Exception:
             continue
-    raise ImportError(f"Impossible d'importer le module '{nom_anglais}' ni '{nom_francais}'.")
+    raise ImportError(f"Impossible d'importer '{nom_francais}' ni '{nom_anglais}'.")
 
 
-bt = _charger_module_sport("sports_skills.betting", "compétences_sportives.paris")
-fb = _charger_module_sport("sports_skills.football", "compétences_sportives.football")
-tn = _charger_module_sport("sports_skills.tennis", "compétences_sportives.tennis")
+bt = _charger_module_sport("compétences_sportives.paris", "sports_skills.betting")
+fb = _charger_module_sport("compétences_sportives.football", "sports_skills.football")
+tn = _charger_module_sport("compétences_sportives.tennis", "sports_skills.tennis")
 
 
 @dataclass(frozen=True)
@@ -42,7 +41,6 @@ class Config:
     fenetre_heures: int = int(os.getenv("FENETRE_HEURES", "48"))
     timeout_http: int = int(os.getenv("TIMEOUT_HTTP", "8"))
     cache_ttl_sec: int = int(os.getenv("CACHE_TTL_SEC", "900"))
-    max_workers: int = int(os.getenv("MAX_WORKERS", "6"))
 
 
 CFG = Config()
@@ -77,6 +75,11 @@ COMPETITIONS_CIBLES = [
     {"slug": "uefa-champions-league", "label": "Ligue des Champions", "mots": ("champions league", "champions-league", "uefa.champions", "ucl"), "equipes": ["160", "86", "83", "364", "132", "110"]},
     {"slug": "uefa-europa-league", "label": "Europa League", "mots": ("europa league", "europa-league", "uefa.europa", "uel"), "equipes": ["176", "174", "360", "111", "1929", "129"]},
 ]
+
+STATUTS_TERMINES_OU_EN_COURS = {
+    "closed", "final", "post", "completed", "finished", "ft", "aet", "pen",
+    "in_progress", "live", "status_final", "status_post"
+}
 
 _CACHE_FOOT_SCHED = {}
 _CACHE_SANTE = {}
@@ -202,14 +205,21 @@ def _parse_date_utc(date_str):
         return None
 
 
-def dans_fenetre_heures(date_str, heures_max):
-    if heures_max is None or not date_str:
-        return True
+def _est_match_a_venir_dans_fenetre(ev, heures_max):
+    statut = str(ev.get("status") or "").strip().lower()
+    if statut in STATUTS_TERMINES_OU_EN_COURS:
+        return False
+
+    date_str = str(ev.get("start_time") or ev.get("date") or "").strip()
+    if not date_str:
+        return False
+
     dt = _parse_date_utc(date_str)
     if dt is None:
-        return True
+        return False
+
     maintenant = datetime.now(timezone.utc)
-    return (maintenant - timedelta(hours=2)) <= dt <= (maintenant + timedelta(hours=heures_max))
+    return (maintenant - timedelta(minutes=15)) <= dt <= (maintenant + timedelta(hours=heures_max))
 
 
 def poisson_prob(k, lam):
@@ -246,7 +256,7 @@ def moyenne_ponderee(valeurs, defaut):
 
 def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=10):
     events = list(events_override or [])
-    joues = [ev for ev in events if str(ev.get("status", "")).lower() in ("closed", "final", "post", "completed")]
+    joues = [ev for ev in events if str(ev.get("status", "")).lower() in ("closed", "final", "post", "completed", "finished")]
     joues.sort(key=lambda ev: str(ev.get("start_time") or ev.get("date") or ""))
 
     bp_all, bc_all = [], []
@@ -292,7 +302,6 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=10
                     adv = sc_int
                     break
             if adv is None:
-                # Fallback si un seul match sur le nom partiel
                 for _, _, sc_int in scores_par_role:
                     if sc_int != moi:
                         adv = sc_int
@@ -349,7 +358,7 @@ def scanner_sante_cible(cible, max_titres=2):
     return list(res)
 
 
-def _construire_entree_foot(ev, label_comp, events_comp, hors_fenetre=False):
+def _construire_entree_foot(ev, label_comp, events_comp):
     ev_id = str(ev.get("id") or "")
     start_str = str(ev.get("start_time") or ev.get("date") or "")
     statut_raw = str(ev.get("status") or "")
@@ -361,7 +370,6 @@ def _construire_entree_foot(ev, label_comp, events_comp, hors_fenetre=False):
     st_a = stats_foot_detail(a_info.get("id", ""), a_nom, events_comp, CFG.n_derniers_matchs)
     fiable = st_h["a_historique"] or st_a["a_historique"]
 
-    # Léger avantage domicile (+10% attaque domicile / -10% attaque extérieure)
     lam_h = max(((st_h["bp"] * 1.10) + st_a["bc"]) / 2, 0.35)
     lam_a = max(((st_a["bp"] * 0.90) + st_h["bc"]) / 2, 0.35)
     p_h, p_n, p_a, p_ov25, p_un25 = simuler_poisson_foot(lam_h, lam_a)
@@ -377,7 +385,6 @@ def _construire_entree_foot(ev, label_comp, events_comp, hors_fenetre=False):
 
     buts_label = "+2.5 buts" if p_ov25 >= p_un25 else "-2.5 buts"
     buts_proba = round(max(p_ov25, p_un25) * 100, 1)
-    tag_fenetre = " [Hors 48h]" if hors_fenetre else ""
 
     return {
         "sport": "FOOT",
@@ -385,7 +392,7 @@ def _construire_entree_foot(ev, label_comp, events_comp, hors_fenetre=False):
         "fiable": fiable,
         "event_id": ev_id,
         "match": f"{h_nom} vs {a_nom}",
-        "date_match": f"{start_str[:16].replace('T', ' ')}{tag_fenetre}",
+        "date_match": start_str[:16].replace("T", " "),
         "detail": (
             f"[{label_comp} | {statut_raw}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] "
             f"| Buts: {buts_label} ({buts_proba:.0f}%)"
@@ -437,36 +444,27 @@ def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
                 dedup_comp[eid] = ev
 
         events_comp = list(dedup_comp.values())
-        retenus_fenetre = [
-            ev for ev in events_comp
-            if str(ev.get("status") or "").lower() not in ("closed", "final", "post", "completed", "in_progress", "live")
-            and dans_fenetre_heures(str(ev.get("start_time") or ev.get("date") or ""), heures_max)
-        ]
+        a_venir_48h = [ev for ev in events_comp if _est_match_a_venir_dans_fenetre(ev, heures_max)]
+        a_venir_48h.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
 
-        hors_fenetre_mode = False
-        candidats = retenus_fenetre
-        if not candidats and events_comp:
-            a_venir = [
-                ev for ev in events_comp
-                if str(ev.get("status") or "").lower() not in ("closed", "final", "post", "completed")
-            ]
-            a_venir.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
-            candidats = a_venir[:3] if a_venir else events_comp[-3:]
-            hors_fenetre_mode = True
+        nb_clos = sum(
+            1 for ev in events_comp
+            if str(ev.get("status") or "").strip().lower() in ("closed", "final", "post", "completed", "finished")
+        )
 
         ajoutes_comp = 0
-        for ev in candidats:
+        for ev in a_venir_48h:
             cle_globale = str(ev.get("id") or f"{ev.get('start_time')}_{ajoutes_comp}")
             if cle_globale in vus_globaux:
                 continue
             vus_globaux.add(cle_globale)
-            entree, titres_s = _construire_entree_foot(ev, label_comp, events_comp, hors_fenetre=hors_fenetre_mode)
+            entree, titres_s = _construire_entree_foot(ev, label_comp, events_comp)
             resultats.append(entree)
             ajoutes_comp += 1
             if titres_s:
                 alertes_globales[entree["match"]] = titres_s
 
-        stats_par_comp[label_comp] = f"{len(retenus_fenetre)}/{ajoutes_comp} (bruts: {len(events_comp)})"
+        stats_par_comp[label_comp] = f"48h:{ajoutes_comp} | clos:{nb_clos} (bruts:{len(events_comp)})"
 
     print("Couverture Foot :", " • ".join(f"{k}: {v}" for k, v in stats_par_comp.items()), flush=True)
     return resultats, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12])
@@ -504,10 +502,7 @@ def analyser_tennis(heures_max=48):
                 continue
             rk_map = atp_rk if "Men" in d.get("name", "") else wta_rk
             for m in d.get("matches", []):
-                if m.get("status") != "not_started":
-                    continue
-                date_m = str(m.get("date", ""))
-                if not dans_fenetre_heures(date_m, heures_max):
+                if not _est_match_a_venir_dans_fenetre(m, heures_max):
                     continue
                 comps = m.get("competitors", [])
                 if len(comps) != 2:
@@ -532,7 +527,7 @@ def analyser_tennis(heures_max=48):
                     "fiable": complet,
                     "event_id": str(m.get("id", "")),
                     "match": f"{j1} (#{r1 or 'NC'}) vs {j2} (#{r2 or 'NC'})",
-                    "date_match": date_m[:16].replace("T", " "),
+                    "date_match": str(m.get("date", ""))[:16].replace("T", " "),
                     "detail": f"{t_name} | Alertes 3j: {len(sante)}",
                     "choix": f"Victoire {favori}",
                     "proba": proba_pct,
@@ -619,7 +614,7 @@ def mettre_a_jour_historique(items):
 def executer_analyse():
     global _DERNIER_RAPPORT
     with _ANALYSE_LOCK:
-        print(f"Analyse en cours (fenetre: {CFG.fenetre_heures}h)...", flush=True)
+        print(f"Analyse en cours (fenetre: {CFG.fenetre_heures}h, matchs a venir uniquement)...", flush=True)
         foot_res, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
             COMPETITIONS_CIBLES, EQUIPES_FOOT_IDS, CFG.fenetre_heures
         )
@@ -632,9 +627,9 @@ def executer_analyse():
         bilan = mettre_a_jour_historique([x for x in top_sur if x.get("fiable", True)])
 
         synthese = "\n".join(
-            f"• [{x['sport']} | {x['prudence']}] {x['match']} -> {x['choix']} ({x['proba']}%)"
+            f"• [{x['sport']} | {x['prudence']}] {x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
             for x in top_sur[:8]
-        ) or "Aucun pronostic disponible."
+        ) or "Aucun match à venir dans les prochaines 48h."
 
         _DERNIER_RAPPORT = {
             "mis_a_jour": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
@@ -657,7 +652,7 @@ _HTML_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BetPulse Pro</title>
+  <title>BetPulse Pro — Matchs à venir (48h)</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 16px; background: #0f172a; color: #e2e8f0; }
     h1, h2 { color: #38bdf8; }
@@ -683,32 +678,34 @@ _HTML_PAGE = """<!doctype html>
     {% endfor %}
   </div>
 
-  <h2>Matchs de Foot ({{ r.foot|length }})</h2>
+  <h2>Matchs de Foot à venir — 48h ({{ r.foot|length }})</h2>
   {% for it in r.foot %}
   <div class="card">
     <strong>{{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong><br>
     <span class="meta">{{ it.match }} ({{ it.date_match }}) — {{ it.detail }}</span>
   </div>
   {% else %}
-  <div class="card">Aucun match de foot trouvé.</div>
+  <div class="card">Aucun match de foot à venir dans les prochaines 48h.</div>
   {% endfor %}
 
-  <h2>Matchs de Tennis ({{ r.tennis|length }})</h2>
+  <h2>Matchs de Tennis à venir — 48h ({{ r.tennis|length }})</h2>
   {% for it in r.tennis %}
   <div class="card">
     <strong>{{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong><br>
     <span class="meta">{{ it.match }} ({{ it.date_match }}) — {{ it.detail }}</span>
   </div>
   {% else %}
-  <div class="card">Aucun match de tennis trouvé.</div>
+  <div class="card">Aucun match de tennis à venir dans les prochaines 48h.</div>
   {% endfor %}
 
-  <h2>Top pronostics (Foot &amp; Tennis)</h2>
+  <h2>Top pronostics à venir (Foot &amp; Tennis)</h2>
   {% for it in r.top_sur %}
   <div class="card">
     <strong>[{{ it.sport }}] {{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong><br>
     <span class="meta">{{ it.match }} ({{ it.date_match }})</span>
   </div>
+  {% else %}
+  <div class="card">Aucun pronostic disponible sur les prochaines 48h.</div>
   {% endfor %}
 
   <h2>Alertes blessures / forfaits (3j)</h2>
