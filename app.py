@@ -1,5 +1,6 @@
 import csv
 import importlib
+import inspect
 import math
 import os
 import re
@@ -43,7 +44,7 @@ class Config:
     n_derniers_matchs: int = int(os.getenv("N_DERNIERS_MATCHS", "10"))
     fenetre_heures: int = int(os.getenv("FENETRE_HEURES", "48"))
     timeout_http: int = int(os.getenv("TIMEOUT_HTTP", "8"))
-    cache_ttl_sec: int = int(os.getenv("CACHE_TTL_SEC", "900"))
+    cache_ttl_sec: int = int(os.getenv("CACHE_TTL_SEC", "300"))
 
 
 CFG = Config()
@@ -343,13 +344,8 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=10
     }
 
 
-def scanner_sante_cible(cible, max_titres=2):
-    cle = (str(cible).strip().lower(), max_titres)
-    cached = _cache_get(_CACHE_SANTE, cle)
-    if cached is not None:
-        return list(cached)
-
-    q = urllib.parse.quote(f'"{cible}" (blessure OR forfait OR incertain) when:3d')
+def _requete_rss(requete_brute, max_titres=2):
+    q = urllib.parse.quote(requete_brute)
     url = f"https://news.google.com/rss/search?q={q}&hl=fr&gl=FR&ceid=FR:fr"
     titres = []
     try:
@@ -362,8 +358,19 @@ def scanner_sante_cible(cible, max_titres=2):
                     titres.append(t)
     except Exception:
         pass
+    return titres[:max_titres]
 
-    res = titres[:max_titres]
+
+def scanner_sante_cible(cible, max_titres=2):
+    cle = (str(cible).strip().lower(), max_titres)
+    cached = _cache_get(_CACHE_SANTE, cle)
+    if cached is not None:
+        return list(cached)
+
+    res = _requete_rss(f'"{cible}" (blessure OR forfait OR incertain) when:3d', max_titres)
+    if not res:
+        res = _requete_rss(f'{cible} (blessure OR forfait OR cuisse OR genou OR cheville OR retrait) when:5d', max_titres)
+
     _cache_set(_CACHE_SANTE, cle, res)
     return list(res)
 
@@ -681,6 +688,14 @@ _HTML_PAGE = """<!doctype html>
     <span class="meta">· <a href="/api/analyse">JSON</a> · <a href="/api/debug-foot">Debug Foot</a></span>
   </form>
 
+  <h2>Bilan historique</h2>
+  <div class="card">
+    <strong>Total suivis</strong> : {{ r.get("bilan", {}).get("total", 0) }} ·
+    <strong>En attente</strong> : {{ r.get("bilan", {}).get("en_attente", 0) }} ·
+    <strong>Vérifiés</strong> : {{ r.get("bilan", {}).get("verifies", 0) }} ·
+    <strong>Réussite</strong> : {{ r.get("bilan", {}).get("taux", 0.0) }}%
+  </div>
+
   <h2>Couverture Foot</h2>
   <div class="card">
     {% for k, v in r.get("stats_comp", {}).items() %}
@@ -752,6 +767,11 @@ def api_analyse():
 @app.route("/api/debug-foot")
 def api_debug_foot():
     fonctions = [n for n in dir(fb) if not n.startswith("_") and callable(getattr(fb, n, None))]
+    try:
+        source_sched = inspect.getsource(getattr(fb, "get_team_schedule"))
+    except Exception as e:
+        source_sched = f"Non disponible: {e}"
+
     sched = get_foot_schedule_cached("160", "ligue-1", CFG.saison_foot)
     evs = _extraire_events(sched)
     echantillon = [
@@ -767,6 +787,7 @@ def api_debug_foot():
     return jsonify({
         "module": getattr(fb, "__name__", str(fb)),
         "fonctions_disponibles": fonctions,
+        "source_get_team_schedule": source_sched,
         "nb_events_psg": len(evs),
         "echantillon_psg": echantillon,
     })
