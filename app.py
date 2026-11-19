@@ -65,49 +65,49 @@ COMPETITIONS_CIBLES = [
     {
         "slug": "ligue-1",
         "label": "Ligue 1",
-        "mots": ("ligue 1", "french ligue 1", "ligue-1", "fra.1"),
+        "mots": ("ligue 1", "french ligue 1", "ligue-1", "fra.1", "france"),
         "exclus": ("women", "féminine", "feminine", "u19", "u21", "reserve", "national", "amical"),
     },
     {
         "slug": "la-liga",
         "label": "Liga Espagnole",
-        "mots": ("la liga", "laliga", "spanish la liga", "la-liga", "esp.1"),
+        "mots": ("la liga", "laliga", "spanish la liga", "la-liga", "esp.1", "spain"),
         "exclus": ("women", "femenina", "u19", "segunda", "b "),
     },
     {
         "slug": "bundesliga",
         "label": "Bundesliga",
-        "mots": ("bundesliga", "1. bundesliga", "german bundesliga", "ger.1"),
+        "mots": ("bundesliga", "1. bundesliga", "german bundesliga", "ger.1", "germany"),
         "exclus": ("2. bundesliga", "women", "frauen", "u19", "regionalliga"),
     },
     {
         "slug": "portuguese-liga",
         "label": "Liga Portugaise",
-        "mots": ("liga portugal", "primeira liga", "portuguese liga", "portuguese-liga", "primeira-liga", "por.1"),
+        "mots": ("liga portugal", "primeira liga", "portuguese liga", "portuguese-liga", "primeira-liga", "por.1", "portugal"),
         "exclus": ("segunda", "women", "u23"),
     },
     {
         "slug": "premier-league",
         "label": "Premier League",
-        "mots": ("premier league", "english premier league", "premier-league", "eng.1"),
+        "mots": ("premier league", "english premier league", "premier-league", "eng.1", "england"),
         "exclus": ("russian", "russia", "rostov", "zenit", "cska", "akhmat", "orenburg", "baltika", "voronezh", "rubin", "women", "u21", "u18"),
     },
     {
         "slug": "serie-a",
         "label": "Serie A",
-        "mots": ("serie a", "italian serie a", "serie-a", "ita.1"),
+        "mots": ("serie a", "italian serie a", "serie-a", "ita.1", "italy"),
         "exclus": ("brazil", "brasileirao", "palmeiras", "flamengo", "vasco", "internacional", "vitória", "vitoria", "bragantino", "são paulo", "sao paulo", "fluminense", "serie b", "women", "femminile"),
     },
     {
         "slug": "uefa-champions-league",
         "label": "Ligue des Champions",
-        "mots": ("champions league", "uefa champions league", "ligue des champions", "champions-league", "uefa.champions"),
+        "mots": ("champions league", "uefa champions league", "ligue des champions", "champions-league", "uefa.champions", "ucl"),
         "exclus": ("women", "féminine", "feminine", "youth", "u19"),
     },
     {
         "slug": "uefa-europa-league",
         "label": "Europa League",
-        "mots": ("europa league", "uefa europa league", "ligue europa", "europa-league", "uefa.europa"),
+        "mots": ("europa league", "uefa europa league", "ligue europa", "europa-league", "uefa.europa", "uel"),
         "exclus": ("women", "féminine", "feminine", "conference"),
     },
 ]
@@ -145,16 +145,29 @@ _HTTP_SESSION.headers.update({
 # =====================================================================
 # RECUPERATION ET NORMALISATION DES DONNEES FOOTBALL
 # =====================================================================
+def _appeler_fb_team_schedule(team_id, league_slug, season_year):
+    fn = getattr(fb, "get_team_schedule", None)
+    if not callable(fn):
+        return {"data": {"events": []}}
+    try:
+        return fn(
+            team_id=str(team_id),
+            league_slug=str(league_slug),
+            season_year=str(season_year),
+            competition_id=str(league_slug),
+        )
+    except TypeError:
+        try:
+            return fn(str(team_id), str(league_slug), str(season_year))
+        except TypeError:
+            return fn(team_id=str(team_id))
+
+
 def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year="2026"):
     cle = (str(team_id), str(league_slug), str(season_year))
     if cle not in _CACHE_FOOT_SCHED:
         try:
-            _CACHE_FOOT_SCHED[cle] = fb.get_team_schedule(
-                team_id=cle[0],
-                league_slug=cle[1],
-                season_year=cle[2],
-                competition_id=cle[1],
-            )
+            _CACHE_FOOT_SCHED[cle] = _appeler_fb_team_schedule(cle[0], cle[1], cle[2])
         except Exception as e:
             print(f"[FOOT] get_team_schedule({cle}) erreur: {e}", flush=True)
             _CACHE_FOOT_SCHED[cle] = {"data": {"events": []}}
@@ -187,12 +200,14 @@ def _resoudre_ids_competitions(forcer_refresh=False):
         return _CACHE_MAPPING_IDS
 
     mapping = {}
-    try:
-        comps_resp = fb.get_competitions()
-        comps_list = _extraire_liste_dict(comps_resp, ("competitions", "leagues", "items", "events"))
-    except Exception as e:
-        print(f"[FOOT] get_competitions() erreur: {e}", flush=True)
-        comps_list = []
+    fn_comps = getattr(fb, "get_competitions", None)
+    comps_list = []
+    if callable(fn_comps):
+        try:
+            comps_resp = fn_comps()
+            comps_list = _extraire_liste_dict(comps_resp, ("competitions", "leagues", "items", "events"))
+        except Exception as e:
+            print(f"[FOOT] get_competitions() erreur: {e}", flush=True)
 
     for cible in COMPETITIONS_CIBLES:
         candidats = [cible["slug"]]
@@ -221,23 +236,25 @@ def _resoudre_season_id(comp_ids):
     if cle in _CACHE_SEASON_ID:
         return _CACHE_SEASON_ID[cle]
 
-    for cid in comp_ids:
-        try:
-            s_resp = fb.get_current_season(competition_id=cid)
-            data_s = s_resp.get("data", s_resp) if isinstance(s_resp, dict) else {}
-            if isinstance(data_s, dict):
-                for k in ("id", "season_id", "slug"):
-                    if data_s.get(k):
-                        _CACHE_SEASON_ID[cle] = str(data_s[k])
-                        return _CACHE_SEASON_ID[cle]
-                seasons_arr = data_s.get("seasons")
-                if isinstance(seasons_arr, list) and seasons_arr and isinstance(seasons_arr[0], dict):
-                    sid = seasons_arr[0].get("id") or seasons_arr[0].get("season_id")
-                    if sid:
-                        _CACHE_SEASON_ID[cle] = str(sid)
-                        return _CACHE_SEASON_ID[cle]
-        except Exception:
-            continue
+    fn_season = getattr(fb, "get_current_season", None)
+    if callable(fn_season):
+        for cid in comp_ids:
+            try:
+                s_resp = fn_season(competition_id=cid)
+                data_s = s_resp.get("data", s_resp) if isinstance(s_resp, dict) else {}
+                if isinstance(data_s, dict):
+                    for k in ("id", "season_id", "slug"):
+                        if data_s.get(k):
+                            _CACHE_SEASON_ID[cle] = str(data_s[k])
+                            return _CACHE_SEASON_ID[cle]
+                    seasons_arr = data_s.get("seasons")
+                    if isinstance(seasons_arr, list) and seasons_arr and isinstance(seasons_arr[0], dict):
+                        sid = seasons_arr[0].get("id") or seasons_arr[0].get("season_id")
+                        if sid:
+                            _CACHE_SEASON_ID[cle] = str(sid)
+                            return _CACHE_SEASON_ID[cle]
+            except Exception:
+                continue
 
     _CACHE_SEASON_ID[cle] = None
     return None
@@ -305,6 +322,22 @@ def _normaliser_home_away(ev):
     return ev.get("home_team") or {}, ev.get("away_team") or {}
 
 
+def _event_correspond_competition(ev, comp_cfg, ids_candidats):
+    comp_obj = ev.get("competition") or ev.get("league") or ev.get("tournament") or {}
+    comp_txt = (
+        " ".join(str(comp_obj.get(k) or "").lower() for k in ("id", "slug", "name", "short_name", "abbreviation"))
+        if isinstance(comp_obj, dict)
+        else str(comp_obj).lower()
+    )
+    txt_ev = f"{comp_txt} {str(ev.get('name') or '').lower()}"
+    if any(m in txt_ev for m in comp_cfg["mots"]) or any(cid.lower() in comp_txt for cid in ids_candidats):
+        return True
+    # Si l'événement ne précise aucune compétition explicite, on accepte s'il a été demandé via ce slug
+    if not comp_txt.strip() and comp_cfg["slug"] in ids_candidats:
+        return True
+    return False
+
+
 def _event_valide_pour_competition(ev, comp_cfg):
     exclus = comp_cfg.get("exclus", ())
     h_info, a_info = _normaliser_home_away(ev)
@@ -322,39 +355,9 @@ def _event_valide_pour_competition(ev, comp_cfg):
     return True
 
 
-def recuperer_evenements_competition(comp_cfg, ids_candidats):
-    slug = comp_cfg["slug"]
-    if slug in _CACHE_COMP_EVENTS:
-        return _CACHE_COMP_EVENTS[slug]
-
-    evenements = []
-    season_id = _resoudre_season_id(ids_candidats)
-    if season_id:
-        try:
-            sched_s = fb.get_season_schedule(season_id=season_id)
-            evenements.extend(_extraire_events_depuis_payload(sched_s))
-        except Exception as e:
-            print(f"[FOOT] get_season_schedule({season_id}) erreur: {e}", flush=True)
-
-    maintenant = datetime.now(timezone.utc)
-    jours_recherche = (-1, 0, 1, 2) if not evenements else (-7, -5, -3, -1, 0, 1, 2)
-    for delta_j in jours_recherche:
-        jour_str = (maintenant + timedelta(days=delta_j)).strftime("%Y-%m-%d")
-        try:
-            d_resp = fb.get_daily_schedule(date=jour_str)
-            for ev in _extraire_events_depuis_payload(d_resp):
-                comp_obj = ev.get("competition") or ev.get("league") or ev.get("tournament") or {}
-                comp_txt = " ".join(
-                    str(comp_obj.get(k) or "").lower()
-                    for k in ("id", "slug", "name", "short_name")
-                ) if isinstance(comp_obj, dict) else str(comp_obj).lower()
-                txt_ev = f"{comp_txt} {str(ev.get('name') or '').lower()}"
-                if any(m in txt_ev for m in comp_cfg["mots"]) or any(cid.lower() in comp_txt for cid in ids_candidats):
-                    evenements.append(ev)
-        except Exception as e:
-            print(f"[FOOT] get_daily_schedule({jour_str}) erreur: {e}", flush=True)
-
+def _dedupliquer_events(evenements, comp_cfg):
     dedup = {}
+    slug = comp_cfg["slug"]
     for idx, ev in enumerate(evenements):
         if not _event_valide_pour_competition(ev, comp_cfg):
             continue
@@ -367,8 +370,47 @@ def recuperer_evenements_competition(comp_cfg, ids_candidats):
             cle = f"{slug}_{idx}"
         if cle not in dedup:
             dedup[cle] = ev
+    return list(dedup.values())
 
-    res = list(dedup.values())
+
+def recuperer_evenements_competition(comp_cfg, ids_candidats):
+    slug = comp_cfg["slug"]
+    if slug in _CACHE_COMP_EVENTS:
+        return _CACHE_COMP_EVENTS[slug]
+
+    evenements = []
+    season_id = _resoudre_season_id(ids_candidats)
+    fn_season_sched = getattr(fb, "get_season_schedule", None)
+    if season_id and callable(fn_season_sched):
+        try:
+            sched_s = fn_season_sched(season_id=season_id)
+            for ev in _extraire_events_depuis_payload(sched_s):
+                if _event_correspond_competition(ev, comp_cfg, ids_candidats):
+                    evenements.append(ev)
+        except Exception as e:
+            print(f"[FOOT] get_season_schedule({season_id}) erreur: {e}", flush=True)
+
+    fn_daily = getattr(fb, "get_daily_schedule", None)
+    if callable(fn_daily):
+        maintenant = datetime.now(timezone.utc)
+        for delta_j in (-1, 0, 1, 2):
+            jour_str = (maintenant + timedelta(days=delta_j)).strftime("%Y-%m-%d")
+            try:
+                d_resp = fn_daily(date=jour_str)
+                for ev in _extraire_events_depuis_payload(d_resp):
+                    if _event_correspond_competition(ev, comp_cfg, ids_candidats):
+                        evenements.append(ev)
+            except Exception as e:
+                print(f"[FOOT] get_daily_schedule({jour_str}) erreur: {e}", flush=True)
+
+    for cid in ids_candidats:
+        for tid in (EQUIPES_FOOT_IDS or [""]):
+            sched = get_foot_schedule_cached(tid, league_slug=cid, season_year=SAISON_FOOT)
+            for ev in _extraire_events_depuis_payload(sched):
+                if _event_correspond_competition(ev, comp_cfg, ids_candidats):
+                    evenements.append(ev)
+
+    res = _dedupliquer_events(evenements, comp_cfg)
     _CACHE_COMP_EVENTS[slug] = res
     return res
 
@@ -880,13 +922,15 @@ def analyser_foot_competitions(competitions, equipes_ids=None, n_derniers=10, he
         slug = comp["slug"]
         label_comp = comp.get("label", slug)
         ids_cand = mapping_ids.get(slug, [slug])
-        events_comp = recuperer_evenements_competition(comp, ids_cand)
+        events_comp = list(recuperer_evenements_competition(comp, ids_cand))
 
         if equipes_ids:
             for cid in ids_cand:
                 for tid in equipes_ids:
                     sched = get_foot_schedule_cached(tid, league_slug=cid, season_year=SAISON_FOOT)
                     for ev in _extraire_events_depuis_payload(sched):
+                        if not _event_correspond_competition(ev, comp, ids_cand):
+                            continue
                         if not _event_valide_pour_competition(ev, comp):
                             continue
                         eid_f = str(ev.get("id") or "")
