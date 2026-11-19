@@ -45,6 +45,7 @@ class Config:
     fenetre_heures: int = int(os.getenv("FENETRE_HEURES", "48"))
     timeout_http: int = int(os.getenv("TIMEOUT_HTTP", "8"))
     cache_ttl_sec: int = int(os.getenv("CACHE_TTL_SEC", "300"))
+    afficher_derniers_clos: bool = os.getenv("AFFICHER_DERNIERS_CLOS", "1").strip() == "1"
 
 
 CFG = Config()
@@ -80,10 +81,8 @@ COMPETITIONS_CIBLES = [
     {"slug": "uefa-europa-league", "label": "Europa League", "mots": ("europa league", "europa-league", "uefa.europa", "uel"), "equipes": ["176", "174", "360", "111", "1929", "129"]},
 ]
 
-STATUTS_TERMINES_OU_EN_COURS = {
-    "closed", "final", "post", "completed", "finished", "ft", "aet", "pen",
-    "in_progress", "live", "status_final", "status_post"
-}
+STATUTS_TERMINES = {"closed", "final", "post", "completed", "finished", "ft", "aet", "pen", "status_final", "status_post"}
+STATUTS_TERMINES_OU_EN_COURS = STATUTS_TERMINES | {"in_progress", "live"}
 
 _CACHE_FOOT_SCHED = {}
 _CACHE_SANTE = {}
@@ -94,6 +93,7 @@ _DERNIER_RAPPORT = {
     "apercu_bruts": "",
     "top_sur": [],
     "foot": [],
+    "foot_clos": [],
     "tennis": [],
     "alertes": {},
     "bilan": {},
@@ -267,7 +267,7 @@ def moyenne_ponderee(valeurs, defaut):
 
 def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=10):
     events = list(events_override or [])
-    joues = [ev for ev in events if str(ev.get("status", "")).lower() in ("closed", "final", "post", "completed", "finished")]
+    joues = [ev for ev in events if str(ev.get("status", "")).lower() in STATUTS_TERMINES]
     joues.sort(key=lambda ev: str(ev.get("start_time") or ev.get("date") or ""))
 
     bp_all, bc_all = [], []
@@ -375,7 +375,7 @@ def scanner_sante_cible(cible, max_titres=2):
     return list(res)
 
 
-def _construire_entree_foot(ev, label_comp, events_comp):
+def _construire_entree_foot(ev, label_comp, events_comp, est_clos=False):
     ev_id = str(ev.get("id") or "")
     start_str = str(ev.get("start_time") or ev.get("date") or "")
     statut_raw = str(ev.get("status") or "")
@@ -396,12 +396,13 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         key=lambda x: x[1],
     )
 
-    titres_sante = scanner_sante_cible(h_nom, 1) + scanner_sante_cible(a_nom, 1)
+    titres_sante = [] if est_clos else (scanner_sante_cible(h_nom, 1) + scanner_sante_cible(a_nom, 1))
     titres_sante = list(dict.fromkeys(titres_sante))[:2]
     proba_pct = round(max(0.05, prob - min(len(titres_sante) * 0.02, 0.08)) * 100, 1)
 
     buts_label = "+2.5 buts" if p_ov25 >= p_un25 else "-2.5 buts"
     buts_proba = round(max(p_ov25, p_un25) * 100, 1)
+    tag = " [TERMINÉ]" if est_clos else ""
 
     return {
         "sport": "FOOT",
@@ -409,7 +410,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "fiable": fiable,
         "event_id": ev_id,
         "match": f"{h_nom} vs {a_nom}",
-        "date_match": _formater_date_locale(start_str),
+        "date_match": f"{_formater_date_locale(start_str)}{tag}",
         "detail": (
             f"[{label_comp} | {statut_raw}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] "
             f"| Buts: {buts_label} ({buts_proba:.0f}%)"
@@ -422,7 +423,8 @@ def _construire_entree_foot(ev, label_comp, events_comp):
 
 
 def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
-    resultats = []
+    resultats_a_venir = []
+    resultats_clos = []
     alertes_globales = {}
     stats_par_comp = {}
     apercu_lignes = []
@@ -464,10 +466,11 @@ def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
         a_venir_48h = [ev for ev in events_comp if _est_match_a_venir_dans_fenetre(ev, heures_max)]
         a_venir_48h.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
 
-        nb_clos = sum(
-            1 for ev in events_comp
-            if str(ev.get("status") or "").strip().lower() in ("closed", "final", "post", "completed", "finished")
-        )
+        clos_comp = [
+            ev for ev in events_comp
+            if str(ev.get("status") or "").strip().lower() in STATUTS_TERMINES
+        ]
+        clos_comp.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""), reverse=True)
 
         ajoutes_comp = 0
         for ev in a_venir_48h:
@@ -475,16 +478,25 @@ def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
             if cle_globale in vus_globaux:
                 continue
             vus_globaux.add(cle_globale)
-            entree, titres_s = _construire_entree_foot(ev, label_comp, events_comp)
-            resultats.append(entree)
+            entree, titres_s = _construire_entree_foot(ev, label_comp, events_comp, est_clos=False)
+            resultats_a_venir.append(entree)
             ajoutes_comp += 1
             if titres_s:
                 alertes_globales[entree["match"]] = titres_s
 
-        stats_par_comp[label_comp] = f"48h:{ajoutes_comp} | clos:{nb_clos} (bruts:{len(events_comp)})"
+        if CFG.afficher_derniers_clos:
+            for ev in clos_comp[:1]:
+                cle_clos = f"clos_{ev.get('id') or ev.get('start_time')}"
+                if cle_clos in vus_globaux:
+                    continue
+                vus_globaux.add(cle_clos)
+                entree_c, _ = _construire_entree_foot(ev, label_comp, events_comp, est_clos=True)
+                resultats_clos.append(entree_c)
+
+        stats_par_comp[label_comp] = f"48h:{ajoutes_comp} | clos:{len(clos_comp)} (bruts:{len(events_comp)})"
 
     print("Couverture Foot :", " • ".join(f"{k}: {v}" for k, v in stats_par_comp.items()), flush=True)
-    return resultats, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12])
+    return resultats_a_venir, resultats_clos, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12])
 
 
 def trouver_rang(nom, rk_map):
@@ -631,13 +643,14 @@ def mettre_a_jour_historique(items):
 def executer_analyse():
     global _DERNIER_RAPPORT
     with _ANALYSE_LOCK:
-        print(f"Analyse en cours (fenetre: {CFG.fenetre_heures}h, matchs a venir uniquement)...", flush=True)
-        foot_res, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
+        print(f"Analyse en cours (fenetre: {CFG.fenetre_heures}h)...", flush=True)
+        foot_res, foot_clos_res, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
             COMPETITIONS_CIBLES, EQUIPES_FOOT_IDS, CFG.fenetre_heures
         )
         tennis_res, alertes_t = analyser_tennis(CFG.fenetre_heures)
 
         foot_sorted = sorted(foot_res, key=lambda x: x["proba"], reverse=True)
+        foot_clos_sorted = sorted(foot_clos_res, key=lambda x: x["proba"], reverse=True)
         tennis_sorted = sorted(tennis_res, key=lambda x: x["proba"], reverse=True)
         top_sur = sorted(foot_sorted + tennis_sorted, key=lambda x: x["proba"], reverse=True)[:10]
         alertes = {**alertes_f, **alertes_t}
@@ -654,6 +667,7 @@ def executer_analyse():
             "apercu_bruts": apercu_bruts,
             "top_sur": top_sur,
             "foot": foot_sorted,
+            "foot_clos": foot_clos_sorted,
             "tennis": tennis_sorted,
             "alertes": alertes,
             "bilan": bilan,
@@ -669,7 +683,7 @@ _HTML_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BetPulse Pro — Matchs à venir (48h)</title>
+  <title>BetPulse Pro</title>
   <style>
     body { font-family: Arial, sans-serif; margin: 16px; background: #0f172a; color: #e2e8f0; }
     h1, h2 { color: #38bdf8; }
@@ -712,6 +726,16 @@ _HTML_PAGE = """<!doctype html>
   {% else %}
   <div class="card">Aucun match de foot à venir dans les prochaines 48h.</div>
   {% endfor %}
+
+  {% if r.get("foot_clos") %}
+  <h2>Derniers matchs de Foot terminés — référence modèle ({{ r.foot_clos|length }})</h2>
+  {% for it in r.foot_clos %}
+  <div class="card">
+    <strong>{{ it.proba }}% [{{ it.prudence }}] -> {{ it.choix }}</strong><br>
+    <span class="meta">{{ it.match }} ({{ it.date_match }}) — {{ it.detail }}</span>
+  </div>
+  {% endfor %}
+  {% endif %}
 
   <h2>Matchs de Tennis à venir — 48h ({{ r.tennis|length }})</h2>
   {% for it in r.tennis %}
