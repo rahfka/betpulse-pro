@@ -426,24 +426,40 @@ def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
     apercu_lignes = []
     vus_globaux = set()
 
+    aujourdhui = datetime.now(timezone.utc).date()
+
     for comp in competitions:
         slug = comp["slug"]
         label_comp = comp["label"]
-        ids_equipes = list(dict.fromkeys((comp.get("equipes") or []) + (equipes_ids or [])))
+        ids_equipes = list(dict.fromkeys(comp.get("equipes") or []))
 
         raw_comp_events = []
+
+        # 1) Historique (matchs passés) pour calculer la forme
         for tid in ids_equipes:
             sched = get_foot_schedule_cached(tid, slug, CFG.saison_foot)
             evs = _extraire_events(sched)
             raw_comp_events.extend(evs)
-            if len(apercu_lignes) < 12 and evs:
-                ev0 = evs[0]
-                hi, ai = _normaliser_home_away(ev0)
-                apercu_lignes.append(
-                    f"{slug} team={tid} | {ev0.get('start_time') or ev0.get('date')} | "
-                    f"{hi.get('short_name') or hi.get('name') or '?'} vs {ai.get('short_name') or ai.get('name') or '?'}"
-                )
 
+        # 2) Matchs à venir : scoreboard ESPN sur J, J+1, J+2
+        for delta in range(3):
+            jour = (aujourdhui + timedelta(days=delta)).strftime("%Y%m%d")
+            try:
+                fixtures = fb.get_fixtures_by_date(slug, jour)
+                evs_futur = _extraire_events(fixtures)
+                raw_comp_events.extend(evs_futur)
+                if len(apercu_lignes) < 12 and evs_futur:
+                    ev0 = evs_futur[0]
+                    hi, ai = _normaliser_home_away(ev0)
+                    apercu_lignes.append(
+                        f"{slug} [{jour}] | {ev0.get('start_time') or ev0.get('date')} | "
+                        f"{hi.get('short_name') or hi.get('name') or '?'} vs "
+                        f"{ai.get('short_name') or ai.get('name') or '?'}"
+                    )
+            except Exception as e:
+                print(f"[FOOT] scoreboard {slug} {jour} erreur: {e}", flush=True)
+
+        # --- suite identique (dédup, filtrage compétition, stats, etc.) ---
         dedup_comp = {}
         for idx, ev in enumerate(raw_comp_events):
             comp_obj = ev.get("competition") or ev.get("league") or ev.get("tournament") or {}
@@ -452,6 +468,7 @@ def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
                 if isinstance(comp_obj, dict)
                 else str(comp_obj).lower()
             )
+            # Filtre assoupli : on garde si pas de champ compétition OU si mot-clé trouvé
             if comp_txt.strip() and not any(m in comp_txt for m in comp["mots"]):
                 continue
             eid = str(ev.get("id") or f"{slug}_{idx}")
