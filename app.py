@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from flask import Flask, jsonify, redirect, render_template_string, url_for
@@ -364,7 +365,6 @@ def scanner_sante_cible(cible, max_titres=2):
     if cached is not None:
         return list(cached)
 
-    # Requête améliorée pour éviter les compositions probables
     res = _requete_rss(f'"{cible}" (blessure OR forfait OR incertain OR absent) -composition when:3d', max_titres)
     if not res:
         res = _requete_rss(f'{cible} (blessure OR forfait OR cuisse OR genou OR cheville) when:5d', max_titres)
@@ -376,7 +376,6 @@ def scanner_sante_cible(cible, max_titres=2):
 def _construire_entree_foot(ev, label_comp, events_comp):
     ev_id = str(ev.get("id") or "")
     start_str = str(ev.get("start_time") or ev.get("date") or "")
-    statut_raw = str(ev.get("status") or "")
     h_info, a_info = _normaliser_home_away(ev)
     h_nom = h_info.get("short_name") or h_info.get("name") or "Home"
     a_nom = a_info.get("short_name") or a_info.get("name") or "Away"
@@ -397,7 +396,6 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     titres_h = scanner_sante_cible(h_nom, 1)
     titres_a = scanner_sante_cible(a_nom, 1)
     
-    # On sépare les alertes par équipe pour plus de clarté
     alertes_eq = {}
     if titres_h: alertes_eq[h_nom] = titres_h
     if titres_a: alertes_eq[a_nom] = titres_a
@@ -432,39 +430,62 @@ def analyser_foot_competitions(competitions, heures_max=48):
 
     aujourdhui = datetime.now(timezone.utc).date()
 
+    # --- ÉTAPE 1 : Récupérer les scoreboards en parallèle ---
+    taches_sb = []
     for comp in competitions:
+        for delta in range(3):
+            jour = (aujourdhui + timedelta(days=delta)).strftime("%Y%m%d")
+            taches_sb.append((comp["slug"], jour))
+
+    def charger_sb(args):
+        slug, jour = args
+        try:
+            return _extraire_events(fb.get_fixtures_by_date(slug, jour))
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        res_sb = list(ex.map(charger_sb, taches_sb))
+
+    events_upcoming_par_slug = {c["slug"]: [] for c in competitions}
+    for i, (slug, _) in enumerate(taches_sb):
+        events_upcoming_par_slug[slug].extend(res_sb[i])
+
+    # --- ÉTAPE 2 : Récupérer les historiques en parallèle ---
+    taches_hist = []
+    for comp in competitions:
+        slug = comp["slug"]
+        eqs = set(comp.get("equipes") or [])
+        for ev in events_upcoming_par_slug[slug]:
+            h, a = _normaliser_home_away(ev)
+            if h.get("id"): eqs.add(str(h["id"]))
+            if a.get("id"): eqs.add(str(a["id"]))
+        for tid in eqs:
+            taches_hist.append((tid, slug))
+
+    def charger_hist(args):
+        tid, slug = args
+        try:
+            sched = get_foot_schedule_cached(tid, slug, CFG.saison_foot)
+            return _extraire_events(sched)
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=20) as ex:
+        res_hist = list(ex.map(charger_hist, taches_hist))
+
+    # Regrouper les historiques par slug
+    events_hist_par_slug = {c["slug"]: [] for c in competitions}
+    for i, (tid, slug) in enumerate(taches_hist):
+        events_hist_par_slug[slug].extend(res_hist[i])
+
+    # --- ÉTAPE 3 : Construire les pronostics ---
+    def analyser_comp(comp):
         slug = comp["slug"]
         label_comp = comp["label"]
         
-        # 1) Récupérer les matchs à venir via le scoreboard (J, J+1, J+2)
-        upcoming_events = []
-        for delta in range(3):
-            jour = (aujourdhui + timedelta(days=delta)).strftime("%Y%m%d")
-            try:
-                fixtures = fb.get_fixtures_by_date(slug, jour)
-                evs_futur = _extraire_events(fixtures)
-                upcoming_events.extend(evs_futur)
-            except Exception as e:
-                print(f"[FOOT] scoreboard {slug} {jour} erreur: {e}", flush=True)
-
-        # 2) Identifier TOUTES les équipes qui jouent pour récupérer leur historique
-        equipes_a_analyser = set(comp.get("equipes") or [])
-        for ev in upcoming_events:
-            h, a = _normaliser_home_away(ev)
-            if h.get("id"): equipes_a_analyser.add(str(h["id"]))
-            if a.get("id"): equipes_a_analyser.add(str(a["id"]))
-
-        # 3) Charger l'historique de ces équipes
-        raw_comp_events = []
-        for tid in equipes_a_analyser:
-            sched = get_foot_schedule_cached(tid, slug, CFG.saison_foot)
-            evs = _extraire_events(sched)
-            raw_comp_events.extend(evs)
-
-        # 4) Ajouter les matchs à venir à la liste globale des événements
-        raw_comp_events.extend(upcoming_events)
-
-        # 5) Déduplication
+        # Fusionner et dédupliquer
+        raw_comp_events = events_hist_par_slug[slug] + events_upcoming_par_slug[slug]
         dedup_comp = {}
         for idx, ev in enumerate(raw_comp_events):
             eid = str(ev.get("id") or f"{slug}_{idx}")
@@ -472,42 +493,40 @@ def analyser_foot_competitions(competitions, heures_max=48):
                 dedup_comp[eid] = ev
 
         events_comp = list(dedup_comp.values())
-        
-        # 6) Filtrage pour ne garder que ceux dans la fenêtre
         a_venir_48h = [ev for ev in events_comp if _est_match_a_venir_dans_fenetre(ev, heures_max)]
         a_venir_48h.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
 
-        nb_clos = sum(
-            1 for ev in events_comp
-            if str(ev.get("status") or "").strip().lower() in STATUTS_TERMINES
-        )
+        nb_clos = sum(1 for ev in events_comp if str(ev.get("status") or "").strip().lower() in STATUTS_TERMINES)
 
-        ajoutes_comp = 0
+        res_comp = []
+        alertes_comp = {}
+        apercu_comp = []
+
         for ev in a_venir_48h:
-            cle_globale = str(ev.get("id") or f"{ev.get('start_time')}_{ajoutes_comp}")
-            if cle_globale in vus_globaux:
-                continue
-            vus_globaux.add(cle_globale)
-            
             entree, alertes_eq = _construire_entree_foot(ev, label_comp, events_comp)
-            resultats_a_venir.append(entree)
-            ajoutes_comp += 1
-            
-            if alertes_eq:
-                alertes_globales.update(alertes_eq)
+            res_comp.append(entree)
+            alertes_comp.update(alertes_eq)
 
-            if len(apercu_lignes) < 12:
+            if len(apercu_comp) < 2:
                 h, a = _normaliser_home_away(ev)
-                apercu_lignes.append(
+                apercu_comp.append(
                     f"{slug} | {_formater_date_locale(ev.get('start_time') or ev.get('date'))} | "
-                    f"{h.get('short_name') or h.get('name') or '?'} vs "
-                    f"{a.get('short_name') or a.get('name') or '?'}"
+                    f"{h.get('short_name') or h.get('name') or '?'} vs {a.get('short_name') or a.get('name') or '?'}"
                 )
 
-        stats_par_comp[label_comp] = f"À venir: {ajoutes_comp} | Terminés: {nb_clos}"
+        return label_comp, res_comp, alertes_comp, nb_clos, len(events_comp), apercu_comp
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        res_comps = list(ex.map(analyser_comp, competitions))
+
+    for label_comp, res_comp, alertes_comp, nb_clos, total_events, apercu_comp in res_comps:
+        resultats_a_venir.extend(res_comp)
+        alertes_globales.update(alertes_comp)
+        apercu_lignes.extend(apercu_comp)
+        stats_par_comp[label_comp] = f"À venir: {len(res_comp)} | Terminés: {nb_clos} (bruts: {total_events})"
 
     print("Couverture Foot :", " • ".join(f"{k}: {v}" for k, v in stats_par_comp.items()), flush=True)
-    return resultats_a_venir, alertes_globales, stats_par_comp, "\n".join(apercu_lignes)
+    return resultats_a_venir, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12])
 
 
 def trouver_rang(nom, rk_map):
@@ -523,15 +542,19 @@ def trouver_rang(nom, rk_map):
 
 
 def analyser_tennis(heures_max=48):
-    atp_rk = {
-        " ".join(p["name"].lower().split()): p["rank"]
-        for p in tn.get_rankings(tour="atp").get("data", {}).get("rankings", [])
-    }
-    wta_rk = {
-        " ".join(p["name"].lower().split()): p["rank"]
-        for p in tn.get_rankings(tour="wta").get("data", {}).get("rankings", [])
-    }
-    sb = tn.get_scoreboard()
+    try:
+        atp_rk = {
+            " ".join(p["name"].lower().split()): p["rank"]
+            for p in tn.get_rankings(tour="atp").get("data", {}).get("rankings", [])
+        }
+        wta_rk = {
+            " ".join(p["name"].lower().split()): p["rank"]
+            for p in tn.get_rankings(tour="wta").get("data", {}).get("rankings", [])
+        }
+        sb = tn.get_scoreboard()
+    except Exception:
+        return [], {}
+
     simples = []
     alertes_tennis = {}
 
@@ -655,10 +678,20 @@ def executer_analyse():
     global _DERNIER_RAPPORT
     with _ANALYSE_LOCK:
         print(f"Analyse en cours (fenetre: {CFG.fenetre_heures}h)...", flush=True)
-        foot_res, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
-            COMPETITIONS_CIBLES, CFG.fenetre_heures
-        )
-        tennis_res, alertes_t = analyser_tennis(CFG.fenetre_heures)
+        
+        try:
+            foot_res, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
+                COMPETITIONS_CIBLES, CFG.fenetre_heures
+            )
+        except Exception as e:
+            print(f"[ERREUR] Foot: {e}", flush=True)
+            foot_res, alertes_f, stats_comp, apercu_bruts = [], {}, {}, f"Erreur Foot: {e}"
+
+        try:
+            tennis_res, alertes_t = analyser_tennis(CFG.fenetre_heures)
+        except Exception as e:
+            print(f"[ERREUR] Tennis: {e}", flush=True)
+            tennis_res, alertes_t = [], {}
 
         foot_sorted = sorted(foot_res, key=lambda x: x["proba"], reverse=True)
         tennis_sorted = sorted(tennis_res, key=lambda x: x["proba"], reverse=True)
@@ -757,10 +790,10 @@ _HTML_PAGE = """<!doctype html>
     <h2>Top pronostics (Foot &amp; Tennis)</h2>
     <div class="grid">
       {% for it in r.top_sur %}
-      <div class="card {{ it.prudence.split(' ')[0] }}">
+      <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
         <div class="card-title">
           <span>{{ it.choix }}</span>
-          <span class="badge {{ it.prudence.split(' ')[0] }}">{{ it.proba }}%</span>
+          <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
@@ -778,10 +811,10 @@ _HTML_PAGE = """<!doctype html>
     <h2>Matchs de Foot à venir — 48h ({{ r.foot|length }})</h2>
     <div class="grid">
       {% for it in r.foot %}
-      <div class="card {{ it.prudence.split(' ')[0] }}">
+      <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
         <div class="card-title">
           <span>{{ it.choix }}</span>
-          <span class="badge {{ it.prudence.split(' ')[0] }}">{{ it.proba }}%</span>
+          <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
@@ -797,10 +830,10 @@ _HTML_PAGE = """<!doctype html>
     <h2>Matchs de Tennis à venir — 48h ({{ r.tennis|length }})</h2>
     <div class="grid">
       {% for it in r.tennis %}
-      <div class="card {{ it.prudence.split(' ')[0] }}">
+      <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
         <div class="card-title">
           <span>{{ it.choix }}</span>
-          <span class="badge {{ it.prudence.split(' ')[0] }}">{{ it.proba }}%</span>
+          <span class="badge {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">{{ it.proba }}%</span>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
