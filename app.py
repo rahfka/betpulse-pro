@@ -57,20 +57,55 @@ FENETRE_HEURES = int(os.getenv("FENETRE_HEURES", "48"))
 TIMEOUT_HTTP = int(os.getenv("TIMEOUT_HTTP", "8"))
 
 COMPETITIONS_CIBLES = [
-    {"slug": "ligue-1", "label": "Ligue 1", "mots": ("ligue 1", "ligue-1", "fra.1", "france")},
-    {"slug": "la-liga", "label": "Liga Espagnole", "mots": ("la liga", "laliga", "la-liga", "esp.1", "spain")},
-    {"slug": "bundesliga", "label": "Bundesliga", "mots": ("bundesliga", "ger.1", "germany")},
-    {"slug": "portuguese-liga", "label": "Liga Portugaise", "mots": ("liga portugal", "primeira liga", "portuguese-liga", "por.1")},
-    {"slug": "premier-league", "label": "Premier League", "mots": ("premier league", "premier-league", "eng.1", "england")},
-    {"slug": "serie-a", "label": "Serie A", "mots": ("serie a", "serie-a", "ita.1", "italy")},
-    {"slug": "uefa-champions-league", "label": "Ligue des Champions", "mots": ("champions league", "champions-league", "uefa.champions")},
-    {"slug": "uefa-europa-league", "label": "Europa League", "mots": ("europa league", "europa-league", "uefa.europa")},
+    {
+        "slug": "ligue-1",
+        "label": "Ligue 1",
+        "mots": ("ligue 1", "ligue-1", "fra.1", "france"),
+        "equipes": ["160", "174", "176", "166"],
+    },
+    {
+        "slug": "la-liga",
+        "label": "Liga Espagnole",
+        "mots": ("la liga", "laliga", "la-liga", "esp.1", "spain"),
+        "equipes": ["86", "83", "81", "89"],
+    },
+    {
+        "slug": "bundesliga",
+        "label": "Bundesliga",
+        "mots": ("bundesliga", "ger.1", "germany"),
+        "equipes": ["132", "124", "167", "129"],
+    },
+    {
+        "slug": "portuguese-liga",
+        "label": "Liga Portugaise",
+        "mots": ("liga portugal", "primeira liga", "portuguese-liga", "por.1", "portugal"),
+        "equipes": ["1929", "1927", "1930", "1936"],
+    },
+    {
+        "slug": "premier-league",
+        "label": "Premier League",
+        "mots": ("premier league", "premier-league", "eng.1", "england"),
+        "equipes": ["364", "359", "360", "382"],
+    },
+    {
+        "slug": "serie-a",
+        "label": "Serie A",
+        "mots": ("serie a", "serie-a", "ita.1", "italy"),
+        "equipes": ["111", "110", "103", "114"],
+    },
+    {
+        "slug": "uefa-champions-league",
+        "label": "Ligue des Champions",
+        "mots": ("champions league", "champions-league", "uefa.champions", "ucl"),
+        "equipes": ["160", "86", "83", "364", "132", "110"],
+    },
+    {
+        "slug": "uefa-europa-league",
+        "label": "Europa League",
+        "mots": ("europa league", "europa-league", "uefa.europa", "uel"),
+        "equipes": ["176", "174", "360", "111", "1929", "129"],
+    },
 ]
-
-FRACTION_KELLY = 0.25
-MISE_MIN_UNITES = 0.25
-MISE_MAX_UNITES = 2.0
-SEUIL_EV_POSITIF_PCT = 3.0
 
 _CACHE_FOOT_SCHED = {}
 _CACHE_SANTE = {}
@@ -157,7 +192,10 @@ def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year="2026")
                     competition_id=cle[1],
                 )
             except TypeError:
-                _CACHE_FOOT_SCHED[cle] = fn(cle[0], cle[1], cle[2])
+                try:
+                    _CACHE_FOOT_SCHED[cle] = fn(cle[0], cle[1], cle[2])
+                except Exception:
+                    _CACHE_FOOT_SCHED[cle] = {"data": {"events": []}}
             except Exception as e:
                 print(f"[FOOT] get_team_schedule({cle}) erreur: {e}", flush=True)
                 _CACHE_FOOT_SCHED[cle] = {"data": {"events": []}}
@@ -368,41 +406,42 @@ def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
     alertes_globales = {}
     stats_par_comp = {}
     apercu_lignes = []
-
-    all_raw_events = []
-    for tid in (equipes_ids or ["160"]):
-        sched = get_foot_schedule_cached(tid, "ligue-1", SAISON_FOOT)
-        evs = _extraire_events(sched)
-        all_raw_events.extend(evs)
-        for ev in evs[:3]:
-            h_i, a_i = _normaliser_home_away(ev)
-            hn = h_i.get("short_name") or h_i.get("name") or "?"
-            an = a_i.get("short_name") or a_i.get("name") or "?"
-            apercu_lignes.append(
-                f"team={tid} | date={ev.get('start_time') or ev.get('date')} | status={ev.get('status')} | {hn} vs {an}"
-            )
-
-    dedup_bruts = {}
-    for idx, ev in enumerate(all_raw_events):
-        eid = str(ev.get("id") or f"raw_{idx}")
-        if eid not in dedup_bruts:
-            dedup_bruts[eid] = ev
-    bruts_list = list(dedup_bruts.values())
+    vus_globaux = set()
 
     for comp in competitions:
         slug = comp["slug"]
         label_comp = comp["label"]
-        events_comp = []
-        for ev in bruts_list:
+        ids_equipes = list(dict.fromkeys((comp.get("equipes") or []) + (equipes_ids or [])))
+
+        raw_comp_events = []
+        for tid in ids_equipes:
+            sched = get_foot_schedule_cached(tid, slug, SAISON_FOOT)
+            evs = _extraire_events(sched)
+            raw_comp_events.extend(evs)
+            if len(apercu_lignes) < 12 and evs:
+                ev0 = evs[0]
+                hi, ai = _normaliser_home_away(ev0)
+                apercu_lignes.append(
+                    f"{slug} team={tid} | {ev0.get('start_time') or ev0.get('date')} | "
+                    f"{hi.get('short_name') or hi.get('name') or '?'} vs {ai.get('short_name') or ai.get('name') or '?'}"
+                )
+
+        dedup_comp = {}
+        for idx, ev in enumerate(raw_comp_events):
             comp_obj = ev.get("competition") or ev.get("league") or ev.get("tournament") or {}
             comp_txt = (
                 " ".join(str(comp_obj.get(k) or "").lower() for k in ("id", "slug", "name", "short_name"))
                 if isinstance(comp_obj, dict)
                 else str(comp_obj).lower()
             )
-            if any(m in comp_txt for m in comp["mots"]) or (slug == "ligue-1" and not comp_txt.strip()):
-                events_comp.append(ev)
+            # Garde l'événement s'il correspond à la compétition ou si le champ compétition est vide
+            if comp_txt.strip() and not any(m in comp_txt for m in comp["mots"]):
+                continue
+            eid = str(ev.get("id") or f"{slug}_{idx}")
+            if eid not in dedup_comp:
+                dedup_comp[eid] = ev
 
+        events_comp = list(dedup_comp.values())
         retenus_fenetre = []
         for ev in events_comp:
             statut = str(ev.get("status") or "").lower()
@@ -414,25 +453,30 @@ def analyser_foot_competitions(competitions, equipes_ids=None, heures_max=48):
         hors_fenetre_mode = False
         candidats = retenus_fenetre
         if not candidats and events_comp:
-            # Repli d'affichage : montre les matchs à venir (ou les plus récents) si aucun n'est dans les 48h
             a_venir = [
                 ev for ev in events_comp
                 if str(ev.get("status") or "").lower() not in ("closed", "final", "post", "completed")
             ]
             a_venir.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
-            candidats = a_venir[:5] if a_venir else events_comp[-5:]
+            candidats = a_venir[:3] if a_venir else events_comp[-3:]
             hors_fenetre_mode = True
 
+        ajoutes_comp = 0
         for ev in candidats:
+            cle_unique = f"{slug}_{ev.get('id') or ev.get('start_time')}_{ajoutes_comp}"
+            if cle_unique in vus_globaux:
+                continue
+            vus_globaux.add(cle_unique)
             entree, titres_s = _construire_entree_foot(ev, label_comp, events_comp, hors_fenetre=hors_fenetre_mode)
             resultats.append(entree)
+            ajoutes_comp += 1
             if titres_s:
                 alertes_globales[entree["match"]] = titres_s
 
-        stats_par_comp[label_comp] = f"{len(retenus_fenetre)}/{len(candidats)} (bruts: {len(events_comp)})"
+        stats_par_comp[label_comp] = f"{len(retenus_fenetre)}/{ajoutes_comp} (bruts: {len(events_comp)})"
 
     print("Couverture Foot :", " • ".join(f"{k}: {v}" for k, v in stats_par_comp.items()), flush=True)
-    return resultats, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:10])
+    return resultats, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12])
 
 
 def trouver_rang(nom, rk_map):
