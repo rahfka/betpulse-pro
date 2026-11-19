@@ -28,25 +28,25 @@ GEMINI_API_KEY_LOCAL = ""
 COMPETITIONS_FOOT = [
     {
         "slug": "ligue-1",
-        "espn_code": "fra.1",
+        "tsdb_id": "4334",
         "label": "Ligue 1",
         "aliases": {"ligue-1", "fra.1", "french ligue 1", "ligue 1", "ligue 1 mcdonald's"},
     },
     {
         "slug": "la-liga",
-        "espn_code": "esp.1",
+        "tsdb_id": "4335",
         "label": "La Liga",
         "aliases": {"la-liga", "esp.1", "spanish la liga", "la liga", "laliga", "primera division"},
     },
     {
         "slug": "bundesliga",
-        "espn_code": "ger.1",
+        "tsdb_id": "4331",
         "label": "Bundesliga",
         "aliases": {"bundesliga", "ger.1", "german bundesliga", "1. bundesliga"},
     },
     {
         "slug": "portuguese-liga",
-        "espn_code": "por.1",
+        "tsdb_id": "4344",
         "label": "Liga Portugal",
         "aliases": {
             "portuguese-liga", "primeira-liga", "liga-portugal", "por.1",
@@ -55,19 +55,19 @@ COMPETITIONS_FOOT = [
     },
     {
         "slug": "premier-league",
-        "espn_code": "eng.1",
+        "tsdb_id": "4328",
         "label": "Premier League",
         "aliases": {"premier-league", "eng.1", "english premier league", "premier league", "epl"},
     },
     {
         "slug": "serie-a",
-        "espn_code": "ita.1",
+        "tsdb_id": "4332",
         "label": "Serie A",
         "aliases": {"serie-a", "ita.1", "italian serie a", "serie a"},
     },
     {
         "slug": "uefa-champions-league",
-        "espn_code": "uefa.champions",
+        "tsdb_id": "4480",
         "label": "Ligue des Champions",
         "aliases": {
             "uefa-champions-league", "champions-league", "uefa.champions",
@@ -76,7 +76,7 @@ COMPETITIONS_FOOT = [
     },
     {
         "slug": "uefa-europa-league",
-        "espn_code": "uefa.europa",
+        "tsdb_id": "4481",
         "label": "Ligue Europa",
         "aliases": {
             "uefa-europa-league", "europa-league", "uefa.europa",
@@ -132,7 +132,7 @@ def _get_gemini_key():
 
 def _noter_erreur_foot(msg):
     texte = str(msg).strip()
-    if texte and texte not in _DERNIERES_ERREURS_FOOT and len(_DERNIERES_ERREURS_FOOT) < 6:
+    if texte and texte not in _DERNIERES_ERREURS_FOOT and len(_DERNIERES_ERREURS_FOOT) < 4:
         _DERNIERES_ERREURS_FOOT.append(texte)
 
 
@@ -159,7 +159,7 @@ def _appeler_avec_signatures(fn, candidats_kwargs):
             if res is not None:
                 return res
         except Exception as exc:
-            _noter_erreur_foot(f"{nom_fn}{kwargs}: {exc}")
+            _noter_erreur_foot(f"{nom_fn}: {exc}")
     return None
 
 
@@ -170,9 +170,6 @@ def _extraire_evenements_depuis_reponse(payload):
         return [x for x in payload if isinstance(x, dict)]
     if not isinstance(payload, dict):
         return []
-
-    if payload.get("error"):
-        _noter_erreur_foot(f"api_error: {payload.get('error')}")
 
     data = payload.get("data", payload)
     if isinstance(data, list):
@@ -187,7 +184,7 @@ def _extraire_evenements_depuis_reponse(payload):
             for item in val:
                 if not isinstance(item, dict):
                     continue
-                if any(k in item for k in ("competitors", "teams", "home_team", "away_team", "home", "away", "competitions")):
+                if any(k in item for k in ("competitors", "teams", "home_team", "away_team", "home", "away")):
                     evenements.append(item)
                 else:
                     evenements.extend(_extraire_evenements_depuis_reponse(item))
@@ -210,71 +207,69 @@ def _extraire_evenements_depuis_reponse(payload):
     return evenements
 
 
-def _normaliser_event_espn(ev_brut, comp_cfg):
-    """Normalise un événement brut ESPN Scoreboard vers le format standard attendu."""
-    if not isinstance(ev_brut, dict):
+def _normaliser_event_tsdb(ev_raw, comp_cfg, est_clos=False):
+    """Normalise un événement TheSportsDB vers le format standard attendu."""
+    if not isinstance(ev_raw, dict):
         return None
-    if ev_brut.get("competitors"):
-        return ev_brut
-
-    comps_list = ev_brut.get("competitions")
-    if not isinstance(comps_list, list) or not comps_list:
-        return None
-    comp0 = comps_list[0] if isinstance(comps_list[0], dict) else {}
-    competitors_bruts = comp0.get("competitors", [])
-    if len(competitors_bruts) < 2:
+    h_nom = (ev_raw.get("strHomeTeam") or "").strip()
+    a_nom = (ev_raw.get("strAwayTeam") or "").strip()
+    if not h_nom or not a_nom:
         return None
 
-    competitors_norm = []
-    for c in competitors_bruts:
-        if not isinstance(c, dict):
-            continue
-        t_raw = c.get("team") if isinstance(c.get("team"), dict) else {}
-        qual = str(c.get("homeAway") or c.get("qualifier") or "").lower()
-        competitors_norm.append({
-            "qualifier": qual,
-            "homeAway": qual,
-            "score": c.get("score"),
-            "team": {
-                "id": str(t_raw.get("id") or c.get("id") or ""),
-                "name": t_raw.get("displayName") or t_raw.get("name") or "",
-                "short_name": t_raw.get("shortDisplayName") or t_raw.get("name") or "",
-                "abbreviation": t_raw.get("abbreviation") or "",
-            },
-        })
+    date_str = (ev_raw.get("strTimestamp") or "").strip()
+    if not date_str:
+        d_ev = (ev_raw.get("dateEvent") or "").strip()
+        t_ev = (ev_raw.get("strTime") or "12:00:00").strip()
+        if d_ev:
+            date_str = f"{d_ev}T{t_ev}+00:00"
 
-    status_obj = comp0.get("status") or ev_brut.get("status") or {}
-    statut_type = ""
-    if isinstance(status_obj, dict):
-        t_s = status_obj.get("type")
-        if isinstance(t_s, dict):
-            statut_type = str(t_s.get("name") or t_s.get("state") or t_s.get("description") or "")
-        else:
-            statut_type = str(t_s or status_obj.get("state") or "")
+    h_score = ev_raw.get("intHomeScore")
+    a_score = ev_raw.get("intAwayScore")
+    statut_raw = str(ev_raw.get("strStatus") or "").strip().lower()
+
+    if est_clos or (h_score is not None and a_score is not None and statut_raw in ("ft", "aet", "pen", "finished", "match finished")):
+        statut = "closed"
+    elif statut_raw in ("postponed", "pst", "cancelled", "canc", "abd", "abandoned"):
+        statut = "postponed"
+    elif statut_raw in ("1h", "2h", "ht", "live", "in play"):
+        statut = "in_progress"
     else:
-        statut_type = str(status_obj)
-
-    odds_norm = None
-    odds_list = comp0.get("odds")
-    if isinstance(odds_list, list) and odds_list and isinstance(odds_list[0], dict):
-        details = odds_list[0].get("details")
-        if details:
-            odds_norm = {"details": details}
+        statut = "not_started"
 
     return {
-        "id": str(ev_brut.get("id") or comp0.get("id") or ""),
-        "start_time": str(comp0.get("date") or ev_brut.get("date") or ""),
-        "status": statut_type,
+        "id": str(ev_raw.get("idEvent") or ""),
+        "start_time": date_str,
+        "status": statut,
         "league_slug": comp_cfg["slug"],
-        "competitors": competitors_norm,
-        "odds": odds_norm,
+        "competitors": [
+            {
+                "qualifier": "home",
+                "homeAway": "home",
+                "score": h_score,
+                "team": {
+                    "id": str(ev_raw.get("idHomeTeam") or ""),
+                    "name": h_nom,
+                    "short_name": h_nom,
+                },
+            },
+            {
+                "qualifier": "away",
+                "homeAway": "away",
+                "score": a_score,
+                "team": {
+                    "id": str(ev_raw.get("idAwayTeam") or ""),
+                    "name": a_nom,
+                    "short_name": a_nom,
+                },
+            },
+        ],
     }
 
 
-def _fetch_espn_scoreboard_events(comp_cfg):
-    """Récupère les matchs directement via l'endpoint public ESPN Scoreboard sur [-1j .. +2j]."""
-    espn_code = comp_cfg.get("espn_code")
-    if not espn_code:
+def _fetch_tsdb_events(comp_cfg):
+    """Récupère les matchs à venir et récents via TheSportsDB (clé publique 3)."""
+    tsdb_id = comp_cfg.get("tsdb_id")
+    if not tsdb_id:
         return []
 
     headers = {
@@ -283,62 +278,68 @@ def _fetch_espn_scoreboard_events(comp_cfg):
             "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
         )
     }
-    now_utc = datetime.now(timezone.utc)
-    d_start = (now_utc - timedelta(days=1)).strftime("%Y%m%d")
-    d_end = (now_utc + timedelta(days=2)).strftime("%Y%m%d")
-    url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{espn_code}/scoreboard?dates={d_start}-{d_end}"
+    evenements = []
 
-    trouves = []
+    # 1. Prochains matchs de la compétition
     try:
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            for ev_b in data.get("events", []):
-                ev_n = _normaliser_event_espn(ev_b, comp_cfg)
+        r_next = requests.get(
+            f"https://www.thesportsdb.com/api/v1/json/3/eventsnextleague.php?id={tsdb_id}",
+            headers=headers,
+            timeout=10,
+        )
+        if r_next.status_code == 200:
+            for ev in (r_next.json().get("events") or []):
+                ev_n = _normaliser_event_tsdb(ev, comp_cfg, est_clos=False)
                 if ev_n:
-                    trouves.append(ev_n)
-        else:
-            _noter_erreur_foot(f"ESPN {espn_code} HTTP {r.status_code}")
-    except Exception as exc:
-        _noter_erreur_foot(f"ESPN {espn_code}: {exc}")
+                    evenements.append(ev_n)
+    except Exception:
+        pass
 
-    return trouves
+    # 2. Derniers matchs joués (pour la forme et xG / Poisson)
+    try:
+        r_last = requests.get(
+            f"https://www.thesportsdb.com/api/v1/json/3/eventspastleague.php?id={tsdb_id}",
+            headers=headers,
+            timeout=10,
+        )
+        if r_last.status_code == 200:
+            for ev in (r_last.json().get("events") or []):
+                ev_n = _normaliser_event_tsdb(ev, comp_cfg, est_clos=True)
+                if ev_n:
+                    evenements.append(ev_n)
+    except Exception:
+        pass
+
+    return evenements
 
 
 def recuperer_evenements_competition(comp_cfg):
     slug = comp_cfg["slug"]
-    espn_code = comp_cfg.get("espn_code", slug)
     if slug in _CACHE_COMP_EVENTS:
         return _CACHE_COMP_EVENTS[slug]
 
     evenements = []
 
-    # 1. Essai via sports_skills.football (toutes signatures courantes)
-    for fn_name in ("get_scoreboard", "get_matches", "get_fixtures", "get_season_schedule", "get_league_schedule"):
+    # 1. Essai via sports_skills.football si disponible
+    for fn_name in ("get_season_schedule", "get_daily_schedule", "get_team_schedule"):
         fn = getattr(fb, fn_name, None)
         if not callable(fn):
             continue
         res = _appeler_avec_signatures(
             fn,
             [
+                {"season_id": f"{slug}-{SAISON_FALLBACK_YEAR}"},
                 {"league_slug": slug},
                 {"competition_id": slug},
-                {"league": espn_code},
-                {"league_slug": espn_code},
-                {"season_id": f"{slug}-{SAISON_FALLBACK_YEAR}"},
-                {},
             ],
         )
         evs = _extraire_evenements_depuis_reponse(res)
         if evs:
-            for ev in evs:
-                ev_n = _normaliser_event_espn(ev, comp_cfg) or ev
-                evenements.append(ev_n)
+            evenements.extend(evs)
             break
 
-    # 2. Fallback fiable : flux direct ESPN Scoreboard pour le championnat / coupe
-    if not evenements:
-        evenements.extend(_fetch_espn_scoreboard_events(comp_cfg))
+    # 2. Source principale fiable pour les matchs à venir + forme : TheSportsDB
+    evenements.extend(_fetch_tsdb_events(comp_cfg))
 
     dedup = {}
     for idx, ev in enumerate(evenements):
@@ -405,26 +406,15 @@ def _extraire_date_evenement(ev):
 def _lire_statut_evenement(ev):
     statut = ev.get("status")
     if isinstance(statut, dict):
-        t_s = statut.get("type")
-        if isinstance(t_s, dict):
-            statut = t_s.get("name") or t_s.get("state") or t_s.get("description") or ""
-        else:
-            statut = (
-                t_s
-                or statut.get("name")
-                or statut.get("state")
-                or statut.get("detail")
-                or statut.get("shortDetail")
-                or ""
-            )
+        statut = statut.get("type") or statut.get("name") or statut.get("state") or statut.get("detail") or ""
     return str(statut or "").strip().lower()
 
 
 def _est_match_clos(ev):
     statut = _lire_statut_evenement(ev)
-    return any(
-        mot in statut
-        for mot in ("closed", "final", "post", "completed", "finished", "full_time", "ft", "aet", "pen")
+    return statut in (
+        "closed", "final", "post", "completed",
+        "finished", "status_final", "full_time", "ft"
     )
 
 
@@ -432,7 +422,7 @@ def _est_match_a_venir(ev):
     if _est_match_clos(ev):
         return False
     statut = _lire_statut_evenement(ev)
-    if any(mot in statut for mot in ("in_progress", "live", "halftime", "cancel", "postpon", "abandon", "suspend")):
+    if statut in ("in_progress", "live", "halftime", "ht", "canceled", "cancelled", "postponed"):
         return False
     return True
 
@@ -606,16 +596,13 @@ def _extraire_score_numerique(val):
         return None
 
 
-def stats_foot_detail(team_id, league_slug="ligue-1", espn_code="fra.1", season_year=SAISON_FALLBACK_YEAR, n_derniers=10, events_comp=None):
+def stats_foot_detail(team_id, team_name="", league_slug="ligue-1", season_year=SAISON_FALLBACK_YEAR, n_derniers=10, events_comp=None):
     events = []
-    if team_id:
+    if events_comp:
+        events = events_comp
+    elif team_id:
         sched = get_foot_schedule_cached(team_id, league_slug=league_slug, season_year=season_year)
         events = _extraire_evenements_depuis_reponse(sched)
-        if not events and espn_code:
-            sched2 = get_foot_schedule_cached(team_id, league_slug=espn_code, season_year=season_year)
-            events = _extraire_evenements_depuis_reponse(sched2)
-    if not events and events_comp:
-        events = events_comp
 
     joues = [ev for ev in events if _est_match_clos(ev)]
     joues.sort(key=lambda ev: _extraire_date_evenement(ev))
@@ -625,27 +612,33 @@ def stats_foot_detail(team_id, league_slug="ligue-1", espn_code="fra.1", season_
     bp_away, bc_away = [], []
     v = n = d = 0
 
-    for ev in joues[-n_derniers:]:
+    nom_cible = (team_name or "").strip().lower()
+
+    for ev in joues:
         comps = ev.get("competitors", [])
         moi = adv = None
         mon_qual = None
+        match_equipe = False
 
         for c in comps:
             t_obj = c.get("team", {}) if isinstance(c.get("team"), dict) else c
             tid = str(t_obj.get("id") or c.get("id") or "")
+            t_nm = str(t_obj.get("name") or t_obj.get("short_name") or "").strip().lower()
             sc = _extraire_score_numerique(c.get("score"))
-            if sc is None:
-                continue
-            if team_id and tid == str(team_id):
+            qual = str(c.get("qualifier") or c.get("homeAway") or "").lower()
+
+            est_moi = (
+                (team_id and tid and tid == str(team_id))
+                or (nom_cible and t_nm and (t_nm == nom_cible or nom_cible in t_nm or t_nm in nom_cible))
+            )
+            if est_moi and sc is not None:
                 moi = sc
-                mon_qual = str(c.get("qualifier") or c.get("homeAway") or "").lower()
-            elif moi is None and adv is None:
-                moi = sc
-                mon_qual = str(c.get("qualifier") or c.get("homeAway") or "").lower()
-            else:
+                mon_qual = qual
+                match_equipe = True
+            elif sc is not None and adv is None and not est_moi:
                 adv = sc
 
-        if moi is not None and adv is not None:
+        if match_equipe and moi is not None and adv is not None:
             bp_all.append(moi)
             bc_all.append(adv)
             if mon_qual == "home":
@@ -662,7 +655,10 @@ def stats_foot_detail(team_id, league_slug="ligue-1", espn_code="fra.1", season_
             else:
                 d += 1
 
-    bp_base = moyenne_ponderee(bp_all, 1.30)
+        if len(bp_all) >= n_derniers:
+            break
+
+    bp_base = moyenne_ponderee(bp_all, 1.35)
     bc_base = moyenne_ponderee(bc_all, 1.20)
 
     return {
@@ -793,7 +789,6 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=FENETRE_HE
 
     for comp in competitions:
         slug = comp["slug"]
-        espn_code = comp.get("espn_code", slug)
         label_comp = comp.get("label", slug)
         evenements = recuperer_evenements_competition(comp)
         nb_bruts = len(evenements)
@@ -817,17 +812,17 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=FENETRE_HE
 
             vus_evenements.add(cle_ev)
             nb_retenus_comp += 1
-            matchs_candidats.append((slug, espn_code, label_comp, evenements, ev, h_info, a_info))
+            matchs_candidats.append((slug, label_comp, evenements, ev, h_info, a_info))
 
         diagnostics.append(f"{label_comp}: {nb_retenus_comp}/{nb_bruts}")
 
-    matchs_candidats.sort(key=lambda item: _extraire_date_evenement(item[4]))
+    matchs_candidats.sort(key=lambda item: _extraire_date_evenement(item[3]))
 
     resultats = []
     alertes_globales = {}
     scans_sante_effectues = 0
 
-    for slug, espn_code, label_comp, evenements_comp, ev, h_info, a_info in matchs_candidats:
+    for slug, label_comp, evenements_comp, ev, h_info, a_info in matchs_candidats:
         ev_id = str(ev.get("id") or ev.get("event_id") or "")
         start_str = _extraire_date_evenement(ev)
 
@@ -847,18 +842,10 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=FENETRE_HE
         )
 
         st_h = stats_foot_detail(
-            h_info.get("id", ""),
-            league_slug=slug,
-            espn_code=espn_code,
-            n_derniers=n_derniers,
-            events_comp=evenements_comp,
+            h_info.get("id", ""), team_name=h_nom, league_slug=slug, n_derniers=n_derniers, events_comp=evenements_comp
         )
         st_a = stats_foot_detail(
-            a_info.get("id", ""),
-            league_slug=slug,
-            espn_code=espn_code,
-            n_derniers=n_derniers,
-            events_comp=evenements_comp,
+            a_info.get("id", ""), team_name=a_nom, league_slug=slug, n_derniers=n_derniers, events_comp=evenements_comp
         )
 
         lam_h = max((st_h["bp_home"] + st_a["bc_away"]) / 2, 0.35)
@@ -941,8 +928,6 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=FENETRE_HE
         })
 
     diag_txt = " · ".join(diagnostics)
-    if _DERNIERES_ERREURS_FOOT:
-        diag_txt += f" | Err: {' / '.join(_DERNIERES_ERREURS_FOOT)}"
     return resultats, alertes_globales, diag_txt
 
 
