@@ -21,19 +21,19 @@ app = Flask(__name__, static_folder="static", static_url_path="/static")
 _DOSSIER_SCRIPT = os.path.dirname(os.path.abspath(__file__))
 FICHIER_HISTORIQUE = os.path.join(_DOSSIER_SCRIPT, "historique_paris.csv")
 
-# Optionnel : tu peux coller une clé ici pour tester ou laisser vide et utiliser
+# Optionnel : tu peux coller une clé ici ou laisser vide et utiliser
 # les variables d'environnement Render (OPENROUTER_API_KEY / GEMINI_API_KEY).
 OPENROUTER_API_KEY_LOCAL = ""
 GEMINI_API_KEY_LOCAL = ""
 
 COMPETITIONS_FOOT = [
-    {"slug": "ligue-1", "label": "Ligue 1", "aliases": {"ligue-1", "fra.1", "french ligue 1", "ligue 1"}},
-    {"slug": "premier-league", "label": "Premier League", "aliases": {"premier-league", "eng.1", "english premier league", "premier league"}},
-    {"slug": "la-liga", "label": "La Liga", "aliases": {"la-liga", "esp.1", "spanish la liga", "la liga"}},
-    {"slug": "bundesliga", "label": "Bundesliga", "aliases": {"bundesliga", "ger.1", "german bundesliga"}},
-    {"slug": "portuguese-liga", "label": "Liga Portugal", "aliases": {"portuguese-liga", "primeira-liga", "por.1", "portuguese liga", "liga portugal", "primeira liga"}},
-    {"slug": "uefa-champions-league", "label": "Ligue des Champions", "aliases": {"uefa-champions-league", "champions-league", "uefa.champions", "uefa champions league", "ligue des champions"}},
-    {"slug": "uefa-europa-league", "label": "Ligue Europa", "aliases": {"uefa-europa-league", "europa-league", "uefa.europa", "uefa europa league", "ligue europa"}},
+    {"slug": "ligue-1", "label": "Ligue 1", "aliases": {"ligue-1", "fra.1", "french ligue 1", "ligue 1", "ligue 1 mcdonald's"}},
+    {"slug": "premier-league", "label": "Premier League", "aliases": {"premier-league", "eng.1", "english premier league", "premier league", "epl"}},
+    {"slug": "la-liga", "label": "La Liga", "aliases": {"la-liga", "esp.1", "spanish la liga", "la liga", "laliga"}},
+    {"slug": "bundesliga", "label": "Bundesliga", "aliases": {"bundesliga", "ger.1", "german bundesliga", "1. bundesliga"}},
+    {"slug": "portuguese-liga", "label": "Liga Portugal", "aliases": {"portuguese-liga", "primeira-liga", "por.1", "portuguese liga", "liga portugal", "primeira liga", "liga portugal betclic"}},
+    {"slug": "uefa-champions-league", "label": "Ligue des Champions", "aliases": {"uefa-champions-league", "champions-league", "uefa.champions", "uefa champions league", "ligue des champions", "ucl"}},
+    {"slug": "uefa-europa-league", "label": "Ligue Europa", "aliases": {"uefa-europa-league", "europa-league", "uefa.europa", "uefa europa league", "ligue europa", "uel"}},
 ]
 
 SAISON_FALLBACK_YEAR = "2026"
@@ -80,10 +80,48 @@ def _get_gemini_key():
     return (os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY_LOCAL or "").strip()
 
 
+def _indexer_seasons_depuis_competitions():
+    mapping = {}
+    if hasattr(fb, "get_competitions"):
+        try:
+            res = fb.get_competitions()
+            data = res.get("data", res) if isinstance(res, dict) else {}
+            liste = []
+            if isinstance(data, list):
+                liste = data
+            elif isinstance(data, dict):
+                for cle in ("competitions", "leagues", "items", "data"):
+                    if isinstance(data.get(cle), list):
+                        liste = data[cle]
+                        break
+            for item in liste:
+                if not isinstance(item, dict):
+                    continue
+                slug = str(item.get("slug") or item.get("id") or "").strip().lower()
+                cur_season = item.get("current_season") or item.get("season") or {}
+                sid = None
+                if isinstance(cur_season, dict):
+                    sid = cur_season.get("id") or cur_season.get("season_id")
+                elif cur_season:
+                    sid = cur_season
+                if not sid:
+                    sid = item.get("season_id")
+                if slug and sid:
+                    mapping[slug] = str(sid).strip()
+        except Exception:
+            pass
+    return mapping
+
+
 def resoudre_season_id_foot(league_slug):
-    cle = str(league_slug).strip()
+    cle = str(league_slug).strip().lower()
     if cle in _CACHE_SEASON_ID:
         return _CACHE_SEASON_ID[cle]
+
+    saisons_globales = _indexer_seasons_depuis_competitions()
+    if cle in saisons_globales and saisons_globales[cle]:
+        _CACHE_SEASON_ID[cle] = saisons_globales[cle]
+        return saisons_globales[cle]
 
     season_id = f"{cle}-{SAISON_FALLBACK_YEAR}"
     if hasattr(fb, "get_current_season"):
@@ -110,26 +148,54 @@ def _extraire_evenements_depuis_reponse(payload):
         return []
     data = payload.get("data", payload)
     if isinstance(data, list):
-        return data
+        return [x for x in data if isinstance(x, dict)]
     if not isinstance(data, dict):
         return []
+
+    evenements = []
     for cle in ("events", "matches", "fixtures", "games", "schedules"):
         val = data.get(cle)
         if isinstance(val, list):
-            return val
-    return []
+            for item in val:
+                if not isinstance(item, dict):
+                    continue
+                if "competitors" in item or "teams" in item or "home_team" in item:
+                    evenements.append(item)
+                else:
+                    evenements.extend(_extraire_evenements_depuis_reponse(item))
+
+    for cle_bloc in ("leagues", "competitions", "seasons", "days"):
+        bloc = data.get(cle_bloc)
+        if isinstance(bloc, list):
+            for sub in bloc:
+                if isinstance(sub, dict):
+                    meta_comp = {}
+                    for m_key in ("slug", "id", "name", "short_name", "abbreviation", "league_slug", "competition_id"):
+                        if sub.get(m_key) and f"_bloc_{m_key}" not in meta_comp:
+                            meta_comp[f"_bloc_{m_key}"] = sub.get(m_key)
+                    for ev in _extraire_evenements_depuis_reponse(sub):
+                        copie = dict(ev)
+                        for mk, mv in meta_comp.items():
+                            copie.setdefault(mk, mv)
+                        evenements.append(copie)
+
+    return evenements
 
 
 def _match_appartient_competition(ev, comp_cfg):
     slug = comp_cfg["slug"].lower()
     aliases = {a.lower() for a in comp_cfg.get("aliases", set())} | {slug, comp_cfg.get("label", "").lower()}
 
-    for champ in ("league_slug", "competition_id", "competition", "league"):
+    for champ in (
+        "league_slug", "competition_id", "competition", "league",
+        "_bloc_slug", "_bloc_id", "_bloc_name", "_bloc_short_name", "_bloc_abbreviation",
+        "_bloc_league_slug", "_bloc_competition_id"
+    ):
         val = ev.get(champ)
         if isinstance(val, dict):
             for k in ("slug", "id", "name", "short_name", "abbreviation"):
                 v = str(val.get(k) or "").strip().lower()
-                if v in aliases:
+                if v in aliases or slug in v:
                     return True
         elif val:
             v = str(val).strip().lower()
@@ -151,15 +217,19 @@ def recuperer_evenements_competition(comp_cfg):
     evenements = []
 
     if hasattr(fb, "get_season_schedule"):
-        try:
-            res_sched = fb.get_season_schedule(season_id=season_id)
-            evenements.extend(_extraire_evenements_depuis_reponse(res_sched))
-        except Exception:
-            pass
+        for sid_test in dict.fromkeys([season_id, f"{slug}-{SAISON_FALLBACK_YEAR}", f"{slug}-2025"]):
+            try:
+                res_sched = fb.get_season_schedule(season_id=sid_test)
+                evs = _extraire_evenements_depuis_reponse(res_sched)
+                if evs:
+                    evenements.extend(evs)
+                    break
+            except Exception:
+                pass
 
     if hasattr(fb, "get_daily_schedule"):
         now_utc = datetime.now(timezone.utc)
-        for offset_jours in (0, 1, 2):
+        for offset_jours in (-1, 0, 1, 2):
             jour = (now_utc + timedelta(days=offset_jours)).strftime("%Y-%m-%d")
             try:
                 res_day = fb.get_daily_schedule(date=jour)
@@ -173,7 +243,7 @@ def recuperer_evenements_competition(comp_cfg):
     for idx, ev in enumerate(evenements):
         if not isinstance(ev, dict):
             continue
-        eid = str(ev.get("id") or ev.get("event_id") or f"idx_{idx}")
+        eid = str(ev.get("id") or ev.get("event_id") or f"{slug}_idx_{idx}")
         dedup[eid] = ev
 
     liste_finale = list(dedup.values())
@@ -225,37 +295,51 @@ def trouver_rang(nom, rk_map):
 
 
 def _extraire_date_evenement(ev):
-    for champ in ("start_time", "date", "commence_time", "startDate"):
+    for champ in ("start_time", "date", "commence_time", "startDate", "utc_date"):
         if ev.get(champ):
             return str(ev.get(champ))
     return ""
 
 
+def _lire_statut_evenement(ev):
+    statut = ev.get("status")
+    if isinstance(statut, dict):
+        statut = statut.get("type") or statut.get("name") or statut.get("state") or statut.get("detail") or ""
+    return str(statut or "").strip().lower()
+
+
 def _est_match_a_venir(ev):
-    statut = str(ev.get("status") or "").strip().lower()
-    if isinstance(ev.get("status"), dict):
-        statut = str(ev["status"].get("type") or ev["status"].get("name") or ev["status"].get("state") or "").strip().lower()
-    return statut in ("not_started", "scheduled", "pre", "upcoming", "status_scheduled")
+    statut = _lire_statut_evenement(ev)
+    if not statut:
+        return True
+    return statut in (
+        "not_started", "scheduled", "pre", "upcoming",
+        "status_scheduled", "fixture", "timed"
+    )
 
 
 def _est_match_clos(ev):
-    statut = str(ev.get("status") or "").strip().lower()
-    if isinstance(ev.get("status"), dict):
-        statut = str(ev["status"].get("type") or ev["status"].get("name") or ev["status"].get("state") or "").strip().lower()
-    return statut in ("closed", "final", "post", "completed", "finished", "status_final")
+    statut = _lire_statut_evenement(ev)
+    return statut in (
+        "closed", "final", "post", "completed",
+        "finished", "status_final", "full_time", "ft"
+    )
 
 
 def dans_fenetre_heures(date_str, heures_max):
     if heures_max is None or not date_str:
         return True
     try:
-        s = str(date_str).strip().replace("Z", "+00:00")
+        s = str(date_str).strip()
+        if len(s) == 10 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            s = f"{s}T12:00:00+00:00"
+        s = s.replace("Z", "+00:00")
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         maintenant = datetime.now(timezone.utc)
         limite = maintenant + timedelta(hours=heures_max)
-        return (maintenant - timedelta(hours=4)) <= dt <= limite
+        return (maintenant - timedelta(hours=6)) <= dt <= limite
     except Exception:
         return True
 
@@ -438,7 +522,6 @@ def stats_foot_detail(team_id, league_slug="ligue-1", season_year=SAISON_FALLBAC
                 moi = sc
                 mon_qual = str(c.get("qualifier") or c.get("homeAway") or "").lower()
             elif moi is None and adv is None:
-                # Si team_id absent, prend le premier compétiteur comme référence
                 moi = sc
                 mon_qual = str(c.get("qualifier") or c.get("homeAway") or "").lower()
             else:
@@ -584,11 +667,14 @@ def _extraire_home_away(ev):
 def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=48):
     vus_evenements = set()
     matchs_candidats = []
+    diagnostics = []
 
     for comp in competitions:
         slug = comp["slug"]
         label_comp = comp.get("label", slug)
         evenements = recuperer_evenements_competition(comp)
+        nb_bruts = len(evenements)
+        nb_retenus_comp = 0
 
         for ev in evenements:
             if not _est_match_a_venir(ev):
@@ -607,7 +693,10 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=48):
                 continue
 
             vus_evenements.add(cle_ev)
+            nb_retenus_comp += 1
             matchs_candidats.append((slug, label_comp, evenements, ev, h_info, a_info))
+
+        diagnostics.append(f"{label_comp}: {nb_retenus_comp}/{nb_bruts}")
 
     matchs_candidats.sort(key=lambda item: _extraire_date_evenement(item[3]))
 
@@ -708,7 +797,7 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=48):
             "buts_proba": buts_proba,
         })
 
-    return resultats, alertes_globales
+    return resultats, alertes_globales, " · ".join(diagnostics)
 
 
 def analyser_tennis(heures_max=48):
@@ -1167,7 +1256,7 @@ def appeler_ia_gratuite(prompt_texte):
     return None
 
 
-def generer_synthese(pistes, alertes_sante):
+def generer_synthese(pistes, alertes_sante, diag_foot=""):
     lignes_pistes = [
         f"- [{p['sport']}] {p['match']} -> {p['choix']} ({p['proba']}%, niveau {p['prudence']}) | {p['detail']}"
         for p in pistes[:8]
@@ -1189,6 +1278,8 @@ def generer_synthese(pistes, alertes_sante):
         return rep_ia
 
     lignes = ["Mode synthétique local (ajoute GEMINI_API_KEY ou OPENROUTER_API_KEY sur Render pour le texte IA)."]
+    if not any(p.get("sport") == "FOOT" for p in pistes) and diag_foot:
+        lignes.append(f"• Diagnostic Foot (48h) : {diag_foot}")
     for p in pistes[:6]:
         mise_str = f" · Mise {p['mise_u']:.2f}u" if p.get("mise_u", 0.0) > 0 else ""
         lignes.append(f"• [{p['prudence']}] {p['match']} → {p['choix']} ({p['proba']}%{mise_str})")
@@ -1202,7 +1293,7 @@ def executer_analyse_complete(heures_max=FENETRE_HEURES):
     _CACHE_SEASON_ID.clear()
     _CACHE_COMP_EVENTS.clear()
 
-    foot_res, alertes_f = analyser_tous_matchs_foot(
+    foot_res, alertes_f, diag_foot = analyser_tous_matchs_foot(
         COMPETITIONS_FOOT,
         n_derniers=N_DERNIERS_MATCHS,
         heures_max=heures_max,
@@ -1214,7 +1305,7 @@ def executer_analyse_complete(heures_max=FENETRE_HEURES):
     filtres = selectionner_meilleurs_paris_filtres(principaux, foot_res)
     bilan = mettre_a_jour_et_sauver_historique(principaux, foot_res, COMPETITIONS_FOOT)
     toutes_alertes = filtrer_alertes_uniques({**alertes_f, **alertes_t})
-    synthese = generer_synthese(principaux, toutes_alertes)
+    synthese = generer_synthese(principaux, toutes_alertes, diag_foot=diag_foot)
 
     return {
         "maj": datetime.now().strftime("%d/%m/%Y %H:%M"),
@@ -1423,7 +1514,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           {{ it.proba }}% · {{ it.prudence }}
         </span>
       </div>
-      <div class="choix">{{ it.choix }}{% if it.mise_u and it.mise_u > 0 %} — Mise {{ "%.2f"|format(it.mise_u) }}u{% endif %}</div>
+      <div class="choix">{{ it.choix }}{% if it.mise_u and mf_mise is defined %} — Mise {{ "%.2f"|format(it.mise_u) }}u{% elif it.mise_u and it.mise_u > 0 %} — Mise {{ "%.2f"|format(it.mise_u) }}u{% endif %}</div>
       <div class="match">{{ it.match }} ({{ it.date_match }})</div>
       <div class="meta">{{ it.detail }}</div>
     </div>
