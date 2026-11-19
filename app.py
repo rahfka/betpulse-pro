@@ -35,7 +35,6 @@ COMPETITIONS_FOOT = [
     {"slug": "uefa-europa-league", "label": "Ligue Europa"},
 ]
 
-SAISON_FALLBACK_YEAR = "2026"
 N_DERNIERS_MATCHS = 10
 FENETRE_HEURES = 72
 MAX_SCAN_SANTE_MATCHS = 25
@@ -76,7 +75,7 @@ def _get_gemini_key():
     return (os.getenv("GEMINI_API_KEY") or GEMINI_API_KEY_LOCAL or "").strip()
 
 
-def _appel_sûr(fn, candidats_kwargs):
+def _appel_sur(fn, candidats_kwargs):
     if not callable(fn):
         return None
     for kwargs in candidats_kwargs:
@@ -89,6 +88,41 @@ def _appel_sûr(fn, candidats_kwargs):
         except Exception:
             continue
     return None
+
+
+def _extraire_season_id(payload, slug):
+    if not payload:
+        return None
+    if isinstance(payload, str):
+        return payload.strip() or None
+    if isinstance(payload, dict):
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        for cle in ("season_id", "id", "slug"):
+            val = data.get(cle)
+            if val:
+                return str(val).strip()
+        season_obj = data.get("season") or data.get("current_season")
+        if isinstance(season_obj, dict):
+            for cle in ("id", "season_id", "slug"):
+                if season_obj.get(cle):
+                    return str(season_obj[cle]).strip()
+    return f"{slug}-2026"
+
+
+def resoudre_season_id(slug):
+    if hasattr(fb, "get_current_season"):
+        res = _appel_sur(
+            fb.get_current_season,
+            [
+                {"competition_id": slug},
+                {"league_slug": slug},
+                {"slug": slug},
+            ],
+        )
+        sid = _extraire_season_id(res, slug)
+        if sid:
+            return sid
+    return f"{slug}-2026"
 
 
 def _extraire_evenements(payload):
@@ -111,7 +145,11 @@ def _extraire_evenements(payload):
         if isinstance(val, list):
             for item in val:
                 if isinstance(item, dict):
-                    if item.get("competitors") or item.get("teams") or (item.get("home_team") and item.get("away_team")):
+                    if (
+                        item.get("competitors")
+                        or item.get("teams")
+                        or (item.get("home_team") and item.get("away_team"))
+                    ):
                         evenements.append(item)
                     else:
                         evenements.extend(_extraire_evenements(item))
@@ -127,28 +165,32 @@ def _extraire_evenements(payload):
 
 
 def recuperer_evenements_competition(slug):
+    season_id = resoudre_season_id(slug)
     evenements = []
 
     if hasattr(fb, "get_season_schedule"):
-        for sid in (f"{slug}-{SAISON_FALLBACK_YEAR}", f"{slug}-2026-2027", slug):
-            res = _appel_sûr(
-                fb.get_season_schedule,
-                [
-                    {"season_id": sid},
-                    {"competition_id": slug, "season_id": sid},
-                    {"league_slug": slug, "season_id": sid},
-                ],
-            )
-            evs = _extraire_evenements(res)
-            if evs:
-                evenements.extend(evs)
-                break
+        res = _appel_sur(
+            fb.get_season_schedule,
+            [
+                {"season_id": season_id},
+                {"competition_id": slug, "season_id": season_id},
+                {"league_slug": slug, "season_id": season_id},
+            ],
+        )
+        evenements.extend(_extraire_evenements(res))
 
     if hasattr(fb, "get_daily_schedule"):
         now_utc = datetime.now(timezone.utc)
         for offset in range(-1, 4):
             jour = (now_utc + timedelta(days=offset)).strftime("%Y-%m-%d")
-            res = _appel_sûr(fb.get_daily_schedule, [{"date": jour}, {"day": jour}])
+            res = _appel_sur(
+                fb.get_daily_schedule,
+                [
+                    {"date": jour, "season_id": season_id},
+                    {"date": jour},
+                    {"day": jour},
+                ],
+            )
             for ev in _extraire_evenements(res):
                 texte_comp = str(
                     ev.get("league_slug")
@@ -164,7 +206,7 @@ def recuperer_evenements_competition(slug):
     for i, ev in enumerate(evenements):
         eid = str(ev.get("id") or ev.get("event_id") or f"{slug}_{i}")
         dedup[eid] = ev
-    return list(dedup.values())
+    return list(dedup.values()), season_id
 
 
 def _extraire_date_evenement(ev):
@@ -189,7 +231,9 @@ def _est_match_clos(ev):
 
 def _est_match_a_venir(ev):
     st = _lire_statut(ev)
-    if _est_match_clos(ev) or st in ("in_progress", "live", "halftime", "ht", "canceled", "cancelled", "postponed"):
+    if _est_match_clos(ev) or st in (
+        "in_progress", "live", "halftime", "ht", "canceled", "cancelled", "postponed"
+    ):
         return False
     return True
 
@@ -437,7 +481,7 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=72):
     for comp in competitions:
         slug = comp["slug"]
         label_comp = comp.get("label", slug)
-        evenements = recuperer_evenements_competition(slug)
+        evenements, season_id = recuperer_evenements_competition(slug)
         retenus = 0
 
         for ev in evenements:
@@ -450,7 +494,7 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=72):
             if not h_info or not a_info:
                 continue
 
-            ev_id = str(ev.get("id") or ev.get("event_id") or f"{slug}_{_extraire_date_evenement(ev)}_{retenus}")
+            ev_id = str(ev.get("id") or ev.get("event_id") or f"{slug}_{start_str}_{retenus}")
             cle = f"{slug}_{ev_id}"
             if cle in vus_ids:
                 continue
@@ -458,7 +502,7 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=72):
             retenus += 1
             matchs_candidats.append((slug, label_comp, evenements, ev_id, start_str, h_info, a_info))
 
-        diag.append(f"{label_comp}: {retenus}/{len(evenements)}")
+        diag.append(f"{label_comp} [{season_id}]: {retenus}/{len(evenements)}")
 
     matchs_candidats.sort(key=lambda x: x[4])
 
@@ -467,8 +511,20 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=72):
     scans_sante = 0
 
     for slug, label_comp, evenements_comp, ev_id, start_str, h_info, a_info in matchs_candidats:
-        h_nom = h_info.get("short_name") or h_info.get("shortDisplayName") or h_info.get("name") or h_info.get("displayName") or "Home"
-        a_nom = a_info.get("short_name") or a_info.get("shortDisplayName") or a_info.get("name") or a_info.get("displayName") or "Away"
+        h_nom = (
+            h_info.get("short_name")
+            or h_info.get("shortDisplayName")
+            or h_info.get("name")
+            or h_info.get("displayName")
+            or "Home"
+        )
+        a_nom = (
+            a_info.get("short_name")
+            or a_info.get("shortDisplayName")
+            or a_info.get("name")
+            or a_info.get("displayName")
+            or "Away"
+        )
 
         st_h = stats_foot_detail(h_info.get("id", ""), evenements_comp, n_derniers=n_derniers)
         st_a = stats_foot_detail(a_info.get("id", ""), evenements_comp, n_derniers=n_derniers)
@@ -497,7 +553,7 @@ def analyser_tous_matchs_foot(competitions, n_derniers=10, heures_max=72):
         label_val = "Neutre"
         cote_dec = None
         mise_u = 0.0
-        odds_obj = ev_info = None
+        odds_obj = None
         for item in evenements_comp:
             if str(item.get("id") or item.get("event_id") or "") == ev_id:
                 odds_obj = item.get("odds")
@@ -554,8 +610,14 @@ def trouver_rang(nom, rk_map):
 
 
 def analyser_tennis(heures_max=72):
-    atp_rk = {" ".join(p["name"].lower().split()): p["rank"] for p in tn.get_rankings(tour="atp").get("data", {}).get("rankings", [])}
-    wta_rk = {" ".join(p["name"].lower().split()): p["rank"] for p in tn.get_rankings(tour="wta").get("data", {}).get("rankings", [])}
+    atp_rk = {
+        " ".join(p["name"].lower().split()): p["rank"]
+        for p in tn.get_rankings(tour="atp").get("data", {}).get("rankings", [])
+    }
+    wta_rk = {
+        " ".join(p["name"].lower().split()): p["rank"]
+        for p in tn.get_rankings(tour="wta").get("data", {}).get("rankings", [])
+    }
     sb = tn.get_scoreboard()
 
     simples_fiables, simples_nc, doubles_liste, alertes_tennis = [], [], [], {}
@@ -799,7 +861,7 @@ def generer_synthese(pistes, alertes_sante, diag_foot=""):
         return rep
 
     lignes = ["Mode synthétique local."]
-    if not any(p.get("sport") == "FOOT" for p in pistes) and diag_foot:
+    if diag_foot:
         lignes.append(f"• Diagnostic Foot : {diag_foot}")
     for p in pistes[:6]:
         lignes.append(f"• [{p['prudence']}] {p['match']} → {p['choix']} ({p['proba']}%)")
@@ -839,7 +901,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <style>
     :root {
       --bg: #0b0f17; --card: #131a26; --card-2: #192232; --border: #243044;
-      --text: #eef2f7; --muted: #93a4bc; --accent: #22c55e; --warn: #f59e0b; --danger: #ef4444; --info: #38bdf8;
+      --text: #eef2f7; --muted: #93a4bc; --accent: #22c55e; --info: #38bdf8;
     }
     * { box-sizing: border-box; }
     body { margin: 0; padding: 0 0 40px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); }
@@ -896,7 +958,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     {% for it in data.principaux %}
     <div class="card">
       <div class="card-head"><span class="badge">{{ it.sport }} · {{ it.competition }}</span><span class="badge">{{ it.proba }}% · {{ it.prudence }}</span></div>
-      <div class="choix">{{ it.choix }}{% if it.mise_u and it.mise_u > 0 %} — Mise {{ "%.2f"|format(it.mise_u) }}u{% endif %}</div>
+      <div class="choix">{{ it.choix }}{% if it.mise_u and it.mise_u > 0 %} — Mise {{ "%.2f"|format(mf.mise_u) }}u{% endif %}</div>
       <div class="meta">{{ it.match }} ({{ it.date_match }}) — {{ it.detail }}</div>
     </div>
     {% else %}
