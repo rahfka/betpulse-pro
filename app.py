@@ -68,6 +68,8 @@ class Config:
     timeout_http: float = field(default_factory=lambda: max(1.0, float(os.getenv("TIMEOUT_HTTP", "4"))))
     cache_ttl_sec: int = field(default_factory=lambda: max(60, int(os.getenv("CACHE_TTL_SEC", "900"))))
     mise_unite_defaut: float = field(default_factory=lambda: max(0.0, float(os.getenv("MISE_UNITE_DEFAUT", "1.0"))))
+    mise_max_unites: float = field(default_factory=lambda: max(0.5, float(os.getenv("MISE_MAX_UNITES", "1.5"))))
+    marge_value_pct: float = field(default_factory=lambda: max(0.0, float(os.getenv("MARGE_VALUE_PCT", "4.0"))))
     auto_refresh_sec: int = field(default_factory=lambda: max(0, int(os.getenv("AUTO_REFRESH_SEC", "0"))))
     activer_debug_routes: bool = field(
         default_factory=lambda: os.getenv("ACTIVER_DEBUG_ROUTES", "false").strip().lower() in ("1", "true", "yes")
@@ -75,6 +77,24 @@ class Config:
 
 
 CFG = Config()
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
+ODDS_CACHE_TTL_SEC = max(300, int(os.getenv("ODDS_CACHE_TTL_SEC", "7200")))
+
+MAP_COMP_ODDS_API = {
+    "ligue-1": "soccer_france_ligue_one",
+    "la-liga": "soccer_spain_la_liga",
+    "bundesliga": "soccer_germany_bundesliga",
+    "portuguese-liga": "soccer_portugal_primeira_liga",
+    "premier-league": "soccer_epl",
+    "serie-a": "soccer_italy_serie_a",
+    "uefa-champions-league": "soccer_uefa_champs_league",
+    "uefa-europa-league": "soccer_uefa_europa_league",
+}
+
+BOOKMAKERS_FR_PRIORITAIRES = {
+    "winamax_fr", "winamax_de", "betclic_fr", "parionssport_fr",
+    "unibet_fr", "pmu_fr", "bwin_fr", "zebet_fr",
+}
 
 
 class _CacheBorne:
@@ -148,6 +168,7 @@ _HTTP_SESSION.headers.update({
 
 _CACHE_FOOT_SCHED = _CacheBorne(max_taille=400)
 _CACHE_SANTE = _CacheBorne(max_taille=400)
+_CACHE_COTES_MARCHE = _CacheBorne(max_taille=64)
 _STATE_LOCK = threading.Lock()
 _CSV_LOCK = threading.Lock()
 _ANALYSE_EN_COURS = False
@@ -332,7 +353,7 @@ def simuler_poisson_foot(lam_h, lam_a):
     p_h = p_n = p_a = p_over_25 = 0.0
     best_h = best_a = 0
     max_pr = -1.0
-    
+
     for h in range(max_buts):
         pr_h = poisson_prob(h, lam_h)
         for a in range(max_buts):
@@ -340,7 +361,7 @@ def simuler_poisson_foot(lam_h, lam_a):
             if pr > max_pr:
                 max_pr = pr
                 best_h, best_a = h, a
-                
+
             if h > a:
                 p_h += pr
             elif h == a:
@@ -349,13 +370,13 @@ def simuler_poisson_foot(lam_h, lam_a):
                 p_a += pr
             if (h + a) > 2:
                 p_over_25 += pr
-                
+
     tot = p_h + p_n + p_a
     if tot <= 0:
-        return 1 / 3, 1 / 3, 1 / 3, 0.5, 0.5, "0 - 0"
+        return 1 / 3, 1 / 3, 1 / 3, 0.5, 0.5, "0 - 0", 0, 0
     p_h, p_n, p_a = p_h / tot, p_n / tot, p_a / tot
     p_ov25_norm = min(max(p_over_25, 0.0), 1.0)
-    return p_h, p_n, p_a, p_ov25_norm, 1.0 - p_ov25_norm, f"{best_h} - {best_a}"
+    return p_h, p_n, p_a, p_ov25_norm, 1.0 - p_ov25_norm, f"{best_h} - {best_a}", best_h, best_a
 
 
 def moyenne_ponderee_shrinkage(valeurs, prior_moyenne, prior_poids=3.0):
@@ -368,14 +389,16 @@ def moyenne_ponderee_shrinkage(valeurs, prior_moyenne, prior_poids=3.0):
     return ((moy_obs * somme_poids) + (prior_moyenne * prior_poids)) / (somme_poids + prior_poids)
 
 
-def _calculer_indice_confiance(proba_pct, fiable, gravite_alerte=0.0):
+def _calculer_indice_confiance(proba_pct, fiable, gravite_alerte=0.0, est_nul=False):
     score = proba_pct
     if not fiable:
         score -= 15.0
     if gravite_alerte > 0.0:
         score -= min(gravite_alerte * 10.0, 22.0)
+    if est_nul:
+        score -= 6.0
     score = round(max(10.0, min(95.0, score)), 1)
-    if fiable and gravite_alerte == 0.0 and score >= 60.0:
+    if fiable and gravite_alerte == 0.0 and not est_nul and score >= 60.0:
         niveau = "HAUTE"
     elif score >= 49.0:
         niveau = "MOYENNE"
@@ -385,17 +408,127 @@ def _calculer_indice_confiance(proba_pct, fiable, gravite_alerte=0.0):
 
 
 def _calculer_cote(proba_pct, marge=0.04):
-    """
-    Calcule une cote réaliste type bookmaker.
-    La marge (vig) par défaut est de 4%.
-    """
     p = proba_pct / 100.0
     if p <= 0 or p >= 1:
         return 0.0
     fair_odds = 1.0 / p
-    # On retire la marge du bookmaker
     cote_broker = fair_odds * (1 - marge)
     return max(1.01, round(cote_broker, 2))
+
+
+def _calculer_cote_min_et_mise(proba_pct, conf_score, fiable, est_nul=False):
+    p = max(0.05, min(0.95, proba_pct / 100.0))
+    marge_facteur = 1.0 + (CFG.marge_value_pct / 100.0)
+    cote_min = round((1.0 / p) * marge_facteur, 2)
+
+    if CFG.mise_unite_defaut <= 0:
+        return cote_min, 0.0
+
+    if not fiable or proba_pct < 50.0:
+        mise = round(CFG.mise_unite_defaut * 0.25, 2)
+    else:
+        facteur_conf = max(0.35, min(1.35, conf_score / 62.0))
+        facteur_nul = 0.65 if est_nul else 1.0
+        mise = round(
+            min(CFG.mise_max_unites, max(0.25, CFG.mise_unite_defaut * facteur_conf * facteur_nul)),
+            2,
+        )
+    return cote_min, mise
+
+
+def _normaliser_nom_equipe(nom):
+    s = re.sub(r"\b(fc|sc|ac|as|rc|rcd|cf|ud|cd|afc|ssc|sl|sd)\b", " ", str(nom or "").lower())
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    return " ".join(s.split())
+
+
+def _memes_equipes(nom_a, nom_b):
+    na = _normaliser_nom_equipe(nom_a)
+    nb = _normaliser_nom_equipe(nom_b)
+    if not na or not nb:
+        return False
+    return na == nb or (len(na) >= 4 and (na in nb or nb in na))
+
+
+def charger_cotes_moyennes_foot(competitions):
+    if not ODDS_API_KEY:
+        return {}
+
+    cotes_map = {}
+    for comp in competitions:
+        slug = comp.get("slug")
+        label = comp.get("label")
+        sport_key = MAP_COMP_ODDS_API.get(slug)
+        if not sport_key:
+            continue
+
+        cached = _CACHE_COTES_MARCHE.get(sport_key, ODDS_CACHE_TTL_SEC)
+        if cached is None:
+            try:
+                resp = _HTTP_SESSION.get(
+                    f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/",
+                    params={
+                        "apiKey": ODDS_API_KEY,
+                        "regions": "eu,fr,uk",
+                        "markets": "h2h",
+                        "oddsFormat": "decimal",
+                    },
+                    timeout=CFG.timeout_http,
+                )
+                if resp.status_code != 200:
+                    logger.debug("Odds API %s -> HTTP %s", sport_key, resp.status_code)
+                    _CACHE_COTES_MARCHE.set(sport_key, [])
+                    continue
+                payload = resp.json()
+                cached = payload if isinstance(payload, list) else []
+                _CACHE_COTES_MARCHE.set(sport_key, cached)
+            except Exception as e:
+                logger.debug("Erreur Odds API (%s): %s", sport_key, e)
+                continue
+
+        for ev in cached:
+            home_api = ev.get("home_team") or ""
+            away_api = ev.get("away_team") or ""
+            cotes_home = []
+            cotes_draw = []
+            cotes_away = []
+
+            for bk in ev.get("bookmakers") or []:
+                bk_key = str(bk.get("key") or "").lower()
+                for mkt in bk.get("markets") or []:
+                    if mkt.get("key") != "h2h":
+                        continue
+                    for oc in mkt.get("outcomes") or []:
+                        prix = oc.get("price")
+                        if not isinstance(prix, (int, float)) or prix <= 1.01:
+                            continue
+                        oc_nom = oc.get("name") or ""
+                        if oc_nom == "Draw" or _normaliser_nom_equipe(oc_nom) == "draw":
+                            cotes_draw.append((float(prix), bk_key in BOOKMAKERS_FR_PRIORITAIRES))
+                        elif _memes_equipes(oc_nom, home_api):
+                            cotes_home.append((float(prix), bk_key in BOOKMAKERS_FR_PRIORITAIRES))
+                        elif _memes_equipes(oc_nom, away_api):
+                            cotes_away.append((float(prix), bk_key in BOOKMAKERS_FR_PRIORITAIRES))
+
+            def _moyenne_liste(liste_tuples):
+                if not liste_tuples:
+                    return None, 0
+                fr_only = [p for p, is_fr in liste_tuples if is_fr]
+                base = fr_only if fr_only else [p for p, _ in liste_tuples]
+                return round(sum(base) / len(base), 2), len(base)
+
+            moy_h, n_h = _moyenne_liste(cotes_home)
+            moy_n, n_n = _moyenne_liste(cotes_draw)
+            moy_a, n_a = _moyenne_liste(cotes_away)
+
+            cle_match = (label, _normaliser_nom_equipe(home_api), _normaliser_nom_equipe(away_api))
+            cotes_map[cle_match] = {
+                "home": (moy_h, n_h),
+                "draw": (moy_n, n_n),
+                "away": (moy_a, n_a),
+            }
+
+    return cotes_map
 
 
 def _extraire_scores_evenement(ev):
@@ -581,18 +714,25 @@ def _construire_entree_foot(ev, label_comp, events_comp):
 
     lam_h = max(((h_att * 1.08) + a_def) / 2.0, 0.35)
     lam_a = max(((a_att * 0.92) + h_def) / 2.0, 0.35)
-    p_h, p_n, p_a, p_ov25, p_un25, score_exact = simuler_poisson_foot(lam_h, lam_a)
+    p_h, p_n, p_a, p_ov25, p_un25, score_exact, best_h, best_a = simuler_poisson_foot(lam_h, lam_a)
 
-    choix, prob = max(
-        [(f"Victoire {h_nom}", p_h), ("Match nul", p_n), (f"Victoire {a_nom}", p_a)],
+    meilleure_victoire, prob_victoire = max(
+        [(f"Victoire {h_nom}", p_h), (f"Victoire {a_nom}", p_a)],
         key=lambda x: x[1],
     )
 
-    plafond = 0.80 if fiable else 0.64
+    score_nul_probable = (best_h == best_a) and abs(p_n - prob_victoire) <= 0.08
+    if p_n >= prob_victoire or score_nul_probable:
+        choix, prob = "Match nul", max(p_n, prob_victoire)
+        est_nul = True
+    else:
+        choix, prob = meilleure_victoire, prob_victoire
+        est_nul = False
+
+    plafond = 0.80 if (fiable and not est_nul) else (0.52 if est_nul else 0.64)
     prob_cal = min(max(prob, 0.05), plafond)
     proba_pct = round(prob_cal * 100, 1)
 
-    # Détection de match imminent (< 2 heures)
     dt_match = _parse_date_utc(start_str)
     est_imminent = False
     if dt_match:
@@ -603,8 +743,10 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     buts_label = "+2.5 buts" if p_ov25 >= p_un25 else "-2.5 buts"
     buts_proba = round(min(max(p_ov25, p_un25), 0.85) * 100, 1)
 
-    prudence = "ELEVE" if (proba_pct >= 72 and fiable) else ("MODERE" if proba_pct >= 56 else "PRUDENT")
-    conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, fiable, 0.0)
+    prudence = "ELEVE" if (proba_pct >= 72 and fiable and not est_nul) else ("MODERE" if proba_pct >= 56 else "PRUDENT")
+    conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, fiable, 0.0, est_nul=est_nul)
+    cote_min, mise_u = _calculer_cote_min_et_mise(proba_pct, conf_score, fiable, est_nul=est_nul)
+    nul_note = " | Nul probable" if est_nul else ""
 
     return {
         "sport": "FOOT",
@@ -615,17 +757,20 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "date_match": _formater_date_locale(start_str),
         "detail": (
             f"[{label_comp}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] "
-            f"| Buts: {buts_label} ({buts_proba:.0f}%)"
+            f"| Buts: {buts_label} ({buts_proba:.0f}%) | Min @{cote_min}{nul_note}"
         ),
         "choix": choix,
+        "est_nul": est_nul,
         "proba": proba_pct,
-        "cote": 0.0, # Sera calculé à la fin dans executer_analyse
+        "cote": 0.0,
+        "cote_source": "Estimée",
+        "cote_min": cote_min,
         "score_exact": score_exact,
         "est_imminent": est_imminent,
         "prudence": prudence,
         "confiance": conf_niveau,
         "confiance_score": conf_score,
-        "mise_u": CFG.mise_unite_defaut,
+        "mise_u": mise_u,
         "equipes": [h_nom, a_nom],
     }
 
@@ -811,6 +956,7 @@ def analyser_tennis(heures_max=48):
                         est_imminent = True
 
                 conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, complet, 0.0)
+                cote_min, mise_u = _calculer_cote_min_et_mise(proba_pct, conf_score, complet, est_nul=False)
                 simples.append({
                     "sport": "TENNIS",
                     "competition": t_name or "Tennis",
@@ -818,16 +964,19 @@ def analyser_tennis(heures_max=48):
                     "event_id": mid,
                     "match": f"{j1} (#{r1 or 'NC'}) vs {j2} (#{r2 or 'NC'})",
                     "date_match": _formater_date_locale(str(m.get("date", ""))),
-                    "detail": f"{t_name}",
+                    "detail": f"{t_name} | Min @{cote_min}",
                     "choix": f"Victoire {favori}",
+                    "est_nul": False,
                     "proba": proba_pct,
-                    "cote": 0.0, # Sera calculé à la fin
+                    "cote": 0.0,
+                    "cote_source": "Estimée",
+                    "cote_min": cote_min,
                     "score_exact": None,
                     "est_imminent": est_imminent,
                     "prudence": "MODERE" if (proba_pct >= 58 and complet) else "PRUDENT",
                     "confiance": conf_niveau,
                     "confiance_score": conf_score,
-                    "mise_u": CFG.mise_unite_defaut,
+                    "mise_u": mise_u,
                     "equipes": [favori],
                 })
     return simples, alertes_tennis, termines_tennis
@@ -872,11 +1021,21 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
             penalite_proba = min(grav * 0.025, 0.09)
             it["proba"] = round(max(0.05, it["proba"] / 100 - penalite_proba) * 100, 1)
             it["prudence"] = "MODERE" if (it["proba"] >= 62 and grav < 1.0) else "PRUDENT (alerte)"
+        est_nul = bool(it.get("est_nul")) or str(it.get("choix") or "").strip().lower() == "match nul"
         conf_score, conf_niveau = _calculer_indice_confiance(
             it.get("proba", 50.0),
             bool(it.get("fiable", True)),
             grav,
+            est_nul=est_nul,
         )
+        cote_min, mise_u = _calculer_cote_min_et_mise(
+            it.get("proba", 50.0),
+            conf_score,
+            bool(it.get("fiable", True)),
+            est_nul=est_nul,
+        )
+        it["cote_min"] = cote_min
+        it["mise_u"] = mise_u
         it["confiance"] = conf_niveau
         it["confiance_score"] = conf_score
 
@@ -1118,6 +1277,40 @@ def executer_analyse():
         except Exception as e:
             logger.error("Erreur Santé: %s", e)
 
+        cotes_reel_map = {}
+        try:
+            cotes_reel_map = charger_cotes_moyennes_foot(COMPETITIONS_CIBLES)
+        except Exception as e:
+            logger.warning("Erreur récupération cotes moyennes: %s", e)
+
+        for it in foot_res:
+            cote_trouvee = None
+            nb_books = 0
+            if cotes_reel_map and " vs " in it.get("match", ""):
+                eq_h, eq_a = [x.strip() for x in it["match"].split(" vs ", 1)]
+                for (lbl, nh, na), pack in cotes_reel_map.items():
+                    if lbl == it.get("competition") and _memes_equipes(eq_h, nh) and _memes_equipes(eq_a, na):
+                        choix_l = str(it.get("choix") or "").strip().lower()
+                        if choix_l == "match nul":
+                            cote_trouvee, nb_books = pack["draw"]
+                        elif choix_l.startswith("victoire "):
+                            cible = choix_l.replace("victoire ", "", 1).strip()
+                            if _memes_equipes(cible, eq_h):
+                                cote_trouvee, nb_books = pack["home"]
+                            elif _memes_equipes(cible, eq_a):
+                                cote_trouvee, nb_books = pack["away"]
+                        break
+            if cote_trouvee:
+                it["cote"] = cote_trouvee
+                it["cote_source"] = f"Moy. {nb_books} bookmakers"
+            else:
+                it["cote"] = _calculer_cote(it["proba"])
+                it["cote_source"] = "Estimée"
+
+        for it in tennis_res:
+            it["cote"] = _calculer_cote(it["proba"])
+            it["cote_source"] = "Estimée"
+
         foot_sorted = sorted(foot_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
         tennis_sorted = sorted(tennis_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
         top_sur = sorted(
@@ -1125,14 +1318,6 @@ def executer_analyse():
             key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]),
             reverse=True,
         )[:10]
-
-        # Application des cotes finales après toutes les pénalités
-        for it in foot_sorted:
-            it["cote"] = _calculer_cote(it["proba"])
-        for it in tennis_sorted:
-            it["cote"] = _calculer_cote(it["proba"])
-        for it in top_sur:
-            it["cote"] = _calculer_cote(it["proba"])
 
         try:
             bilan = mettre_a_jour_historique(
@@ -1145,7 +1330,8 @@ def executer_analyse():
                 bilan = dict(_DERNIER_RAPPORT.get("bilan") or {})
 
         synthese = "\n".join(
-            f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')}] {x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
+            f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')} | Mise {x.get('mise_u', 1.0)}u | Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')})] "
+            f"{x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
             for x in top_sur[:8]
         ) or f"Aucun match à venir dans les prochaines {CFG.fenetre_heures}h."
 
@@ -1631,7 +1817,7 @@ _HTML_PAGE = """<!doctype html>
             <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
             {% endif %}
             {% if it.get('cote') %}
-            <span class="badge cote">Cote {{ it.cote }}</span>
+            <span class="badge cote" title="{{ it.get('cote_source', 'Estimée') }}">Cote {{ it.cote }}</span>
             {% endif %}
             <span class="badge proba">{{ it.proba }}%</span>
             <span class="badge {{ conf }}">{{ conf }}</span>
@@ -1639,7 +1825,7 @@ _HTML_PAGE = """<!doctype html>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} — {{ it.competition }}
+          {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 1.0) }}u</strong>
           {% if it.get('score_exact') %}
           <br><span style="color: var(--accent); font-weight: 600;">Score exact prédit : {{ it.score_exact }}</span>
           {% endif %}
@@ -1682,7 +1868,7 @@ _HTML_PAGE = """<!doctype html>
             <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
             {% endif %}
             {% if it.get('cote') %}
-            <span class="badge cote">Cote {{ it.cote }}</span>
+            <span class="badge cote" title="{{ it.get('cote_source', 'Estimée') }}">Cote {{ it.cote }}</span>
             {% endif %}
             <span class="badge proba">{{ it.proba }}%</span>
             <span class="badge {{ conf }}">{{ conf }}</span>
@@ -1690,7 +1876,7 @@ _HTML_PAGE = """<!doctype html>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }}
+          {{ it.date_match }} • Mise : <strong>{{ it.get('mise_u', 1.0) }}u</strong>
           {% if it.get('score_exact') %}
           <br><span style="color: var(--accent); font-weight: 600;">Score exact prédit : {{ it.score_exact }}</span>
           {% endif %}
@@ -1726,7 +1912,7 @@ _HTML_PAGE = """<!doctype html>
             <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
             {% endif %}
             {% if it.get('cote') %}
-            <span class="badge cote">Cote {{ it.cote }}</span>
+            <span class="badge cote" title="{{ it.get('cote_source', 'Estimée') }}">Cote {{ it.cote }}</span>
             {% endif %}
             <span class="badge proba">{{ it.proba }}%</span>
             <span class="badge {{ conf }}">{{ conf }}</span>
@@ -1734,7 +1920,7 @@ _HTML_PAGE = """<!doctype html>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} — {{ it.competition }}
+          {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 1.0) }}u</strong>
         </div>
         <div class="conf-meter">
           <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
@@ -1946,11 +2132,9 @@ def index():
         rapport = dict(_DERNIER_RAPPORT)
         en_cours = _ANALYSE_EN_COURS
 
-    # Données déjà prêtes → accès direct à l'app
     if rapport.get("mis_a_jour"):
         return redirect(url_for("app_view"))
 
-    # Sinon, déclenche l'analyse si pas déjà en cours
     if not en_cours:
         _demarrer_analyse_si_besoin(0.2)
 
