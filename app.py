@@ -1574,4 +1574,865 @@ def executer_analyse():
 
         top_candidats = sorted(
             foot_sorted + tennis_sorted,
-            key=lambda x: (x.get("
+            key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]),
+            reverse=True,
+        )[:10]
+        top_sur = sorted(top_candidats, key=_cle_cle_chronologique)
+
+        try:
+            bilan = mettre_a_jour_historique(
+                [x for x in top_candidats if x.get("fiable", True)],
+                evenements_termines=clos_globaux,
+            )
+        except Exception as e:
+            logger.error("Erreur Historique: %s", e)
+            with _STATE_LOCK:
+                bilan = dict(_DERNIER_RAPPORT.get("bilan") or {})
+
+        synthese = "\n".join(
+            f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')} | "
+            f"Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')})] "
+            f"{x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
+            for x in top_sur[:8]
+        ) or f"Aucun match à venir dans les prochaines {CFG.fenetre_heures}h."
+
+        nouveau_rapport = {
+            "mis_a_jour": datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M %Z"),
+            "stats_comp": stats_comp,
+            "apercu_bruts": apercu_bruts,
+            "top_sur": top_sur,
+            "foot": foot_sorted,
+            "tennis": tennis_sorted,
+            "alertes": alertes_combines,
+            "bilan": bilan,
+            "synthese": synthese,
+        }
+
+        with _STATE_LOCK:
+            _DERNIER_RAPPORT = nouveau_rapport
+
+        _sauvegarder_rapport_disque(nouveau_rapport)
+        logger.info("Analyse terminée et rapport mis à jour.")
+        return nouveau_rapport
+    finally:
+        with _STATE_LOCK:
+            _ANALYSE_EN_COURS = False
+
+
+app = Flask(__name__, static_folder="statique", static_url_path="/statique")
+
+
+@app.after_request
+def _ajouter_entetes_securite(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    return resp
+
+
+_HTML_HOME = """<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BetPulse Pro — Chargement…</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #38bdf8;
+    --green: #10b981;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100vh; overflow: hidden;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: radial-gradient(circle at 50% 30%, #1e293b 0%, var(--bg) 70%);
+    color: var(--text);
+  }
+  .field {
+    position: fixed; inset: 0; overflow: hidden;
+    background-image:
+      linear-gradient(rgba(56,189,248,.04) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(56,189,248,.04) 1px, transparent 1px);
+    background-size: 60px 60px;
+  }
+  .ball {
+    position: absolute; top: 0; left: 0;
+    will-change: transform;
+    filter: drop-shadow(0 6px 14px rgba(0,0,0,.45));
+  }
+  .football {
+    width: 64px; height: 64px; border-radius: 50%;
+    background:
+      radial-gradient(circle at 50% 50%, #111 17%, transparent 19%),
+      radial-gradient(circle at 22% 22%, #111 11%, transparent 13%),
+      radial-gradient(circle at 78% 22%, #111 11%, transparent 13%),
+      radial-gradient(circle at 15% 55%, #111 11%, transparent 13%),
+      radial-gradient(circle at 85% 55%, #111 11%, transparent 13%),
+      radial-gradient(circle at 30% 85%, #111 11%, transparent 13%),
+      radial-gradient(circle at 70% 85%, #111 11%, transparent 13%),
+      radial-gradient(circle at 40% 40%, #fff 0%, #eee 55%, #b0b0b0 100%);
+    box-shadow: inset -6px -6px 14px rgba(0,0,0,.28), inset 4px 4px 8px rgba(255,255,255,.4);
+  }
+  .tennis {
+    width: 54px; height: 54px;
+  }
+  .tennis svg {
+    width: 100%; height: 100%;
+  }
+  .center-card {
+    position: absolute; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 10; text-align: center;
+    padding: 32px 40px; border-radius: 20px;
+    background: rgba(30, 41, 59, 0.82);
+    border: 1px solid rgba(56,189,248,.25);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 20px 50px rgba(0,0,0,.5);
+    max-width: 440px;
+    animation: fadeIn .5s ease-out;
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translate(-50%, -45%); }
+    to   { opacity: 1; transform: translate(-50%, -50%); }
+  }
+  .logo-badge {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 74px; height: 74px; border-radius: 20px;
+    background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
+    color: #0f172a; font-weight: 900; font-size: 1.7rem;
+    margin-bottom: 18px;
+    animation: pulse 2.2s cubic-bezier(.4,0,.6,1) infinite;
+  }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(56,189,248,.6); }
+    70%  { box-shadow: 0 0 0 22px rgba(56,189,248,0); }
+    100% { box-shadow: 0 0 0 0 rgba(56,189,248,0); }
+  }
+  .title { font-size: 1.9rem; font-weight: 800; margin: 0 0 6px; }
+  .title span { color: var(--accent); }
+  .tagline { color: var(--muted); font-size: .9rem; margin-bottom: 22px; }
+  .progress {
+    height: 6px; border-radius: 999px; overflow: hidden;
+    background: rgba(148,163,184,.2); margin-bottom: 14px;
+  }
+  .progress-fill {
+    height: 100%; width: 35%; border-radius: 999px;
+    background: linear-gradient(90deg, var(--accent), var(--green));
+    animation: slide 1.8s ease-in-out infinite;
+    box-shadow: 0 0 12px rgba(56,189,248,.85);
+  }
+  @keyframes slide {
+    0%   { transform: translateX(-110%); }
+    100% { transform: translateX(380%); }
+  }
+  .status { font-size: .85rem; color: var(--muted); }
+  .status::after {
+    content: ''; display: inline-block; width: 1.3em;
+    animation: dots 1.5s steps(4,end) infinite;
+  }
+  @keyframes dots {
+    0% { content: ''; }
+    25% { content: '.'; }
+    50% { content: '..'; }
+    75%, 100% { content: '...'; }
+  }
+  .meta { margin-top: 10px; font-size: .75rem; color: #64748b; }
+
+  @keyframes fly1 {
+    0%   { transform: translate(8vw, 18vh) rotate(0deg); }
+    20%  { transform: translate(25vw, 72vh) rotate(180deg); }
+    40%  { transform: translate(60vw, 15vh) rotate(360deg); }
+    60%  { transform: translate(85vw, 70vh) rotate(540deg); }
+    80%  { transform: translate(45vw, 85vh) rotate(720deg); }
+    100% { transform: translate(8vw, 18vh) rotate(900deg); }
+  }
+  @keyframes fly2 {
+    0%   { transform: translate(88vw, 12vh) rotate(0deg); }
+    25%  { transform: translate(60vw, 78vh) rotate(180deg); }
+    50%  { transform: translate(20vw, 35vh) rotate(360deg); }
+    75%  { transform: translate(70vw, 60vh) rotate(540deg); }
+    100% { transform: translate(88vw, 12vh) rotate(720deg); }
+  }
+  @keyframes fly3 {
+    0%   { transform: translate(50vw, 88vh) rotate(0deg); }
+    20%  { transform: translate(80vw, 30vh) rotate(144deg); }
+    40%  { transform: translate(30vw, 10vh) rotate(288deg); }
+    60%  { transform: translate(10vw, 60vh) rotate(432deg); }
+    80%  { transform: translate(70vw, 80vh) rotate(576deg); }
+    100% { transform: translate(50vw, 88vh) rotate(720deg); }
+  }
+  @keyframes fly4 {
+    0%   { transform: translate(15vw, 55vh) rotate(0deg); }
+    25%  { transform: translate(50vw, 20vh) rotate(180deg); }
+    50%  { transform: translate(90vw, 65vh) rotate(360deg); }
+    75%  { transform: translate(40vw, 80vh) rotate(540deg); }
+    100% { transform: translate(15vw, 55vh) rotate(720deg); }
+  }
+  @keyframes fly5 {
+    0%   { transform: translate(70vw, 15vh) rotate(0deg); }
+    20%  { transform: translate(20vw, 45vh) rotate(180deg); }
+    40%  { transform: translate(60vw, 80vh) rotate(360deg); }
+    60%  { transform: translate(90vw, 35vh) rotate(540deg); }
+    80%  { transform: translate(30vw, 70vh) rotate(720deg); }
+    100% { transform: translate(70vw, 15vh) rotate(900deg); }
+  }
+
+  @media (max-width: 480px) {
+    .football { width: 48px; height: 48px; }
+    .tennis { width: 42px; height: 42px; }
+    .center-card { padding: 26px 22px; max-width: 92vw; }
+    .title { font-size: 1.6rem; }
+  }
+</style>
+</head>
+<body>
+<div class="field">
+  <div class="ball football" style="animation: fly1 11s linear infinite; animation-delay: 0s;"></div>
+  <div class="ball football" style="animation: fly3 13s ease-in-out infinite; animation-delay: -4s;"></div>
+  <div class="ball football" style="animation: fly5 15s linear infinite; animation-delay: -8s;"></div>
+
+  <div class="ball tennis" style="animation: fly2 10s ease-in-out infinite; animation-delay: -2s;">
+    <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <radialGradient id="tg1" cx="35%" cy="35%">
+          <stop offset="0%" stop-color="#f0f56a"/>
+          <stop offset="100%" stop-color="#b8c92b"/>
+        </radialGradient>
+      </defs>
+      <circle cx="50" cy="50" r="48" fill="url(#tg1)"/>
+      <path d="M 12,14 Q 50,50 12,86" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
+      <path d="M 88,14 Q 50,50 88,86" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
+    </svg>
+  </div>
+  <div class="ball tennis" style="animation: fly4 12s linear infinite; animation-delay: -6s;">
+    <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <radialGradient id="tg2" cx="35%" cy="35%">
+          <stop offset="0%" stop-color="#f0f56a"/>
+          <stop offset="100%" stop-color="#b8c92b"/>
+        </radialGradient>
+      </defs>
+      <circle cx="50" cy="50" r="48" fill="url(#tg2)"/>
+      <path d="M 12,14 Q 50,50 12,86" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
+      <path d="M 88,14 Q 50,50 88,86" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/>
+    </svg>
+  </div>
+</div>
+
+<div class="center-card">
+  <div class="logo-badge">BP</div>
+  <h1 class="title">BetPulse <span>Pro</span></h1>
+  <div class="tagline">Préparation des pronostics</div>
+  <div class="progress"><div class="progress-fill"></div></div>
+  <div class="status" id="status">
+    {% if en_cours %}Analyse en cours{% else %}Initialisation des données{% endif %}
+  </div>
+  <div class="meta" id="meta"></div>
+</div>
+
+<script>
+(function(){
+  var statusEl = document.getElementById('status');
+  var metaEl   = document.getElementById('meta');
+  var POLL_MS  = 1500;
+  var MAX_ATTEMPTS = 400;
+  var attempts = 0;
+
+  async function check() {
+    attempts += 1;
+    try {
+      var r = await fetch("/api/status", { cache: "no-store" });
+      if (r.ok) {
+        var d = await r.json();
+        if (d.ready) {
+          statusEl.textContent = "Prêt ! Ouverture de l'application";
+          setTimeout(function(){ window.location.replace("/app"); }, 200);
+          return;
+        }
+        if (d.mis_a_jour) metaEl.textContent = "Dernière analyse : " + d.mis_a_jour;
+      }
+    } catch (e) {}
+    if (attempts >= MAX_ATTEMPTS) {
+      statusEl.textContent = "Analyse longue — actualisez la page.";
+      return;
+    }
+    setTimeout(check, POLL_MS);
+  }
+  setTimeout(check, 300);
+})();
+</script>
+</body>
+</html>
+"""
+
+_HTML_LOADING = """<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BetPulse Pro — Chargement…</title>
+  <style>
+    body { background: #0f172a; color: #e2e8f0; font-family: sans-serif; text-align: center; padding: 80px 20px; }
+    h1 { color: #38bdf8; }
+    p { color: #94a3b8; }
+    a { color: #38bdf8; text-decoration: none; display: inline-block; margin-top: 16px; }
+    .loader { border: 4px solid #334155; border-top: 4px solid #38bdf8; border-radius: 50%; width: 42px; height: 42px; animation: spin 1s linear infinite; margin: 24px auto; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1>BetPulse Pro</h1>
+  <div class="loader"></div>
+  <p id="status-msg">Récupération des matchs et pronostics en cours…</p>
+  <a href="/">← Retour à l'accueil</a>
+  <script>
+    var MAX_ATTEMPTS = 300;
+    var attempts = 0;
+    async function verifierEtat() {
+      attempts += 1;
+      try {
+        const res = await fetch("/api/status", { cache: "no-store" });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.ready) {
+            window.location.replace(window.location.href);
+            return;
+          }
+        }
+      } catch (e) {}
+      if (attempts >= MAX_ATTEMPTS) {
+        document.getElementById('status-msg').textContent = "Analyse longue — actualisez la page.";
+        return;
+      }
+      setTimeout(verifierEtat, 2000);
+    }
+    verifierEtat();
+  </script>
+</body>
+</html>
+"""
+
+_HTML_PAGE = """<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BetPulse Pro — Matchs &amp; Pronostics</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --card: #131d31;
+      --card-hover: #18253f;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --accent: #38bdf8;
+      --green: #10b981;
+      --orange: #f59e0b;
+      --red: #ef4444;
+      --border: #24334d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background: radial-gradient(circle at top right, #132238 0%, var(--bg) 55%);
+      color: var(--text);
+    }
+    h1, h2 { color: var(--accent); margin: 0 0 14px 0; }
+    h2 { font-size: 1.2rem; display: flex; align-items: center; gap: 8px; }
+    .container { max-width: 1220px; margin: 0 auto; }
+    .header {
+      display: flex; justify-content: space-between; align-items: center;
+      flex-wrap: wrap; gap: 14px; margin-bottom: 18px; padding-bottom: 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .brand-link { display: inline-flex; align-items: center; gap: 12px; text-decoration: none; color: var(--text); }
+    .brand-badge {
+      width: 40px; height: 40px; border-radius: 12px;
+      background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
+      color: #0b1220; font-weight: 900; display: inline-flex; align-items: center; justify-content: center;
+      font-size: 1.05rem;
+    }
+    .meta { color: var(--muted); font-size: 0.88em; }
+    button, .btn, select {
+      background: var(--accent); color: #0b1220; border: none; padding: 9px 15px;
+      border-radius: 9px; cursor: pointer; font-weight: 700; text-decoration: none;
+      display: inline-flex; align-items: center; gap: 6px; font-size: 0.88em;
+      transition: transform 0.12s ease, opacity 0.15s ease, background 0.15s ease;
+    }
+    select { background: #0b1220; color: var(--text); border: 1px solid var(--border); font-weight: 600; }
+    .btn-cat { background: var(--card); color: var(--text); border: 1px solid var(--border); font-weight: 600; }
+    .btn-cat.active { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 700; }
+    button:hover, .btn:hover { opacity: 0.92; transform: translateY(-1px); }
+    button:disabled { opacity: 0.65; cursor: wait; transform: none; }
+    .cat-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+    .toolbar {
+      display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between;
+      background: rgba(19, 29, 49, 0.75); border: 1px solid var(--border);
+      padding: 10px 12px; border-radius: 12px; margin-bottom: 18px;
+    }
+    .search-input {
+      background: #0b1220; color: var(--text); border: 1px solid var(--border);
+      border-radius: 8px; padding: 8px 12px; font-size: 0.88em; min-width: 210px; flex: 1; max-width: 320px;
+    }
+    .search-input:focus { outline: none; border-color: var(--accent); }
+    .filter-pills { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .pill-btn {
+      background: #0b1220; color: var(--muted); border: 1px solid var(--border);
+      padding: 6px 11px; border-radius: 20px; font-size: 0.8em; font-weight: 600;
+    }
+    .pill-btn.active { background: rgba(56, 189, 248, 0.18); color: var(--accent); border-color: var(--accent); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 16px; margin-bottom: 26px; }
+    .card {
+      background: var(--card); padding: 16px; border-radius: 12px;
+      border: 1px solid var(--border); border-left: 4px solid var(--accent);
+      box-shadow: 0 6px 14px rgba(0,0,0,0.18);
+      transition: transform 0.14s ease, background 0.14s ease, border-color 0.14s ease;
+    }
+    .card:hover { background: var(--card-hover); transform: translateY(-2px); }
+    .card.HAUTE { border-left-color: var(--green); }
+    .card.MOYENNE { border-left-color: var(--orange); }
+    .card.FAIBLE { border-left-color: var(--red); }
+    .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
+    .card-title { font-size: 1.02em; font-weight: 700; line-height: 1.3; display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .badges-right { display: flex; align-items: center; gap: 5px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+    .badge { font-size: 0.73em; padding: 3px 7px; border-radius: 999px; font-weight: 800; white-space: nowrap; }
+    .badge.proba { background: rgba(56, 189, 248, 0.16); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35); }
+    .badge.cote { background: rgba(148, 163, 184, 0.18); color: #e2e8f0; border: 1px solid rgba(148, 163, 184, 0.32); }
+    .badge.HAUTE { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }
+    .badge.MOYENNE { background: rgba(245, 158, 11, 0.2); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.4); }
+    .badge.FAIBLE { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
+    .badge.imminent { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); display: inline-flex; align-items: center; gap: 4px; }
+    .dot-red { width: 8px; height: 8px; background-color: #ef4444; border-radius: 50%; animation: pulse-red 1.5s infinite; }
+    @keyframes pulse-red { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); } 70% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
+    .card-meta { font-size: 0.86em; color: var(--muted); margin-bottom: 10px; line-height: 1.45; }
+    .card-meta strong { color: var(--text); }
+    .conf-meter { margin: 8px 0 4px 0; }
+    .conf-label { display: flex; justify-content: space-between; font-size: 0.76em; color: var(--muted); margin-bottom: 4px; }
+    .meter-track { height: 6px; background: #0b1220; border-radius: 999px; overflow: hidden; }
+    .meter-fill { height: 100%; border-radius: 999px; background: var(--accent); }
+    .card.HAUTE .meter-fill { background: var(--green); }
+    .card.MOYENNE .meter-fill { background: var(--orange); }
+    .card.FAIBLE .meter-fill { background: var(--red); }
+    .card-detail {
+      font-size: 0.8em; color: #cbd5e1; background: #0b1220; border: 1px solid rgba(36, 51, 77, 0.8);
+      padding: 8px 10px; border-radius: 8px; margin-top: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      line-height: 1.4;
+    }
+    .panel { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 24px; }
+    .stats-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+    .stat-item { background: var(--card); border: 1px solid var(--border); padding: 8px 13px; border-radius: 999px; font-size: 0.84em; }
+    pre { white-space: pre-wrap; background: #0b1220; border: 1px solid var(--border); padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 0.85em; margin: 0; line-height: 1.5; }
+    .notice { background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #bae6fd; padding: 10px 14px; border-radius: 10px; margin-bottom: 18px; font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div>
+        <a href="/" class="brand-link" title="Retour à l'accueil">
+          <span class="brand-badge">BP</span>
+          <h1 style="margin: 0;">BetPulse Pro</h1>
+        </a><br>
+        <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }} • Fenêtre : {{ fenetre_heures }}h • <span id="compteur-cartes">Filtre actif</span></span>
+      </div>
+      <form method="post" action="/refresh" style="margin: 0;" onsubmit="document.getElementById('btn-refresh').disabled=true; document.getElementById('btn-refresh').innerText='Actualisation…';">
+        <button id="btn-refresh" type="submit">↻ Actualiser</button>
+      </form>
+    </div>
+
+    <div class="cat-bar">
+      <a href="{{ url_for('app_view', cat='all') }}" class="btn btn-cat {% if cat == 'all' %}active{% endif %}">Tout</a>
+      <a href="{{ url_for('app_view', cat='top') }}" class="btn btn-cat {% if cat == 'top' %}active{% endif %}">Top Pronostics ({{ r.top_sur|length }})</a>
+      <a href="{{ url_for('app_view', cat='foot') }}" class="btn btn-cat {% if cat == 'foot' %}active{% endif %}">Football ({{ r.foot|length }})</a>
+      <a href="{{ url_for('app_view', cat='tennis') }}" class="btn btn-cat {% if cat == 'tennis' %}active{% endif %}">Tennis ({{ r.tennis|length }})</a>
+      <a href="{{ url_for('app_view', cat='alertes') }}" class="btn btn-cat {% if cat == 'alertes' %}active{% endif %}">Alertes ({{ r.get('alertes', {})|length }})</a>
+      <a href="{{ url_for('app_view', cat='bilan') }}" class="btn btn-cat {% if cat == 'bilan' %}active{% endif %}">Bilan &amp; Synthèse</a>
+    </div>
+
+    <div class="toolbar">
+      <input id="search-input" class="search-input" type="search" placeholder="Rechercher une équipe, un joueur, une compétition…" oninput="appliquerFiltres()">
+      <div class="filter-pills">
+        <button type="button" class="pill-btn active" data-conf="ALL" onclick="setConf('ALL', this)">Confiance : Tous</button>
+        <button type="button" class="pill-btn" data-conf="HAUTE" onclick="setConf('HAUTE', this)">Haute</button>
+        <button type="button" class="pill-btn" data-conf="MOYENNE" onclick="setConf('MOYENNE', this)">Moyenne</button>
+        <button type="button" class="pill-btn" data-conf="FAIBLE" onclick="setConf('FAIBLE', this)">Faible</button>
+        <select id="proba-min" onchange="appliquerFiltres()" title="Probabilité minimale">
+          <option value="0">Proba min : Tous</option>
+          <option value="55">≥ 55%</option>
+          <option value="65">≥ 65%</option>
+          <option value="75">≥ 75%</option>
+        </select>
+        <select id="sort-mode" onchange="trierCartes()" title="Tri des cartes">
+          <option value="date" selected>Tri : Date match</option>
+          <option value="conf">Tri : Confiance</option>
+          <option value="proba">Tri : Probabilité</option>
+        </select>
+      </div>
+    </div>
+
+    {% if en_cours %}
+    <div class="notice">Mise à jour en arrière-plan en cours — les données affichées restent accessibles.</div>
+    {% endif %}
+
+    {% if cat in ('all', 'top') %}
+    <h2>★ Top pronostics (Foot &amp; Tennis)</h2>
+    <div class="grid">
+      {% for it in r.top_sur %}
+      {% set conf = it.get('confiance', 'MOYENNE') %}
+      {% set conf_sc = it.get('confiance_score', it.proba) %}
+      {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
+      <div class="card {{ conf }}"
+           data-conf="{{ conf }}"
+           data-proba="{{ it.proba or 0 }}"
+           data-conf-score="{{ conf_sc }}"
+           data-date="{{ it.date_match }}"
+           data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
+        <div class="card-top">
+          <div class="card-title">
+            {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.choix }}
+          </div>
+          <div class="badges-right">
+            {% if it.get('cote') %}
+            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
+            {% endif %}
+            <span class="badge proba" title="Probabilité du score exact cohérent">{{ pct_score }}%</span>
+            {% if it.get('est_imminent') %}
+            <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
+            {% endif %}
+          </div>
+        </div>
+        <div class="card-meta">
+          <strong>{{ it.match }}</strong><br>
+          {{ it.date_match }} — {{ it.competition }}
+          {% if it.get('score_exact') %}
+          <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
+          {% endif %}
+        </div>
+        <div class="conf-meter">
+          <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
+          <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
+        </div>
+        {% if it.detail %}
+        <div class="card-detail">{{ it.detail }}</div>
+        {% endif %}
+      </div>
+      {% else %}
+      <div class="card">Aucun pronostic disponible.</div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if cat in ('all', 'foot') %}
+    <h2>⚽ Matchs de Foot à venir — {{ fenetre_heures }}h ({{ r.foot|length }})</h2>
+    <div class="stats-bar">
+      {% for k, v in r.get("stats_comp", {}).items() %}
+        <span class="stat-item"><strong>{{ k }}</strong> : {{ v }}</span>
+      {% endfor %}
+    </div>
+    <div class="grid">
+      {% for it in r.foot %}
+      {% set conf = it.get('confiance', 'MOYENNE') %}
+      {% set conf_sc = it.get('confiance_score', it.proba) %}
+      {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
+      <div class="card {{ conf }}"
+           data-conf="{{ conf }}"
+           data-proba="{{ it.proba or 0 }}"
+           data-conf-score="{{ conf_sc }}"
+           data-date="{{ it.date_match }}"
+           data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
+        <div class="card-top">
+          <div class="card-title">⚽ {{ it.choix }}</div>
+          <div class="badges-right">
+            {% if it.get('cote') %}
+            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
+            {% endif %}
+            <span class="badge proba" title="Probabilité du score exact cohérent">{{ pct_score }}%</span>
+            {% if it.get('est_imminent') %}
+            <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
+            {% endif %}
+          </div>
+        </div>
+        <div class="card-meta">
+          <strong>{{ it.match }}</strong><br>
+          {{ it.date_match }}
+          {% if it.get('score_exact') %}
+          <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
+          {% endif %}
+        </div>
+        <div class="conf-meter">
+          <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
+          <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
+        </div>
+        <div class="card-detail">{{ it.detail }}</div>
+      </div>
+      {% else %}
+      <div class="card">Aucun match de foot à venir dans cette fenêtre.</div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if cat in ('all', 'tennis') %}
+    <h2>🎾 Matchs de Tennis à venir — {{ fenetre_heures }}h ({{ r.tennis|length }})</h2>
+    <div class="grid">
+      {% for it in r.tennis %}
+      {% set conf = it.get('confiance', 'MOYENNE') %}
+      {% set conf_sc = it.get('confiance_score', it.proba) %}
+      {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
+      <div class="card {{ conf }}"
+           data-conf="{{ conf }}"
+           data-proba="{{ it.proba or 0 }}"
+           data-conf-score="{{ conf_sc }}"
+           data-date="{{ it.date_match }}"
+           data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
+        <div class="card-top">
+          <div class="card-title">🎾 {{ it.choix }}</div>
+          <div class="badges-right">
+            {% if it.get('cote') %}
+            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
+            {% endif %}
+            <span class="badge proba" title="Probabilité du score exact cohérent">{{ pct_score }}%</span>
+            {% if it.get('est_imminent') %}
+            <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
+            {% endif %}
+          </div>
+        </div>
+        <div class="card-meta">
+          <strong>{{ it.match }}</strong><br>
+          {{ it.date_match }} — {{ it.competition }}
+        </div>
+        <div class="conf-meter">
+          <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
+          <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
+        </div>
+      </div>
+      {% else %}
+      <div class="card">Aucun match de tennis à venir dans cette fenêtre.</div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if cat in ('all', 'alertes') %}
+    <h2>🩺 Alertes blessures / forfaits (2j)</h2>
+    <div class="panel">
+      {% for cible, titres in r.get("alertes", {}).items() %}
+        <p style="margin-bottom: 10px;">
+          <strong style="color: #fca5a5;">{{ cible }}</strong> :<br>
+          <span style="font-size: 0.9em; color: #cbd5e1;">{{ titres | join(" | ") }}</span>
+        </p>
+      {% else %}
+        <span class="meta">Aucune alerte récente.</span>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if cat in ('all', 'bilan') %}
+    <h2>📊 Bilan historique &amp; Synthèse</h2>
+    <div class="stats-bar">
+      <span class="stat-item">Total : <strong>{{ r.get("bilan", {}).get("total", 0) }}</strong></span>
+      <span class="stat-item">En attente : <strong>{{ r.get("bilan", {}).get("en_attente", 0) }}</strong></span>
+      <span class="stat-item">Vérifiés : <strong>{{ r.get("bilan", {}).get("verifies", 0) }}</strong></span>
+      <span class="stat-item">Réussite : <strong>{{ r.get("bilan", {}).get("taux", 0.0) }}%</strong></span>
+      <span class="stat-item">PnL : <strong>{{ r.get("bilan", {}).get("pnl_total", 0.0) }}u</strong></span>
+    </div>
+    <div class="panel">
+      <pre>{{ r.synthese or "Aucune synthèse disponible pour le moment." }}</pre>
+    </div>
+    {% endif %}
+  </div>
+
+  <script>
+    let confActif = "ALL";
+    function setConf(val, btn) {
+      confActif = val;
+      document.querySelectorAll(".pill-btn").forEach(b => b.classList.remove("active"));
+      if (btn) btn.classList.add("active");
+      appliquerFiltres();
+    }
+    function appliquerFiltres() {
+      const q = (document.getElementById("search-input")?.value || "").trim().toLowerCase();
+      const probaMin = parseFloat(document.getElementById("proba-min")?.value || "0") || 0;
+      let totalCartes = 0;
+      let visibles = 0;
+      document.querySelectorAll(".grid .card[data-conf]").forEach(card => {
+        totalCartes += 1;
+        const cConf = card.getAttribute("data-conf") || "";
+        const cProba = parseFloat(card.getAttribute("data-proba") || "0") || 0;
+        const cText = card.getAttribute("data-search") || "";
+        const okConf = (confActif === "ALL") || (cConf === confActif);
+        const okProba = cProba >= probaMin;
+        const okText = !q || cText.includes(q);
+        const show = okConf && okProba && okText;
+        card.style.display = show ? "" : "none";
+        if (show) visibles += 1;
+      });
+      const cpt = document.getElementById("compteur-cartes");
+      if (cpt && totalCartes > 0) {
+        cpt.textContent = `${visibles}/${totalCartes} affichés`;
+      }
+    }
+    function trierCartes() {
+      const mode = document.getElementById("sort-mode")?.value || "date";
+      document.querySelectorAll(".grid").forEach(grid => {
+        const cards = Array.from(grid.querySelectorAll(".card[data-conf]"));
+        if (cards.length < 2) return;
+        cards.sort((a, b) => {
+          if (mode === "proba") {
+            return (parseFloat(b.dataset.proba) || 0) - (parseFloat(a.dataset.proba) || 0);
+          }
+          if (mode === "conf") {
+            return (parseFloat(b.dataset.confScore) || 0) - (parseFloat(a.dataset.confScore) || 0);
+          }
+          return (a.dataset.date || "").localeCompare(b.dataset.date || "");
+        });
+        cards.forEach(c => grid.appendChild(c));
+      });
+    }
+    trierCartes();
+    appliquerFiltres();
+  </script>
+</body>
+</html>
+"""
+
+
+def _demarrer_analyse_si_besoin(delai_sec=0.0):
+    global _ANALYSE_THREAD_LANCE
+    with _STATE_LOCK:
+        if _ANALYSE_THREAD_LANCE or _ANALYSE_EN_COURS:
+            return
+        _ANALYSE_THREAD_LANCE = True
+
+    def _runner():
+        global _ANALYSE_THREAD_LANCE
+        if delai_sec > 0:
+            time.sleep(delai_sec)
+        try:
+            executer_analyse()
+        except Exception as e:
+            logger.critical("Erreur fatale analyse background: %s", e)
+        finally:
+            with _STATE_LOCK:
+                _ANALYSE_THREAD_LANCE = False
+
+    threading.Thread(target=_runner, daemon=True).start()
+
+
+def _demarrer_scheduler_si_actif():
+    global _SCHEDULER_DEMARRE
+    if CFG.auto_refresh_sec <= 0:
+        return
+    with _STATE_LOCK:
+        if _SCHEDULER_DEMARRE:
+            return
+        _SCHEDULER_DEMARRE = True
+
+    def _loop():
+        while True:
+            time.sleep(CFG.auto_refresh_sec)
+            try:
+                executer_analyse()
+            except Exception as e:
+                logger.warning("Erreur scheduler auto-refresh: %s", e)
+            # Purge périodique des caches
+            try:
+                _CACHE_FOOT_SCHED.purge_expired(CFG.cache_ttl_sec)
+                _CACHE_SANTE.purge_expired(CFG.cache_ttl_sec)
+                _CACHE_COTES_MARCHE.purge_expired(CFG.odds_cache_ttl_sec)
+            except Exception:
+                pass
+
+    threading.Thread(target=_loop, daemon=True).start()
+
+
+@app.route("/health")
+def health():
+    with _STATE_LOCK:
+        maj = _DERNIER_RAPPORT.get("mis_a_jour")
+    logger.debug("/health consulté (mis_a_jour=%s)", maj)
+    return "ok", 200
+
+
+@app.route("/api/status")
+def api_status():
+    with _STATE_LOCK:
+        maj = _DERNIER_RAPPORT.get("mis_a_jour")
+        en_cours = _ANALYSE_EN_COURS
+    if not maj and not en_cours:
+        _demarrer_analyse_si_besoin(0.0)
+    resp = make_response(jsonify({
+        "ready": bool(maj),
+        "mis_a_jour": maj,
+        "en_cours": en_cours,
+    }), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/api/analyse")
+def api_analyse():
+    with _STATE_LOCK:
+        rapport = copy.deepcopy(_DERNIER_RAPPORT)
+    if not rapport.get("mis_a_jour"):
+        rapport = executer_analyse()
+    return jsonify(rapport)
+
+
+@app.route("/api/historique/statut", methods=["POST"])
+def api_historique_statut():
+    payload = request.get_json(silent=True) or request.form or {}
+    bilan = definir_statut_historique(
+        payload.get("sport"),
+        payload.get("event_id"),
+        payload.get("choix"),
+        payload.get("statut"),
+    )
+    if bilan is None:
+        return jsonify({"ok": False, "error": "Entrée introuvable ou statut invalide"}), 404
+    with _STATE_LOCK:
+        _DERNIER_RAPPORT["bilan"] = bilan
+        rapport_copie = copy.deepcopy(_DERNIER_RAPPORT)
+    _sauvegarder_rapport_disque(rapport_copie)
+    return jsonify({"ok": True, "bilan": bilan}), 200
+
+
+if CFG.activer_debug_routes:
+    @app.route("/api/debug-foot")
+    def api_debug_foot():
+        fonctions = [n for n in dir(fb) if not n.startswith("_") and callable(getattr(fb, n, None))]
+        sched = get_foot_schedule_cached("160", "ligue-1", CFG.saison_foot)
+        evs = _extraire_events(sched)
+        echantillon = [
+            {
+                "id": ev.get("id"),
+                "status": ev.get("status"),
+                "date": ev.get("start_time") or ev.get("date"),
+                "home": (_normaliser_home_away(ev)[0].get("name")),
+                "away": (_normaliser_home_away(ev)[1].get("name")),
+            }
+            for ev in evs[:5]
+        ]
+        return jsonify({
+            "module": getattr(fb, "__name__", str(fb)),
+            "fonctions_disponibles": fonctions,
+            "nb_events_psg": len(evs),
+            "echantillon_psg": echantillon,
+        })
+
+
+@app.route("/refresh", methods=["POST"])
+def refresh():
+    _demarrer_analyse_si_besoin(0.0)
+    return redirect(url_for("app_view"))
+
+
+@app.route("/")
+def index():
+    with _STATE_LOCK:
+        rapport = copy.deepcopy(_DERNIER_RAPPORT)
+        en_cours = _
