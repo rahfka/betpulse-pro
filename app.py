@@ -57,9 +57,9 @@ STATUTS_EXCLUS_AVENIR = STATUTS_TERMINES | {
 
 MOTS_ALERTE_FORT = (
     "forfait", "blessure", "blessé", "blessée", "opéré", "opérée",
-    "rupture", "absent", "absente", "suspendu", "out", "injured",
+    "rupture", "suspendu", "injured",
 )
-MOTS_ALERTE_FAIBLE = ("incertain", "incertaine", "doute", "gêne", "repris", "doubtful", "knock")
+MOTS_ALERTE_FAIBLE = ("incertain", "incertaine", "doute", "gêne", "doubtful", "knock")
 
 
 @dataclass(frozen=True)
@@ -426,7 +426,7 @@ def _rendre_score_coherent(choix, h_nom, a_nom, best_h, best_a):
     return f"{h_sc} - {a_sc}"
 
 
-def moyenne_ponderee_shrinkage(valeurs, prior_moyenne, prior_poids=3.0):
+def moyenne_ponderee_shrinkage(valeurs, prior_moyenne, prior_poids=1.5):
     if not valeurs:
         return prior_moyenne
     n = len(valeurs)
@@ -439,15 +439,15 @@ def moyenne_ponderee_shrinkage(valeurs, prior_moyenne, prior_poids=3.0):
 def _calculer_indice_confiance(proba_pct, fiable, gravite_alerte=0.0, est_nul=False):
     score = proba_pct
     if not fiable:
-        score -= 15.0
+        score -= 10.0
     if gravite_alerte > 0.0:
-        score -= min(gravite_alerte * 10.0, 22.0)
+        score -= min(gravite_alerte * 6.0, 14.0)
     if est_nul:
         score -= 8.0
-    score = round(max(10.0, min(95.0, score)), 1)
-    if fiable and gravite_alerte == 0.0 and not est_nul and score >= 68.0 and proba_pct >= 65.0:
+    score = round(max(15.0, min(95.0, score)), 1)
+    if fiable and gravite_alerte < 1.0 and not est_nul and score >= 65.0 and proba_pct >= 62.0:
         niveau = "HAUTE"
-    elif score >= 52.0:
+    elif score >= 48.0:
         niveau = "MOYENNE"
     else:
         niveau = "FAIBLE"
@@ -472,7 +472,7 @@ def _calculer_cote_min_et_mise(proba_pct, conf_score, fiable, est_nul=False):
     if not fiable or proba_pct < 50.0:
         mise = round(CFG.mise_unite_defaut * 0.25, 2)
     else:
-        facteur_conf = max(0.35, min(1.35, conf_score / 62.0))
+        facteur_conf = max(0.35, min(1.35, conf_score / 60.0))
         facteur_nul = 0.65 if est_nul else 1.0
         mise = round(
             min(CFG.mise_max_unites, max(0.25, CFG.mise_unite_defaut * facteur_conf * facteur_nul)),
@@ -687,18 +687,18 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8)
     bp_away.reverse()
     bc_away.reverse()
     nb_matchs = v + n + d
-    a_historique = nb_matchs >= 3
+    a_historique = nb_matchs >= 2
 
     return {
         "forme": f"{v}V-{n}N-{d}D" if nb_matchs > 0 else "Forme récente",
         "a_historique": a_historique,
         "nb_matchs": nb_matchs,
-        "bp": moyenne_ponderee_shrinkage(bp_all, 1.30, prior_poids=3.0),
-        "bc": moyenne_ponderee_shrinkage(bc_all, 1.25, prior_poids=3.0),
-        "bp_home": moyenne_ponderee_shrinkage(bp_home, 1.40, prior_poids=2.5),
-        "bc_home": moyenne_ponderee_shrinkage(bc_home, 1.15, prior_poids=2.5),
-        "bp_away": moyenne_ponderee_shrinkage(bp_away, 1.15, prior_poids=2.5),
-        "bc_away": moyenne_ponderee_shrinkage(bc_away, 1.35, prior_poids=2.5),
+        "bp": moyenne_ponderee_shrinkage(bp_all, 1.35, prior_poids=1.5),
+        "bc": moyenne_ponderee_shrinkage(bc_all, 1.20, prior_poids=1.5),
+        "bp_home": moyenne_ponderee_shrinkage(bp_home, 1.50, prior_poids=1.2),
+        "bc_home": moyenne_ponderee_shrinkage(bc_home, 1.10, prior_poids=1.2),
+        "bp_away": moyenne_ponderee_shrinkage(bp_away, 1.20, prior_poids=1.2),
+        "bc_away": moyenne_ponderee_shrinkage(bc_away, 1.30, prior_poids=1.2),
     }
 
 
@@ -707,10 +707,10 @@ def _evaluer_gravite_titres(titres):
     for t in titres or []:
         tl = str(t).lower()
         if any(m in tl for m in MOTS_ALERTE_FORT):
-            gravite += 1.0
+            gravite += 0.75
         elif any(m in tl for m in MOTS_ALERTE_FAIBLE):
-            gravite += 0.5
-    return min(gravite, 2.5)
+            gravite += 0.25
+    return min(gravite, 2.0)
 
 
 def _requete_rss(requete_brute, max_titres=2):
@@ -736,7 +736,7 @@ def scanner_sante_cible(cible, max_titres=2):
     if cached is not None:
         return list(cached)
 
-    requete = f'"{cible}" (blessure OR forfait OR incertain OR absent) (match OR équipe OR foot OR tennis OR ATP OR WTA) when:3d'
+    requete = f'"{cible}" (blessure OR forfait OR incertain) (match OR équipe OR foot OR tennis OR ATP OR WTA) when:2d'
     res = _requete_rss(requete, max_titres)
     _CACHE_SANTE.set(cle, res)
     return list(res)
@@ -758,8 +758,9 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     a_att = (0.60 * st_a["bp"]) + (0.40 * st_a["bp_away"])
     a_def = (0.60 * st_a["bc"]) + (0.40 * st_a["bc_away"])
 
-    lam_h = max(((h_att * 1.12) + a_def) / 2.0, 0.35)
-    lam_a = max(((a_att * 0.90) + h_def) / 2.0, 0.35)
+    # Modèle Poisson multiplicatif avec avantage domicile et désavantage extérieur
+    lam_h = max(((h_att * a_def) / 1.30) * 1.12, 0.35)
+    lam_a = max(((a_att * h_def) / 1.30) * 0.90, 0.35)
     p_h, p_n, p_a, p_ov25, p_un25, _, best_h, best_a = simuler_poisson_foot(lam_h, lam_a)
 
     meilleure_victoire, prob_victoire = max(
@@ -768,18 +769,18 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     )
     ecart_victoires = abs(p_h - p_a)
     buts_label = "+2.5 buts" if p_ov25 >= p_un25 else "-2.5 buts"
-    buts_proba = round(min(max(p_ov25, p_un25), 0.85) * 100, 1)
+    buts_proba = round(min(max(p_ov25, p_un25), 0.88) * 100, 1)
 
     est_nul = False
-    if (best_h == best_a and p_n >= 0.24) or (p_n >= 0.25 and (prob_victoire - p_n) <= 0.09):
-        choix, prob = "Match nul", max(p_n, prob_victoire if best_h == best_a else p_n)
+    if (best_h == best_a and p_n >= 0.25 and ecart_victoires < 0.12) or (p_n >= 0.27 and (prob_victoire - p_n) <= 0.06):
+        choix, prob = "Match nul", p_n
         est_nul = True
     elif ecart_victoires < 0.055 and max(p_ov25, p_un25) > prob_victoire + 0.06:
         choix, prob = buts_label, max(p_ov25, p_un25)
     else:
         choix, prob = meilleure_victoire, prob_victoire
 
-    plafond = 0.80 if (fiable and not est_nul) else (0.55 if est_nul else 0.68)
+    plafond = 0.86 if (fiable and not est_nul) else (0.55 if est_nul else 0.72)
     prob_cal = min(max(prob, 0.05), plafond)
     proba_pct = round(prob_cal * 100, 1)
     score_exact = _rendre_score_coherent(choix, h_nom, a_nom, best_h, best_a)
@@ -791,7 +792,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         if 0 <= delta_sec <= 7200:
             est_imminent = True
 
-    prudence = "ELEVE" if (proba_pct >= 72 and fiable and not est_nul) else ("MODERE" if proba_pct >= 56 else "PRUDENT")
+    prudence = "ELEVE" if (proba_pct >= 70 and fiable and not est_nul) else ("MODERE" if proba_pct >= 55 else "PRUDENT")
     conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, fiable, 0.0, est_nul=est_nul)
     cote_min, mise_u = _calculer_cote_min_et_mise(proba_pct, conf_score, fiable, est_nul=est_nul)
     nul_note = " | Nul probable" if est_nul else ""
@@ -991,7 +992,7 @@ def analyser_tennis(heures_max=48):
                 diff = (math.log((r2 or 180) + 1) - math.log((r1 or 180) + 1)) * (0.68 if complet else 0.25)
                 p1 = 1 / (1 + math.exp(-diff))
                 favori, prob = (j1, p1) if p1 >= 0.5 else (j2, 1 - p1)
-                plafond = 0.78 if complet else 0.60
+                plafond = 0.82 if complet else 0.62
                 prob = min(max(prob, 0.50), plafond)
 
                 proba_pct = round(max(0.05, prob) * 100, 1)
@@ -1065,10 +1066,10 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
 
     for it in liste_a_maj:
         grav = sum(gravites.get(n, 0.0) for n in it.get("equipes", []))
-        if grav > 0.0:
-            penalite_proba = min(grav * 0.025, 0.09)
+        if grav >= 0.75:
+            penalite_proba = min(grav * 0.015, 0.04)
             it["proba"] = round(max(0.05, it["proba"] / 100 - penalite_proba) * 100, 1)
-            it["prudence"] = "MODERE" if (it["proba"] >= 62 and grav < 1.0) else "PRUDENT (alerte)"
+            it["prudence"] = "MODERE" if it["proba"] >= 62 else "PRUDENT (alerte)"
         est_nul = bool(it.get("est_nul")) or str(it.get("choix") or "").strip().lower() == "match nul"
         conf_score, conf_niveau = _calculer_indice_confiance(
             it.get("proba", 50.0),
@@ -1988,7 +1989,7 @@ _HTML_PAGE = """<!doctype html>
     {% endif %}
 
     {% if cat in ('all', 'alertes') %}
-    <h2>🩺 Alertes blessures / forfaits (3j)</h2>
+    <h2>🩺 Alertes blessures / forfaits (2j)</h2>
     <div class="panel">
       {% for cible, titres in r.get("alertes", {}).items() %}
         <p style="margin-bottom: 10px;">
