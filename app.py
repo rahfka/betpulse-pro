@@ -441,6 +441,7 @@ def basculer_favori(item_data, force_etat=None):
                 "confiance": str(item_data.get("confiance") or existant.get("confiance") or "MOYENNE"),
                 "confiance_score": conf_sc_val,
                 "detail": str(item_data.get("detail") or existant.get("detail") or ""),
+                "etat_match": str(item_data.get("etat_match") or existant.get("etat_match") or "A_VENIR").upper(),
                 "ajoute_le": existant.get("ajoute_le") or datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M"),
             }
         else:
@@ -462,10 +463,10 @@ def nettoyer_favoris_termines():
             if str(it.get("etat_match") or "").upper() == "TERMINE"
         }
 
-    if not cles_a_supprimer:
-        return 0, len(_obtenir_cles_favoris())
-
     with _FAV_LOCK:
+        for cle, meta in list(_FAVORIS_ACTIFS.items()):
+            if str((meta or {}).get("etat_match") or "").upper() == "TERMINE":
+                cles_a_supprimer.add(cle)
         supprimes = 0
         for cle in cles_a_supprimer:
             if _FAVORIS_ACTIFS.pop(cle, None) is not None:
@@ -3131,7 +3132,7 @@ _HTML_PAGE = """<!doctype html>
                         data-ts-match="{{ ts_m }}" data-choix="{{ it.choix or '' }}"
                         data-proba="{{ it.proba if it.proba is not none else '' }}" data-cote="{{ it.cote if it.cote is not none else '' }}"
                         data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}" data-confiance="{{ conf }}"
-                        data-confiance-score="{{ conf_sc }}" data-detail="{{ it.detail or '' }}">★</button>
+                        data-confiance-score="{{ conf_sc }}" data-detail="{{ it.detail or '' }}" data-etat-match="EN_COURS">★</button>
               </div>
             </div>
             <div class="card-meta">{{ it.competition or it.sport }} • {{ it.date_match }}</div>
@@ -3185,7 +3186,7 @@ _HTML_PAGE = """<!doctype html>
                         data-ts-match="{{ ts_m }}" data-choix="{{ it.choix or '' }}"
                         data-proba="{{ it.proba if it.proba is not none else '' }}" data-cote="{{ it.cote if it.cote is not none else '' }}"
                         data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}" data-confiance="{{ conf }}"
-                        data-confiance-score="{{ conf_sc }}" data-detail="{{ it.detail or '' }}">★</button>
+                        data-confiance-score="{{ conf_sc }}" data-detail="{{ it.detail or '' }}" data-etat-match="A_VENIR">★</button>
               </div>
             </div>
             <div class="card-meta">{{ it.competition or it.sport }} • {{ it.date_match }}</div>
@@ -3240,7 +3241,7 @@ _HTML_PAGE = """<!doctype html>
                         data-ts-match="{{ ts_m }}" data-choix="{{ it.choix or '' }}"
                         data-proba="{{ it.proba if it.proba is not none else '' }}" data-cote="{{ it.cote if it.cote is not none else '' }}"
                         data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}" data-confiance="{{ conf }}"
-                        data-confiance-score="{{ conf_sc }}" data-detail="{{ it.detail or '' }}">★</button>
+                        data-confiance-score="{{ conf_sc }}" data-detail="{{ it.detail or '' }}" data-etat-match="TERMINE">★</button>
               </div>
             </div>
             <div class="card-meta">{{ it.competition or it.sport }} • {{ it.date_match }}</div>
@@ -3303,7 +3304,10 @@ _HTML_PAGE = """<!doctype html>
                       data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
                       data-confiance="{{ conf }}"
                       data-confiance-score="{{ conf_sc }}"
-                      data-detail="{{ it.detail or '' }}">{% if is_fav %}★{% else %}☆{% endif %}</button>
+                      data-detail="{{ it.detail or '' }}"
+                      data-etat-match="EN_COURS"
+                      data-score-actuel="{{ it.score_actuel or '' }}"
+                      data-chrono-live="{{ it.chrono_live or 'LIVE' }}">{% if is_fav %}★{% else %}☆{% endif %}</button>
             </div>
           </div>
           <div class="card-meta">
@@ -3381,7 +3385,8 @@ _HTML_PAGE = """<!doctype html>
                       data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
                       data-confiance="{{ conf }}"
                       data-confiance-score="{{ conf_sc }}"
-                      data-detail="{{ it.detail or '' }}">{% if is_fav %}★{% else %}☆{% endif %}</button>
+                      data-detail="{{ it.detail or '' }}"
+                      data-etat-match="A_VENIR">{% if is_fav %}★{% else %}☆{% endif %}</button>
             </div>
           </div>
           <div class="card-meta">
@@ -3457,7 +3462,8 @@ _HTML_PAGE = """<!doctype html>
                       data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
                       data-confiance="{{ conf }}"
                       data-confiance-score="{{ conf_sc }}"
-                      data-detail="{{ it.detail or '' }}">{% if is_fav %}★{% else %}☆{% endif %}</button>
+                      data-detail="{{ it.detail or '' }}"
+                      data-etat-match="A_VENIR">{% if is_fav %}★{% else %}☆{% endif %}</button>
             </div>
           </div>
           <div class="card-meta">
@@ -3526,7 +3532,8 @@ _HTML_PAGE = """<!doctype html>
                       data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
                       data-confiance="{{ conf }}"
                       data-confiance-score="{{ conf_sc }}"
-                      data-detail="{{ it.detail or '' }}">{% if is_fav %}★{% else %}☆{% endif %}</button>
+                      data-detail="{{ it.detail or '' }}"
+                      data-etat-match="A_VENIR">{% if is_fav %}★{% else %}☆{% endif %}</button>
             </div>
           </div>
           <div class="card-meta">
@@ -3582,6 +3589,15 @@ _HTML_PAGE = """<!doctype html>
     let favGroupFilter = "ALL";
     const PAGE_FAVORIS = {{ "true" if (page_favoris or cat == "favoris") else "false" }};
     const TOKEN_REQUIS = {{ "true" if token_requis else "false" }};
+
+    function escapeHtml(str) {
+      return String(str ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
 
     function afficherBanniere(msg, type = "warn") {
       const b = document.getElementById("action-banner");
@@ -3678,6 +3694,7 @@ _HTML_PAGE = """<!doctype html>
       setTxt("cnt-fav-live", liveCards.length);
       setTxt("cnt-fav-upcoming", upCards.length);
       setTxt("cnt-fav-done", doneCards.length);
+      setTxt("fav-count-tab", allFavCards.length);
 
       const btnClear = document.getElementById("btn-clear-done");
       if (btnClear) btnClear.disabled = (doneCards.length === 0);
@@ -3707,6 +3724,135 @@ _HTML_PAGE = """<!doctype html>
         const emptyMsg = document.getElementById("fav-empty-msg");
         if (emptyMsg) emptyMsg.remove();
       }
+    }
+
+    function construireCarteFavoriElement(item) {
+      const etat = String(item.etat_match || "A_VENIR").toUpperCase();
+      const conf = String(item.confiance || "MOYENNE").toUpperCase();
+      const confSc = Number(item.confiance_score ?? item.proba ?? 50) || 50;
+      const tsM = Number(item.ts_match ?? 9999999999) || 9999999999;
+      const sport = String(item.sport || "FOOT").toUpperCase();
+      const icone = sport === "FOOT" ? "⚽" : "🎾";
+      const cle = String(item.cle_favori || "");
+      const match = String(item.match || "Match");
+      const comp = String(item.competition || sport);
+      const dateMatch = String(item.date_match || "");
+      const choix = String(item.choix || "Non défini");
+      const proba = item.proba ?? "";
+      const cote = item.cote ?? "";
+      const miseU = item.mise_u ?? "";
+      const detail = String(item.detail || "");
+      const scoreActuel = String(item.score_actuel || "En cours");
+      const chronoLive = String(item.chrono_live || "LIVE");
+      const scoreFinal = String(item.score_final || "Terminé");
+      const statutProno = String(item.statut_prono || "").toUpperCase();
+
+      const card = document.createElement("div");
+      card.className = `card ${etat === "EN_COURS" ? "live-card " : etat === "TERMINE" ? "termine-card " : ""}${conf}`;
+      card.dataset.favCard = "1";
+      card.dataset.favState = etat;
+      card.dataset.cleFavori = cle;
+      card.dataset.conf = conf;
+      card.dataset.proba = proba !== "" ? String(proba) : "0";
+      card.dataset.confScore = String(confSc);
+      card.dataset.ts = String(tsM);
+      card.dataset.search = `${choix} ${match} ${comp} ${scoreActuel} ${scoreFinal} ${detail}`.toLowerCase();
+
+      let topBadgeHtml = `<span class="badge a-venir">À VENIR</span>`;
+      if (etat === "EN_COURS") {
+        topBadgeHtml = `<span class="badge live"><span class="dot-red"></span> ${escapeHtml(chronoLive)}</span>`;
+      } else if (etat === "TERMINE") {
+        let pronoBadge = "";
+        if (statutProno === "GAGNE") pronoBadge = `<span class="badge gagne">GAGNÉ</span>`;
+        else if (statutProno === "PERDU") pronoBadge = `<span class="badge perdu">PERDU</span>`;
+        topBadgeHtml = `<span class="badge termine">TERMINÉ</span>${pronoBadge}`;
+      }
+
+      let middleHtml = "";
+      if (etat === "EN_COURS") {
+        middleHtml = `
+          <div class="live-score-box">
+            <span class="meta">Score en direct</span>
+            <span class="live-score-val">${escapeHtml(scoreActuel)}</span>
+          </div>`;
+      } else if (etat === "TERMINE") {
+        middleHtml = `
+          <div class="final-score-box">
+            <span class="meta">Score final</span>
+            <span class="live-score-val">${escapeHtml(scoreFinal)}</span>
+          </div>`;
+      }
+
+      const subParts = [];
+      if (proba !== "") subParts.push(`Proba : <strong>${escapeHtml(proba)}%</strong>`);
+      if (etat === "EN_COURS" && cote !== "") subParts.push(`Cote : <strong>${escapeHtml(cote)}</strong>`);
+      if (etat !== "EN_COURS") subParts.push(`Confiance : <strong>${escapeHtml(conf)}</strong>`);
+
+      const footerHtml = etat !== "TERMINE" ? `
+        <div class="fav-slip-footer">
+          <span>${etat === "EN_COURS" ? "Mise suggérée" : "Mise"} : <strong>${miseU !== "" ? escapeHtml(miseU) + "u" : "-"}</strong></span>
+          ${cote !== "" ? `<span class="odds-chip">@ ${escapeHtml(cote)}</span>` : ""}
+        </div>` : "";
+
+      card.innerHTML = `
+        <div class="card-top">
+          <div class="card-title">${icone} ${escapeHtml(match)}</div>
+          <div class="badges-right">
+            ${topBadgeHtml}
+            <button type="button" class="star-btn active" title="Retirer des favoris" onclick="toggleFavori(this)"
+                    data-cle-favori="${escapeHtml(cle)}"
+                    data-sport="${escapeHtml(sport)}"
+                    data-event-id="${escapeHtml(item.event_id || "")}"
+                    data-match="${escapeHtml(match)}"
+                    data-competition="${escapeHtml(comp)}"
+                    data-date-match="${escapeHtml(dateMatch)}"
+                    data-ts-match="${escapeHtml(tsM)}"
+                    data-choix="${escapeHtml(choix)}"
+                    data-proba="${escapeHtml(proba)}"
+                    data-cote="${escapeHtml(cote)}"
+                    data-mise-u="${escapeHtml(miseU)}"
+                    data-confiance="${escapeHtml(conf)}"
+                    data-confiance-score="${escapeHtml(confSc)}"
+                    data-detail="${escapeHtml(detail)}"
+                    data-etat-match="${escapeHtml(etat)}">★</button>
+          </div>
+        </div>
+        <div class="card-meta">${escapeHtml(comp)} • ${escapeHtml(dateMatch)}</div>
+        ${middleHtml}
+        <div class="pred-box">
+          <div class="pred-label">${etat === "TERMINE" ? "Pronostic" : "Sélection suivie"}</div>
+          <div class="pred-choice">${escapeHtml(choix)}</div>
+          <div class="pred-sub">${subParts.join(" • ")}</div>
+        </div>
+        ${footerHtml}
+      `;
+      return card;
+    }
+
+    function synchroniserCarteFavoriDom(item, estFav) {
+      if (!PAGE_FAVORIS) return;
+      const cle = String(item.cle_favori || "");
+      if (!cle) return;
+
+      const existante = document.querySelector(`#favoris-container .card[data-fav-card][data-cle-favori="${CSS.escape(cle)}"]`);
+      if (!estFav) {
+        if (existante) existante.remove();
+        rafraichirCompteursFavoris();
+        return;
+      }
+
+      const etat = String(item.etat_match || "A_VENIR").toUpperCase();
+      const grilleId = etat === "EN_COURS" ? "fav-grid-live" : (etat === "TERMINE" ? "fav-grid-done" : "fav-grid-upcoming");
+      const grille = document.getElementById(grilleId);
+      if (!grille) return;
+
+      const nouvelleCarte = construireCarteFavoriElement(item);
+      if (existante) {
+        existante.replaceWith(nouvelleCarte);
+      } else {
+        grille.appendChild(nouvelleCarte);
+      }
+      rafraichirCompteursFavoris();
     }
 
     function appliquerFiltres() {
@@ -3781,7 +3927,10 @@ _HTML_PAGE = """<!doctype html>
         mise_u: d.miseU || null,
         confiance: d.confiance || "MOYENNE",
         confiance_score: d.confianceScore || 50,
-        detail: d.detail || ""
+        detail: d.detail || "",
+        etat_match: d.etatMatch || "A_VENIR",
+        score_actuel: d.scoreActuel || "",
+        chrono_live: d.chronoLive || ""
       };
       btn.disabled = true;
       try {
@@ -3794,6 +3943,7 @@ _HTML_PAGE = """<!doctype html>
           const data = await res.json();
           const estFav = Boolean(data.est_favori);
           const cle = data.cle_favori || payload.cle_favori;
+          const itemSync = data.item || { ...payload, cle_favori: cle, est_favori: estFav };
 
           document.querySelectorAll(".star-btn").forEach(other => {
             if ((other.dataset.cleFavori || "") === cle) {
@@ -3808,11 +3958,8 @@ _HTML_PAGE = """<!doctype html>
             if (tCpt) tCpt.textContent = data.total_favoris;
           }
 
-          if (PAGE_FAVORIS && !estFav) {
-            const favCard = btn.closest(".card[data-fav-card]");
-            if (favCard) favCard.remove();
-            rafraichirCompteursFavoris();
-          }
+          synchroniserCarteFavoriDom(itemSync, estFav);
+          trierCartes();
           appliquerFiltres();
         }
       } catch (e) {
@@ -3835,6 +3982,7 @@ _HTML_PAGE = """<!doctype html>
             if (tCpt) tCpt.textContent = data.total_favoris;
           }
           rafraichirCompteursFavoris();
+          trierCartes();
           appliquerFiltres();
           if ((data.supprimes || 0) > 0) {
             afficherBanniere(`${data.supprimes} match(s) terminé(s) retiré(s) des favoris.`, "ok");
@@ -3939,26 +4087,59 @@ def api_favoris_toggle():
         payload.get("sport"), payload.get("event_id"), payload.get("match"), payload.get("date_match")
     )
 
+    item_enrichi = None
     with _STATE_LOCK:
         if _DERNIER_RAPPORT.get("mis_a_jour"):
+            suivis_actuels = list(_DERNIER_RAPPORT.get("favoris_suivis") or [])
+            index_ref = {}
+            for liste_k in ("en_cours_matchs", "top_sur", "foot", "tennis"):
+                for ref_it in (_DERNIER_RAPPORT.get(liste_k) or []):
+                    ref_cle = str(ref_it.get("cle_favori") or "").strip() or _construire_cle_favori(
+                        ref_it.get("sport"), ref_it.get("event_id"), ref_it.get("match"), ref_it.get("date_match")
+                    )
+                    if ref_cle:
+                        index_ref[ref_cle] = ref_it
+
             if est_fav:
-                suivis_actuels = list(_DERNIER_RAPPORT.get("favoris_suivis") or [])
-                deja_dans_suivis = any(
-                    (x.get("cle_favori") or _construire_cle_favori(x.get("sport"), x.get("event_id"), x.get("match"), x.get("date_match"))) == cle
-                    for x in suivis_actuels
-                )
-                if not deja_dans_suivis:
-                    with _FAV_LOCK:
-                        meta = dict(_FAVORIS_ACTIFS.get(cle) or {})
-                    meta.setdefault("etat_match", "A_VENIR")
-                    meta["est_favori"] = True
-                    suivis_actuels.append(meta)
-                    ordre_etat = {"EN_COURS": 0, "A_VENIR": 1, "TERMINE": 2}
-                    suivis_actuels.sort(key=lambda x: (
-                        ordre_etat.get(str(x.get("etat_match") or "A_VENIR").upper(), 1),
-                        _cle_cle_chronologique(x),
-                    ))
-                    _DERNIER_RAPPORT["favoris_suivis"] = suivis_actuels
+                with _FAV_LOCK:
+                    meta = dict(_FAVORIS_ACTIFS.get(cle) or payload or {})
+                source_it = dict(index_ref.get(cle) or meta)
+                source_it.update({k: v for k, v in meta.items() if v not in (None, "")})
+                source_it["cle_favori"] = cle
+                source_it["est_favori"] = True
+                source_it.setdefault("etat_match", "EN_COURS" if source_it.get("en_cours") else "A_VENIR")
+                item_enrichi = dict(source_it)
+
+                remplace = False
+                for idx_s, existing_s in enumerate(suivis_actuels):
+                    ex_cle = str(existing_s.get("cle_favori") or "").strip() or _construire_cle_favori(
+                        existing_s.get("sport"), existing_s.get("event_id"), existing_s.get("match"), existing_s.get("date_match")
+                    )
+                    if ex_cle == cle:
+                        merged_s = dict(existing_s)
+                        merged_s.update(source_it)
+                        suivis_actuels[idx_s] = merged_s
+                        item_enrichi = dict(merged_s)
+                        remplace = True
+                        break
+                if not remplace:
+                    suivis_actuels.append(source_it)
+
+                ordre_etat = {"EN_COURS": 0, "A_VENIR": 1, "TERMINE": 2}
+                suivis_actuels.sort(key=lambda x: (
+                    ordre_etat.get(str(x.get("etat_match") or "A_VENIR").upper(), 1),
+                    _cle_cle_chronologique(x),
+                ))
+                _DERNIER_RAPPORT["favoris_suivis"] = suivis_actuels
+            else:
+                for ex_s in suivis_actuels:
+                    ex_cle = str(ex_s.get("cle_favori") or "").strip() or _construire_cle_favori(
+                        ex_s.get("sport"), ex_s.get("event_id"), ex_s.get("match"), ex_s.get("date_match")
+                    )
+                    if ex_cle == cle:
+                        item_enrichi = dict(ex_s, est_favori=False)
+                        break
+
             _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
             rapport_copie = dict(_DERNIER_RAPPORT)
         else:
@@ -3967,11 +4148,20 @@ def api_favoris_toggle():
     if rapport_copie and rapport_copie.get("mis_a_jour"):
         _sauvegarder_rapport_disque(rapport_copie)
 
+    if item_enrichi is None:
+        with _FAV_LOCK:
+            meta_fallback = dict(_FAVORIS_ACTIFS.get(cle) or payload or {})
+        meta_fallback["cle_favori"] = cle
+        meta_fallback["est_favori"] = est_fav
+        meta_fallback.setdefault("etat_match", "A_VENIR")
+        item_enrichi = meta_fallback
+
     return jsonify({
         "ok": True,
         "cle_favori": cle,
         "est_favori": est_fav,
         "total_favoris": len(cles_actuelles),
+        "item": item_enrichi,
     }), 200
 
 
