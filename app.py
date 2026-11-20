@@ -781,22 +781,6 @@ def _selectionner_score_exact_coherent(choix, h_nom, a_nom, best_h, best_a, matr
     return f"{h_sc} - {a_sc}", h_sc, a_sc, proba_secours_pct
 
 
-def _calculer_top_scores_exacts(matrice_scores, choix, h_nom, a_nom, top_n=3):
-    if not matrice_scores:
-        return []
-    tries = sorted(matrice_scores.items(), key=lambda kv: float(kv[1]), reverse=True)
-    top_liste = []
-    for (h_sc, a_sc), pr in tries[:top_n]:
-        pct = round(max(0.5, min(95.0, float(pr) * 100.0)), 1)
-        compatible = _score_compatible_avec_choix(h_sc, a_sc, choix, h_nom, a_nom)
-        top_liste.append({
-            "score": f"{int(h_sc)} - {int(a_sc)}",
-            "proba": pct,
-            "compatible": compatible,
-        })
-    return top_liste
-
-
 def moyenne_ponderee_shrinkage(valeurs, prior_moyenne, prior_poids=1.5):
     if not valeurs:
         return prior_moyenne
@@ -1228,7 +1212,6 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     score_exact, _, _, score_exact_proba = _selectionner_score_exact_coherent(
         choix, h_nom, a_nom, best_h, best_a, matrice_scores, lam_h, lam_a
     )
-    top_scores_exacts = _calculer_top_scores_exacts(matrice_scores, choix, h_nom, a_nom, top_n=3)
 
     dt_match = _parse_date_utc(start_str)
     est_imminent = False
@@ -1269,7 +1252,6 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "ecart_value_pct": ecart_value_pct,
         "score_exact": score_exact,
         "score_exact_proba": score_exact_proba,
-        "top_scores_exacts": top_scores_exacts,
         "est_imminent": est_imminent,
         "prudence": prudence,
         "confiance": conf_niveau,
@@ -1653,7 +1635,6 @@ def analyser_tennis(heures_max=48):
                     "ecart_value_pct": ecart_value_pct,
                     "score_exact": None,
                     "score_exact_proba": None,
-                    "top_scores_exacts": [],
                     "est_imminent": est_imminent,
                     "prudence": "MODERE" if (proba_pct >= 58 and complet) else "PRUDENT",
                     "confiance": conf_niveau,
@@ -1711,6 +1692,20 @@ def _enrichir_matchs_live_avec_pronostics(live_items, candidats_precalcul):
         eid = str(copie.get("event_id") or "").strip()
         cle_ev = f"{sport_u}_{eid}"
 
+        base = precalcul_par_event.get(cle_ev)
+        if not base and " vs " in copie.get("match", ""):
+            eq_h, eq_a = [x.strip() for x in copie["match"].split(" vs ", 1)]
+            for it in (candidats_precalcul or []):
+                if str(it.get("sport") or "").upper() == sport_u and " vs " in it.get("match", ""):
+                    rh, ra = [x.strip() for x in it["match"].split(" vs ", 1)]
+                    if _memes_equipes(eq_h, rh) and _memes_equipes(eq_a, ra):
+                        base = it
+                        break
+
+        if base and not copie.get("score_exact"):
+            copie["score_exact"] = base.get("score_exact")
+            copie["score_exact_proba"] = base.get("score_exact_proba")
+
         hist_match = par_event.get(cle_ev) or []
         if not hist_match and " vs " in copie.get("match", ""):
             eq_h, eq_a = [x.strip() for x in copie["match"].split(" vs ", 1)]
@@ -1729,10 +1724,10 @@ def _enrichir_matchs_live_avec_pronostics(live_items, candidats_precalcul):
             copie["pronostic_statut"] = dernier.get("statut") or "EN_ATTENTE"
             copie["pronostic_source"] = "Enregistré"
         else:
-            base = precalcul_par_event.get(cle_ev) or copie
-            copie["pronostic_predi"] = base.get("choix")
-            copie["pronostic_proba"] = base.get("proba")
-            copie["pronostic_cote"] = base.get("cote")
+            ref = base or copie
+            copie["pronostic_predi"] = ref.get("choix")
+            copie["pronostic_proba"] = ref.get("proba")
+            copie["pronostic_cote"] = ref.get("cote")
             copie["pronostic_statut"] = "EN_ATTENTE"
             copie["pronostic_source"] = "Calculé"
 
@@ -2324,9 +2319,8 @@ def executer_analyse():
 
         synthese = "\n".join(
             f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')} | "
-            f"Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')}) / Min {x.get('cote_min', '-')}"
-            f"{' | VALUE +' + str(x.get('ecart_value_pct')) + '%' if x.get('est_value_bet') else ''} | "
-            f"Mise {x.get('mise_u', 0)}u] "
+            f"Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')})"
+            f"{' | VALUE +' + str(x.get('ecart_value_pct')) + '%' if x.get('est_value_bet') else ''}] "
             f"{x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
             for x in top_sur[:8]
         ) or f"Aucun match à venir dans les prochaines {CFG.fenetre_heures}h."
@@ -2684,8 +2678,6 @@ _HTML_PAGE = """<!doctype html>
     select { background: #0b1220; color: var(--text); border: 1px solid var(--border); font-weight: 600; }
     .btn-cat { background: var(--card); color: var(--text); border: 1px solid var(--border); font-weight: 600; }
     .btn-cat.active { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 700; }
-    .btn-fav-page { background: rgba(251, 191, 36, 0.14); color: var(--gold); border: 1px solid rgba(251, 191, 36, 0.45); }
-    .btn-fav-page.active { background: var(--gold); color: #0b1220; border-color: var(--gold); }
     button:hover, .btn:hover { opacity: 0.92; transform: translateY(-1px); }
     button:disabled { opacity: 0.65; cursor: wait; transform: none; }
     .cat-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
@@ -2749,12 +2741,6 @@ _HTML_PAGE = """<!doctype html>
       background: rgba(15, 23, 42, 0.72); border: 1px solid rgba(56, 189, 248, 0.22);
     }
     .score-main { color: var(--accent); font-weight: 700; font-size: 0.92em; }
-    .top-scores-line { margin-top: 4px; font-size: 0.82em; color: #cbd5e1; display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
-    .top-sc-chip {
-      background: rgba(30, 41, 59, 0.9); border: 1px solid var(--border);
-      border-radius: 6px; padding: 2px 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em;
-    }
-    .top-sc-chip.ok { border-color: rgba(16, 185, 129, 0.45); color: #a7f3d0; }
     .live-score-box {
       display: flex; justify-content: space-between; align-items: center;
       background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3);
@@ -2806,8 +2792,6 @@ _HTML_PAGE = """<!doctype html>
       <div class="header-actions">
         {% if page_favoris %}
         <a href="{{ url_for('app_view', cat='all') }}" class="btn btn-cat">← Tous les matchs</a>
-        {% else %}
-        <a href="{{ url_for('favoris_view') }}" class="btn btn-fav-page">★ Page Favoris (<span id="fav-count-header">{{ r.favoris_suivis|length }}</span>)</a>
         {% endif %}
         <form id="refresh-form" method="post" action="/refresh" style="margin: 0;" onsubmit="return soumettreRefresh(event);">
           <input type="hidden" name="admin_token" id="refresh-admin-token" value="">
@@ -2930,7 +2914,6 @@ _HTML_PAGE = """<!doctype html>
           <div class="pred-sub">
             {% if it.proba is not none %}Proba : <strong>{{ it.proba }}%</strong>{% endif %}
             {% if it.cote %} • Cote : <strong>{{ it.cote }}</strong>{% endif %}
-            {% if it.mise_u is not none %} • Mise : <strong>{{ it.mise_u }}u</strong>{% endif %}
           </div>
         </div>
         {% if it.detail %}
@@ -2952,12 +2935,13 @@ _HTML_PAGE = """<!doctype html>
         {% set conf_sc = it.get('confiance_score', it.proba) %}
         {% set ts_m = it.get('ts_match', 9999999999.0) %}
         {% set is_fav = it.get('est_favori', False) %}
+        {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else (it.pronostic_proba or it.proba) %}
         <div class="card live-card {{ conf }}"
              data-conf="{{ conf }}"
              data-proba="{{ it.pronostic_proba or it.proba }}"
              data-conf-score="{{ conf_sc }}"
              data-ts="{{ ts_m }}"
-             data-search="{{ ((it.pronostic_predi or it.choix) ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.score_actuel or ''))|lower }}">
+             data-search="{{ ((it.pronostic_predi or it.choix) ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.score_actuel or '') ~ ' ' ~ (it.score_exact or ''))|lower }}">
           <div class="card-top">
             <div class="card-title">
               {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}
@@ -2986,6 +2970,11 @@ _HTML_PAGE = """<!doctype html>
           </div>
           <div class="card-meta">
             {{ it.competition }} • Début : {{ it.date_match }}
+            {% if it.get('score_exact') %}
+            <div class="score-box">
+              <div class="score-main">Score exact cohérent : {{ it.score_exact }} ({{ pct_score }}%)</div>
+            </div>
+            {% endif %}
           </div>
           <div class="live-score-box">
             <span class="meta">Score actuel</span>
@@ -3031,7 +3020,7 @@ _HTML_PAGE = """<!doctype html>
               <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
               {% endif %}
               {% if it.get('cote') %}
-              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
+              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
               {% endif %}
               <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
               {% if it.get('est_imminent') %}
@@ -3059,18 +3048,10 @@ _HTML_PAGE = """<!doctype html>
           </div>
           <div class="card-meta">
             <strong>{{ it.match }}</strong><br>
-            {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
+            {{ it.date_match }} — {{ it.competition }}
             {% if it.get('score_exact') %}
             <div class="score-box">
               <div class="score-main">Score exact cohérent : {{ it.score_exact }} ({{ pct_score }}%)</div>
-              {% if it.get('top_scores_exacts') %}
-              <div class="top-scores-line">
-                <span>Top 3 :</span>
-                {% for sc_item in it.get('top_scores_exacts', []) %}
-                <span class="top-sc-chip {% if sc_item.compatible %}ok{% endif %}">{{ sc_item.score }} ({{ sc_item.proba }}%)</span>
-                {% endfor %}
-              </div>
-              {% endif %}
             </div>
             {% endif %}
           </div>
@@ -3115,7 +3096,7 @@ _HTML_PAGE = """<!doctype html>
               <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
               {% endif %}
               {% if it.get('cote') %}
-              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
+              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
               {% endif %}
               <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
               {% if it.get('est_imminent') %}
@@ -3143,18 +3124,10 @@ _HTML_PAGE = """<!doctype html>
           </div>
           <div class="card-meta">
             <strong>{{ it.match }}</strong><br>
-            {{ it.date_match }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
+            {{ it.date_match }}
             {% if it.get('score_exact') %}
             <div class="score-box">
               <div class="score-main">Score exact cohérent : {{ it.score_exact }} ({{ pct_score }}%)</div>
-              {% if it.get('top_scores_exacts') %}
-              <div class="top-scores-line">
-                <span>Top 3 :</span>
-                {% for sc_item in it.get('top_scores_exacts', []) %}
-                <span class="top-sc-chip {% if sc_item.compatible %}ok{% endif %}">{{ sc_item.score }} ({{ sc_item.proba }}%)</span>
-                {% endfor %}
-              </div>
-              {% endif %}
             </div>
             {% endif %}
           </div>
@@ -3192,7 +3165,7 @@ _HTML_PAGE = """<!doctype html>
               <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
               {% endif %}
               {% if it.get('cote') %}
-              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
+              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
               {% endif %}
               <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
               {% if it.get('est_imminent') %}
@@ -3220,7 +3193,7 @@ _HTML_PAGE = """<!doctype html>
           </div>
           <div class="card-meta">
             <strong>{{ it.match }}</strong><br>
-            {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
+            {{ it.date_match }} — {{ it.competition }}
           </div>
           <div class="conf-meter">
             <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
@@ -3427,9 +3400,7 @@ _HTML_PAGE = """<!doctype html>
           });
 
           if (typeof data.total_favoris === "number") {
-            const hCpt = document.getElementById("fav-count-header");
             const tCpt = document.getElementById("fav-count-tab");
-            if (hCpt) hCpt.textContent = data.total_favoris;
             if (tCpt) tCpt.textContent = data.total_favoris;
           }
 
