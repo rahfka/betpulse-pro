@@ -2404,7 +2404,7 @@ _HTML_HOME = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BetPulse Pro — Chargement…</title>
+<title>BetPulse Pro — Accueil</title>
 <style>
   :root {
     --bg: #0f172a;
@@ -2535,12 +2535,44 @@ _HTML_HOME = """<!doctype html>
     animation: slide 1.8s ease-in-out infinite;
     box-shadow: 0 0 12px rgba(56,189,248,.85);
   }
+  .progress-fill.ready {
+    width: 100%;
+    animation: none;
+    background: linear-gradient(90deg, var(--green), var(--accent));
+  }
   @keyframes slide {
     0%   { transform: translateX(-110%); }
     100% { transform: translateX(380%); }
   }
+  .enter-wrap {
+    margin: 4px 0 14px;
+  }
+  .btn-enter {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    width: 100%;
+    padding: 13px 22px;
+    border-radius: 12px;
+    background: linear-gradient(135deg, #38bdf8 0%, #10b981 100%);
+    color: #0b1220;
+    font-weight: 900;
+    font-size: 1rem;
+    letter-spacing: 0.04em;
+    text-decoration: none;
+    box-shadow: 0 10px 24px rgba(16, 185, 129, 0.28);
+    transition: transform 0.14s ease, box-shadow 0.14s ease, opacity 0.15s ease;
+  }
+  .btn-enter:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 14px 28px rgba(56, 189, 248, 0.38);
+  }
+  .btn-enter.waiting {
+    background: rgba(56, 189, 248, 0.16);
+    color: var(--accent);
+    border: 1px solid rgba(56, 189, 248, 0.35);
+    box-shadow: none;
+  }
   .status { font-size: .85rem; color: var(--muted); }
-  .status::after {
+  .status.dots::after {
     content: ''; display: inline-block; width: 1.3em;
     animation: dots 1.5s steps(4,end) infinite;
   }
@@ -2643,7 +2675,7 @@ _HTML_HOME = """<!doctype html>
       <div class="explain-title">Comment fonctionne BetPulse Pro ?</div>
       <div>
         L'outil analyse automatiquement les matchs en cours et à venir sur une fenêtre de {{ fenetre_heures }}h :
-        forme récente, modèle de Poisson pour les buts et scores exacts en football, classements/surfaces en tennis,
+        forme récente, estimation statistique des buts et des scores exacts en football, classements et surfaces en tennis,
         ainsi que les alertes blessures ou forfaits récents.
       </div>
       <div class="comp-list">
@@ -2659,36 +2691,65 @@ _HTML_HOME = """<!doctype html>
       </div>
     </div>
 
-    <div class="progress"><div class="progress-fill"></div></div>
-    <div class="status" id="status">
-      {% if en_cours %}Analyse en cours{% else %}Initialisation des données{% endif %}
+    <div class="progress"><div class="progress-fill {% if pret %}ready{% endif %}" id="progress-fill"></div></div>
+
+    <div class="enter-wrap">
+      <a href="/app" class="btn-enter {% if not pret %}waiting{% endif %}" id="btn-entrer">
+        ENTRER →
+      </a>
     </div>
-    <div class="meta" id="meta"></div>
+
+    <div class="status {% if not pret %}dots{% endif %}" id="status">
+      {% if pret %}Données prêtes — cliquez sur ENTRER pour accéder à l'application{% elif en_cours %}Analyse en cours{% else %}Initialisation des données{% endif %}
+    </div>
+    <div class="meta" id="meta">{% if mis_a_jour %}Dernière analyse : {{ mis_a_jour }}{% endif %}</div>
   </div>
 </div>
 
 <script>
 (function(){
-  var statusEl = document.getElementById('status');
-  var metaEl   = document.getElementById('meta');
-  var POLL_MS  = 1500;
+  var statusEl   = document.getElementById('status');
+  var metaEl     = document.getElementById('meta');
+  var btnEntrer  = document.getElementById('btn-entrer');
+  var progFill   = document.getElementById('progress-fill');
+  var POLL_MS    = 1500;
+
+  function marquerPret(maj) {
+    if (btnEntrer) {
+      btnEntrer.classList.remove('waiting');
+    }
+    if (progFill) {
+      progFill.classList.add('ready');
+    }
+    if (statusEl) {
+      statusEl.classList.remove('dots');
+      statusEl.textContent = "Données prêtes — cliquez sur ENTRER pour accéder à l'application";
+    }
+    if (metaEl && maj) {
+      metaEl.textContent = "Dernière analyse : " + maj;
+    }
+  }
 
   async function check() {
     try {
       var r = await fetch("/api/status", { cache: "no-store" });
       if (r.ok) {
         var d = await r.json();
+        if (d.mis_a_jour) {
+          if (metaEl) metaEl.textContent = "Dernière analyse : " + d.mis_a_jour;
+        }
         if (d.ready) {
-          statusEl.textContent = "Prêt ! Ouverture de l'application";
-          setTimeout(function(){ window.location.replace("/app"); }, 200);
+          marquerPret(d.mis_a_jour);
           return;
         }
-        if (d.mis_a_jour) metaEl.textContent = "Dernière analyse : " + d.mis_a_jour;
       }
     } catch (e) {}
     setTimeout(check, POLL_MS);
   }
-  setTimeout(check, 300);
+
+  if (!({{ "true" if pret else "false" }})) {
+    setTimeout(check, 400);
+  }
 })();
 </script>
 </body>
@@ -2819,7 +2880,6 @@ _HTML_PAGE = """<!doctype html>
     }
     .pill-btn.active { background: rgba(56, 189, 248, 0.18); color: var(--accent); border-color: var(--accent); }
 
-    /* --- STYLE BOOKMAKER POUR LES FAVORIS --- */
     .fav-summary-bar {
       display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px;
       background: linear-gradient(135deg, rgba(19, 29, 49, 0.95) 0%, rgba(24, 37, 63, 0.85) 100%);
@@ -4001,14 +4061,16 @@ def index():
         rapport = dict(_DERNIER_RAPPORT)
         en_cours = _ANALYSE_EN_COURS
 
-    if rapport.get("mis_a_jour"):
-        return redirect(url_for("app_view"))
+    maj = rapport.get("mis_a_jour")
+    pret = bool(maj)
 
-    if not en_cours:
+    if not pret and not en_cours:
         _demarrer_analyse_si_besoin(0.2)
 
     resp = make_response(render_template_string(
         _HTML_HOME,
+        pret=pret,
+        mis_a_jour=maj,
         en_cours=en_cours,
         fenetre_heures=CFG.fenetre_heures,
     ), 200)
