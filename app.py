@@ -806,7 +806,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "date_match": _formater_date_locale(start_str),
         "detail": (
             f"[{label_comp}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] "
-            f"| Buts: {buts_label} ({buts_proba:.0f}%) | Min @{cote_min} | Mise {mise_u}u{nul_note}"
+            f"| Buts: {buts_label} ({buts_proba:.0f}%){nul_note}"
         ),
         "choix": choix,
         "est_nul": est_nul,
@@ -1022,7 +1022,7 @@ def analyser_tennis(heures_max=48):
                     "event_id": mid,
                     "match": f"{j1} (#{r1 or 'NC'}) vs {j2} (#{r2 or 'NC'})",
                     "date_match": _formater_date_locale(str(m.get("date", ""))),
-                    "detail": f"{t_name} | Min @{cote_min} | Mise {mise_u}u",
+                    "detail": f"{t_name}",
                     "choix": f"Victoire {favori}",
                     "est_nul": False,
                     "proba": proba_pct,
@@ -1395,8 +1395,7 @@ def executer_analyse():
 
         synthese = "\n".join(
             f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')} | "
-            f"Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')}) | "
-            f"Min @{x.get('cote_min', '-')} | Mise {x.get('mise_u', '-')}u] "
+            f"Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')})] "
             f"{x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
             for x in top_sur[:8]
         ) or f"Aucun match à venir dans les prochaines {CFG.fenetre_heures}h."
@@ -1893,9 +1892,6 @@ _HTML_PAGE = """<!doctype html>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
           {{ it.date_match }} — {{ it.competition }}
-          {% if it.get('cote_min') is not none or it.get('mise_u') is not none %}
-          <br><span style="color: #cbd5e1;">Min @{{ it.get('cote_min', '-') }} • Mise {{ it.get('mise_u', '-') }}u</span>
-          {% endif %}
           {% if it.get('score_exact') %}
           <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
           {% endif %}
@@ -1948,9 +1944,6 @@ _HTML_PAGE = """<!doctype html>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
           {{ it.date_match }}
-          {% if it.get('cote_min') is not none or it.get('mise_u') is not none %}
-          <br><span style="color: #cbd5e1;">Min @{{ it.get('cote_min', '-') }} • Mise {{ it.get('mise_u', '-') }}u</span>
-          {% endif %}
           {% if it.get('score_exact') %}
           <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
           {% endif %}
@@ -1996,9 +1989,6 @@ _HTML_PAGE = """<!doctype html>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
           {{ it.date_match }} — {{ it.competition }}
-          {% if it.get('cote_min') is not none or it.get('mise_u') is not none %}
-          <br><span style="color: #cbd5e1;">Min @{{ it.get('cote_min', '-') }} • Mise {{ it.get('mise_u', '-') }}u</span>
-          {% endif %}
         </div>
         <div class="conf-meter">
           <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
