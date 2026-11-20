@@ -384,6 +384,20 @@ def _calculer_indice_confiance(proba_pct, fiable, gravite_alerte=0.0):
     return score, niveau
 
 
+def _calculer_cote(proba_pct, marge=0.04):
+    """
+    Calcule une cote réaliste type bookmaker.
+    La marge (vig) par défaut est de 4%.
+    """
+    p = proba_pct / 100.0
+    if p <= 0 or p >= 1:
+        return 0.0
+    fair_odds = 1.0 / p
+    # On retire la marge du bookmaker
+    cote_broker = fair_odds * (1 - marge)
+    return max(1.01, round(cote_broker, 2))
+
+
 def _extraire_scores_evenement(ev):
     comps = ev.get("competitors")
     if isinstance(comps, dict):
@@ -577,9 +591,6 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     plafond = 0.80 if fiable else 0.64
     prob_cal = min(max(prob, 0.05), plafond)
     proba_pct = round(prob_cal * 100, 1)
-    
-    # Calcul de la cote implicite
-    cote = round(1 / prob_cal, 2) if prob_cal > 0 else 0.0
 
     # Détection de match imminent (< 2 heures)
     dt_match = _parse_date_utc(start_str)
@@ -608,7 +619,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         ),
         "choix": choix,
         "proba": proba_pct,
-        "cote": cote,
+        "cote": 0.0, # Sera calculé à la fin dans executer_analyse
         "score_exact": score_exact,
         "est_imminent": est_imminent,
         "prudence": prudence,
@@ -791,8 +802,7 @@ def analyser_tennis(heures_max=48):
                 prob = min(max(prob, 0.50), plafond)
 
                 proba_pct = round(max(0.05, prob) * 100, 1)
-                cote = round(1 / prob, 2) if prob > 0 else 0.0
-                
+
                 dt_match = _parse_date_utc(str(m.get("date", "")))
                 est_imminent = False
                 if dt_match:
@@ -811,7 +821,7 @@ def analyser_tennis(heures_max=48):
                     "detail": f"{t_name}",
                     "choix": f"Victoire {favori}",
                     "proba": proba_pct,
-                    "cote": cote,
+                    "cote": 0.0, # Sera calculé à la fin
                     "score_exact": None,
                     "est_imminent": est_imminent,
                     "prudence": "MODERE" if (proba_pct >= 58 and complet) else "PRUDENT",
@@ -1116,6 +1126,14 @@ def executer_analyse():
             reverse=True,
         )[:10]
 
+        # Application des cotes finales après toutes les pénalités
+        for it in foot_sorted:
+            it["cote"] = _calculer_cote(it["proba"])
+        for it in tennis_sorted:
+            it["cote"] = _calculer_cote(it["proba"])
+        for it in top_sur:
+            it["cote"] = _calculer_cote(it["proba"])
+
         try:
             bilan = mettre_a_jour_historique(
                 [x for x in top_sur if x.get("fiable", True)],
@@ -1268,7 +1286,6 @@ _HTML_HOME = """<!doctype html>
   }
   .meta { margin-top: 10px; font-size: .75rem; color: #64748b; }
 
-  /* Trajectoires de rebond des ballons */
   @keyframes fly1 {
     0%   { transform: translate(8vw, 18vh) rotate(0deg); }
     20%  { transform: translate(25vw, 72vh) rotate(180deg); }
@@ -1318,12 +1335,10 @@ _HTML_HOME = """<!doctype html>
 </head>
 <body>
 <div class="field">
-  <!-- Ballons de foot -->
   <div class="ball football" style="animation: fly1 11s linear infinite; animation-delay: 0s;"></div>
   <div class="ball football" style="animation: fly3 13s ease-in-out infinite; animation-delay: -4s;"></div>
   <div class="ball football" style="animation: fly5 15s linear infinite; animation-delay: -8s;"></div>
 
-  <!-- Balles de tennis -->
   <div class="ball tennis" style="animation: fly2 10s ease-in-out infinite; animation-delay: -2s;">
     <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
       <defs>
