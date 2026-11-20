@@ -1,7 +1,7 @@
 import csv
 import importlib
-import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -11,12 +11,18 @@ import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, jsonify, make_response, redirect, render_template_string, request, url_for
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("betpulse")
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -40,14 +46,24 @@ tn = _charger_module_sport("compétences_sportives.tennis", "sports_skills.tenni
 
 TZ_PARIS = ZoneInfo("Europe/Paris")
 
+STATUTS_TERMINES = {
+    "closed", "final", "post", "completed", "finished",
+    "ft", "aet", "pen", "status_final", "status_post",
+}
+STATUTS_TERMINES_OU_EN_COURS = STATUTS_TERMINES | {"in_progress", "live"}
+
 
 @dataclass(frozen=True)
 class Config:
-    saison_foot: str = os.getenv("SAISON_FOOT", "2026").strip() or "2026"
-    n_derniers_matchs: int = int(os.getenv("N_DERNIERS_MATCHS", "8"))
-    fenetre_heures: int = int(os.getenv("FENETRE_HEURES", "48"))
-    timeout_http: int = int(os.getenv("TIMEOUT_HTTP", "3"))
-    cache_ttl_sec: int = int(os.getenv("CACHE_TTL_SEC", "900"))
+    saison_foot: str = field(default_factory=lambda: (os.getenv("SAISON_FOOT") or "2026").strip())
+    n_derniers_matchs: int = field(default_factory=lambda: max(1, int(os.getenv("N_DERNIERS_MATCHS", "8"))))
+    fenetre_heures: int = field(default_factory=lambda: max(1, int(os.getenv("FENETRE_HEURES", "48"))))
+    timeout_http: float = field(default_factory=lambda: max(1.0, float(os.getenv("TIMEOUT_HTTP", "4"))))
+    cache_ttl_sec: int = field(default_factory=lambda: max(60, int(os.getenv("CACHE_TTL_SEC", "900"))))
+    mise_unite_defaut: float = field(default_factory=lambda: max(0.0, float(os.getenv("MISE_UNITE_DEFAUT", "1.0"))))
+    activer_debug_routes: bool = field(
+        default_factory=lambda: os.getenv("ACTIVER_DEBUG_ROUTES", "false").strip().lower() in ("1", "true", "yes")
+    )
 
 
 CFG = Config()
@@ -70,21 +86,26 @@ def _resoudre_chemin_historique():
 
 
 FICHIER_HISTORIQUE = _resoudre_chemin_historique()
-FICHIER_RAPPORT = "/tmp/rapport.json"
+FICHIER_RAPPORT = os.getenv("FICHIER_RAPPORT", "/tmp/rapport.json").strip() or "/tmp/rapport.json"
 
 COMPETITIONS_CIBLES = [
-    {"slug": "ligue-1", "label": "Ligue 1", "mots": ("ligue 1", "ligue-1", "fra.1", "france"), "equipes": ["160", "174", "176"]},
-    {"slug": "la-liga", "label": "Liga Espagnole", "mots": ("la liga", "laliga", "la-liga", "esp.1", "spain"), "equipes": ["86", "83", "81"]},
-    {"slug": "bundesliga", "label": "Bundesliga", "mots": ("bundesliga", "ger.1", "germany"), "equipes": ["132", "124", "167"]},
-    {"slug": "portuguese-liga", "label": "Liga Portugaise", "mots": ("liga portugal", "primeira liga", "portuguese-liga", "por.1", "portugal"), "equipes": ["1929", "1927", "1930"]},
-    {"slug": "premier-league", "label": "Premier League", "mots": ("premier league", "premier-league", "eng.1", "england"), "equipes": ["364", "359", "360"]},
-    {"slug": "serie-a", "label": "Serie A", "mots": ("serie a", "serie-a", "ita.1", "italy"), "equipes": ["111", "110", "103"]},
-    {"slug": "uefa-champions-league", "label": "Ligue des Champions", "mots": ("champions league", "champions-league", "uefa.champions", "ucl"), "equipes": ["160", "86", "83", "364"]},
-    {"slug": "uefa-europa-league", "label": "Europa League", "mots": ("europa league", "europa-league", "uefa.europa", "uel"), "equipes": ["176", "174", "360", "111"]},
+    {"slug": "ligue-1", "label": "Ligue 1", "equipes": ["160", "174", "176"]},
+    {"slug": "la-liga", "label": "Liga Espagnole", "equipes": ["86", "83", "81"]},
+    {"slug": "bundesliga", "label": "Bundesliga", "equipes": ["132", "124", "167"]},
+    {"slug": "portuguese-liga", "label": "Liga Portugaise", "equipes": ["1929", "1927", "1930"]},
+    {"slug": "premier-league", "label": "Premier League", "equipes": ["364", "359", "360"]},
+    {"slug": "serie-a", "label": "Serie A", "equipes": ["111", "110", "103"]},
+    {"slug": "uefa-champions-league", "label": "Ligue des Champions", "equipes": ["160", "86", "83", "364"]},
+    {"slug": "uefa-europa-league", "label": "Europa League", "equipes": ["176", "174", "360", "111"]},
 ]
 
-STATUTS_TERMINES = {"closed", "final", "post", "completed", "finished", "ft", "aet", "pen", "status_final", "status_post"}
-STATUTS_TERMINES_OU_EN_COURS = STATUTS_TERMINES | {"in_progress", "live"}
+_HTTP_SESSION = requests.Session()
+_HTTP_SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+    )
+})
 
 _CACHE_FOOT_SCHED = {}
 _CACHE_SANTE = {}
@@ -103,13 +124,6 @@ _DERNIER_RAPPORT = {
     "synthese": "",
 }
 
-_HTTP_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-    )
-}
-
 
 def _charger_rapport_disque():
     global _DERNIER_RAPPORT
@@ -120,16 +134,26 @@ def _charger_rapport_disque():
                 if isinstance(data, dict) and data.get("mis_a_jour"):
                     with _STATE_LOCK:
                         _DERNIER_RAPPORT = data
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Impossible de charger le rapport disque : %s", e)
 
 
 def _sauvegarder_rapport_disque(rapport):
+    tmp_path = f"{FICHIER_RAPPORT}.tmp"
     try:
-        with open(FICHIER_RAPPORT, "w", encoding="utf-8") as f:
+        parent = os.path.dirname(FICHIER_RAPPORT)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(rapport, f, ensure_ascii=False)
-    except Exception:
-        pass
+        os.replace(tmp_path, FICHIER_RAPPORT)
+    except Exception as e:
+        logger.warning("Impossible de sauvegarder le rapport disque : %s", e)
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
 
 def _cache_get(cache_dict, cle):
@@ -137,14 +161,14 @@ def _cache_get(cache_dict, cle):
     if not entree:
         return None
     ts, val = entree
-    if (datetime.now(timezone.utc).timestamp() - ts) > CFG.cache_ttl_sec:
+    if (time.monotonic() - ts) > CFG.cache_ttl_sec:
         cache_dict.pop(cle, None)
         return None
     return val
 
 
 def _cache_set(cache_dict, cle, val):
-    cache_dict[cle] = (datetime.now(timezone.utc).timestamp(), val)
+    cache_dict[cle] = (time.monotonic(), val)
 
 
 def _extraire_events(payload):
@@ -196,8 +220,9 @@ def _normaliser_home_away(ev):
     return ev.get("home_team") or {}, ev.get("away_team") or {}
 
 
-def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year="2026"):
-    cle = (str(team_id), str(league_slug), str(season_year))
+def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year=None):
+    saison = str(season_year or CFG.saison_foot)
+    cle = (str(team_id), str(league_slug), saison)
     cached = _cache_get(_CACHE_FOOT_SCHED, cle)
     if cached is not None:
         return cached
@@ -210,10 +235,10 @@ def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year="2026")
         except TypeError:
             try:
                 res = fn(cle[0], cle[1], cle[2])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("get_team_schedule fallback erreur (%s): %s", cle, e)
         except Exception as e:
-            print(f"[FOOT] get_team_schedule({cle}) erreur: {e}", flush=True)
+            logger.warning("get_team_schedule(%s) erreur: %s", cle, e)
 
     _cache_set(_CACHE_FOOT_SCHED, cle, res)
     return res
@@ -245,9 +270,6 @@ def _est_match_a_venir_dans_fenetre(ev, heures_max):
         return False
 
     date_str = str(ev.get("start_time") or ev.get("date") or "").strip()
-    if not date_str:
-        return False
-
     dt = _parse_date_utc(date_str)
     if dt is None:
         return False
@@ -259,14 +281,17 @@ def _est_match_a_venir_dans_fenetre(ev, heures_max):
 def poisson_prob(k, lam):
     if lam <= 0:
         return 1.0 if k == 0 else 0.0
-    return (math.exp(-lam) * (lam ** k)) / math.factorial(k)
+    if k < 0:
+        return 0.0
+    return math.exp(-lam + k * math.log(lam) - math.lgamma(k + 1))
 
 
 def simuler_poisson_foot(lam_h, lam_a):
     p_h = p_n = p_a = p_over_25 = 0.0
     for h in range(8):
+        pr_h = poisson_prob(h, lam_h)
         for a in range(8):
-            pr = poisson_prob(h, lam_h) * poisson_prob(a, lam_a)
+            pr = pr_h * poisson_prob(a, lam_a)
             if h > a:
                 p_h += pr
             elif h == a:
@@ -276,8 +301,11 @@ def simuler_poisson_foot(lam_h, lam_a):
             if (h + a) > 2:
                 p_over_25 += pr
     tot = p_h + p_n + p_a
+    if tot <= 0:
+        return 1 / 3, 1 / 3, 1 / 3, 0.5, 0.5
     p_h, p_n, p_a = p_h / tot, p_n / tot, p_a / tot
-    return p_h, p_n, p_a, p_over_25, max(0.0, 1.0 - p_over_25)
+    p_ov25_norm = min(max(p_over_25 / tot, 0.0), 1.0)
+    return p_h, p_n, p_a, p_ov25_norm, 1.0 - p_ov25_norm
 
 
 def moyenne_ponderee(valeurs, defaut):
@@ -325,7 +353,9 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8)
             except Exception:
                 continue
             scores_par_role.append((tid, tnm, sc_int))
-            if (team_id and tid and tid == str(team_id)) or (nom_l and tnm and (tnm == nom_l or nom_l in tnm or tnm in nom_l)):
+            if (team_id and tid and tid == str(team_id)) or (
+                nom_l and tnm and (tnm == nom_l or nom_l in tnm or tnm in nom_l)
+            ):
                 if moi is None:
                     moi = sc_int
 
@@ -372,15 +402,15 @@ def _requete_rss(requete_brute, max_titres=2):
     url = f"https://news.google.com/rss/search?q={q}&hl=fr&gl=FR&ceid=FR:fr"
     titres = []
     try:
-        r = requests.get(url, headers=_HTTP_HEADERS, timeout=CFG.timeout_http)
-        if r.status_code == 200:
+        r = _HTTP_SESSION.get(url, timeout=CFG.timeout_http)
+        if r.status_code == 200 and r.text:
             root = ET.fromstring(r.text)
             for item in root.findall(".//item")[:4]:
                 t = (item.findtext("title") or "").strip()
                 if t:
                     titres.append(t)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Erreur RSS (%s): %s", requete_brute, e)
     return titres[:max_titres]
 
 
@@ -426,13 +456,16 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "event_id": ev_id,
         "match": f"{h_nom} vs {a_nom}",
         "date_match": _formater_date_locale(start_str),
-        "detail": f"[{label_comp}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] | Buts: {buts_label} ({buts_proba:.0f}%)",
+        "detail": (
+            f"[{label_comp}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] "
+            f"| Buts: {buts_label} ({buts_proba:.0f}%)"
+        ),
         "choix": choix,
         "proba": proba_pct,
         "prudence": "ELEVE" if proba_pct >= 72 else ("MODERE" if proba_pct >= 56 else "PRUDENT"),
-        "mise_u": 0.0,
+        "mise_u": CFG.mise_unite_defaut,
         "equipes": [h_nom, a_nom],
-    }, {}
+    }
 
 
 def analyser_foot_competitions(competitions, heures_max=48):
@@ -443,25 +476,26 @@ def analyser_foot_competitions(competitions, heures_max=48):
 
     aujourdhui = datetime.now(timezone.utc).date()
 
-    taches_sb = []
-    for comp in competitions:
-        for delta in range(2):
-            jour = (aujourdhui + timedelta(days=delta)).strftime("%Y%m%d")
-            taches_sb.append((comp["slug"], jour))
+    taches_sb = [
+        (comp["slug"], (aujourdhui + timedelta(days=delta)).strftime("%Y%m%d"))
+        for comp in competitions
+        for delta in range(2)
+    ]
 
     def charger_sb(args):
         slug, jour = args
         try:
             return _extraire_events(fb.get_fixtures_by_date(slug, jour))
-        except Exception:
+        except Exception as e:
+            logger.debug("get_fixtures_by_date(%s, %s) erreur: %s", slug, jour, e)
             return []
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         res_sb = list(ex.map(charger_sb, taches_sb))
 
     events_upcoming_par_slug = {c["slug"]: [] for c in competitions}
-    for i, (slug, _) in enumerate(taches_sb):
-        events_upcoming_par_slug[slug].extend(res_sb[i])
+    for (slug, _), evs in zip(taches_sb, res_sb):
+        events_upcoming_par_slug[slug].extend(evs)
 
     taches_hist_set = set()
     for comp in competitions:
@@ -483,15 +517,16 @@ def analyser_foot_competitions(competitions, heures_max=48):
         try:
             sched = get_foot_schedule_cached(tid, slug, CFG.saison_foot)
             return _extraire_events(sched)
-        except Exception:
+        except Exception as e:
+            logger.debug("charger_hist(%s, %s) erreur: %s", tid, slug, e)
             return []
 
     with ThreadPoolExecutor(max_workers=10) as ex:
         res_hist = list(ex.map(charger_hist, taches_hist))
 
     events_hist_par_slug = {c["slug"]: [] for c in competitions}
-    for i, (_, slug) in enumerate(taches_hist):
-        events_hist_par_slug[slug].extend(res_hist[i])
+    for (_, slug), evs in zip(taches_hist, res_hist):
+        events_hist_par_slug[slug].extend(evs)
 
     def analyser_comp(comp):
         slug = comp["slug"]
@@ -511,11 +546,10 @@ def analyser_foot_competitions(competitions, heures_max=48):
         nb_clos = sum(1 for ev in events_comp if str(ev.get("status") or "").strip().lower() in STATUTS_TERMINES)
 
         res_comp = []
-        alertes_comp = {}
         apercu_comp = []
 
         for ev in a_venir_48h:
-            entree, _ = _construire_entree_foot(ev, label_comp, events_comp)
+            entree = _construire_entree_foot(ev, label_comp, events_comp)
             res_comp.append(entree)
 
             if len(apercu_comp) < 2:
@@ -525,7 +559,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
                     f"{h.get('short_name') or h.get('name') or '?'} vs {a.get('short_name') or a.get('name') or '?'}"
                 )
 
-        return label_comp, res_comp, alertes_comp, nb_clos, len(events_comp), apercu_comp
+        return label_comp, res_comp, {}, nb_clos, len(events_comp), apercu_comp
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         res_comps = list(ex.map(analyser_comp, competitions))
@@ -536,7 +570,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
         apercu_lignes.extend(apercu_comp)
         stats_par_comp[label_comp] = f"À venir: {len(res_comp)} | Terminés: {nb_clos} (bruts: {total_events})"
 
-    print("Couverture Foot :", " • ".join(f"{k}: {v}" for k, v in stats_par_comp.items()), flush=True)
+    logger.info("Couverture Foot : %s", " • ".join(f"{k}: {v}" for k, v in stats_par_comp.items()))
     return resultats_a_venir, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12])
 
 
@@ -563,7 +597,8 @@ def analyser_tennis(heures_max=48):
             for p in tn.get_rankings(tour="wta").get("data", {}).get("rankings", [])
         }
         sb = tn.get_scoreboard()
-    except Exception:
+    except Exception as e:
+        logger.warning("Erreur récupération données tennis: %s", e)
         return [], {}
 
     simples = []
@@ -604,18 +639,18 @@ def analyser_tennis(heures_max=48):
                     "choix": f"Victoire {favori}",
                     "proba": proba_pct,
                     "prudence": "MODERE" if proba_pct >= 56 else "PRUDENT",
-                    "mise_u": 0.0,
+                    "mise_u": CFG.mise_unite_defaut,
                     "equipes": [favori],
                 })
     return simples, alertes_tennis
 
 
-def _enrichir_sante_top(top_items):
-    if not top_items:
+def _enrichir_sante_items(items_cibles, tous_les_items=None):
+    if not items_cibles:
         return {}
 
     equipes_a_scanner = set()
-    for it in top_items[:8]:
+    for it in items_cibles[:8]:
         for nom in it.get("equipes", []):
             if nom:
                 equipes_a_scanner.add(nom)
@@ -635,7 +670,15 @@ def _enrichir_sante_top(top_items):
                 alertes_globales[nom] = titres
                 penalites[nom] = len(titres)
 
-    for it in top_items:
+    liste_a_maj = list(items_cibles)
+    if tous_les_items:
+        ids_vus = {id(x) for x in liste_a_maj}
+        for x in tous_les_items:
+            if id(x) not in ids_vus:
+                liste_a_maj.append(x)
+                ids_vus.add(id(x))
+
+    for it in liste_a_maj:
         nb = sum(penalites.get(n, 0) for n in it.get("equipes", []))
         if nb:
             it["proba"] = round(max(0.05, it["proba"] / 100 - min(nb * 0.02, 0.08)) * 100, 1)
@@ -677,7 +720,10 @@ def _calculer_bilan(lignes):
 
 
 def mettre_a_jour_historique(items):
-    champs = ["date_analyse", "sport", "event_id", "match", "date_match", "choix", "proba", "prudence", "mise_u", "statut"]
+    champs = [
+        "date_analyse", "sport", "event_id", "match", "date_match",
+        "choix", "proba", "prudence", "mise_u", "statut",
+    ]
     lignes = []
     cles = set()
     if os.path.exists(FICHIER_HISTORIQUE):
@@ -687,8 +733,8 @@ def mettre_a_jour_historique(items):
                     if any((v or "").strip() for v in row.values()):
                         lignes.append(row)
                         cles.add(f"{row.get('sport')}_{row.get('event_id')}_{row.get('choix')}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Erreur lecture historique CSV: %s", e)
 
     now_str = datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M")
     for p in items:
@@ -703,7 +749,7 @@ def mettre_a_jour_historique(items):
                 "choix": p["choix"],
                 "proba": str(p["proba"]),
                 "prudence": p["prudence"],
-                "mise_u": str(p.get("mise_u", 0.0)),
+                "mise_u": str(p.get("mise_u", CFG.mise_unite_defaut)),
                 "statut": "EN_ATTENTE",
             })
             cles.add(cle)
@@ -715,8 +761,8 @@ def mettre_a_jour_historique(items):
             writer.writeheader()
             for r in lignes:
                 writer.writerow({k: r.get(k, "") for k in champs})
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Erreur écriture historique CSV: %s", e)
 
     return _calculer_bilan(lignes)
 
@@ -729,46 +775,49 @@ def executer_analyse():
         _ANALYSE_EN_COURS = True
 
     try:
-        print(f"Analyse en cours (fenetre: {CFG.fenetre_heures}h)...", flush=True)
+        logger.info("Analyse en cours (fenetre: %sh)...", CFG.fenetre_heures)
 
         try:
             foot_res, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
                 COMPETITIONS_CIBLES, CFG.fenetre_heures
             )
         except Exception as e:
-            print(f"[ERREUR] Foot: {e}", flush=True)
+            logger.error("Erreur Foot: %s", e)
             foot_res, alertes_f, stats_comp, apercu_bruts = [], {}, {}, f"Erreur Foot: {e}"
 
         try:
             tennis_res, alertes_t = analyser_tennis(CFG.fenetre_heures)
         except Exception as e:
-            print(f"[ERREUR] Tennis: {e}", flush=True)
+            logger.error("Erreur Tennis: %s", e)
             tennis_res, alertes_t = [], {}
 
         foot_sorted = sorted(foot_res, key=lambda x: x["proba"], reverse=True)
         tennis_sorted = sorted(tennis_res, key=lambda x: x["proba"], reverse=True)
         top_sur = sorted(foot_sorted + tennis_sorted, key=lambda x: x["proba"], reverse=True)[:10]
 
-        try:
-            bilan = mettre_a_jour_historique([x for x in top_sur if x.get("fiable", True)])
-        except Exception as e:
-            print(f"[ERREUR] Historique: {e}", flush=True)
-            with _STATE_LOCK:
-                bilan = dict(_DERNIER_RAPPORT.get("bilan") or {})
-
         alertes_combines = {**alertes_f, **alertes_t}
         try:
-            alertes_sante = _enrichir_sante_top(top_sur)
+            alertes_sante = _enrichir_sante_items(
+                top_sur, tous_les_items=foot_sorted + tennis_sorted
+            )
             alertes_combines.update(alertes_sante)
             top_sur = sorted(top_sur, key=lambda x: x["proba"], reverse=True)
             foot_sorted = sorted(foot_sorted, key=lambda x: x["proba"], reverse=True)
+            tennis_sorted = sorted(tennis_sorted, key=lambda x: x["proba"], reverse=True)
         except Exception as e:
-            print(f"[ERREUR] Santé: {e}", flush=True)
+            logger.error("Erreur Santé: %s", e)
+
+        try:
+            bilan = mettre_a_jour_historique([x for x in top_sur if x.get("fiable", True)])
+        except Exception as e:
+            logger.error("Erreur Historique: %s", e)
+            with _STATE_LOCK:
+                bilan = dict(_DERNIER_RAPPORT.get("bilan") or {})
 
         synthese = "\n".join(
             f"• [{x['sport']} | {x['prudence']}] {x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
             for x in top_sur[:8]
-        ) or "Aucun match à venir dans les prochaines 48h."
+        ) or f"Aucun match à venir dans les prochaines {CFG.fenetre_heures}h."
 
         nouveau_rapport = {
             "mis_a_jour": datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M %Z"),
@@ -786,7 +835,7 @@ def executer_analyse():
             _DERNIER_RAPPORT = nouveau_rapport
 
         _sauvegarder_rapport_disque(nouveau_rapport)
-        print("Analyse terminée et rapport mis à jour.", flush=True)
+        logger.info("Analyse terminée et rapport mis à jour.")
         return nouveau_rapport
     finally:
         with _STATE_LOCK:
@@ -802,77 +851,32 @@ _HTML_HOME = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>BetPulse Pro</title>
   <style>
-    :root { --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8; --green: #10b981; --border: #334155; }
+    :root { --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8; }
     * { box-sizing: border-box; }
     body {
       font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-      margin: 0;
-      min-height: 100vh;
+      margin: 0; min-height: 100vh;
       background: radial-gradient(circle at top, #1e293b 0%, var(--bg) 68%);
-      color: var(--text);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 24px;
+      color: var(--text); display: flex; align-items: center; justify-content: center; padding: 24px;
     }
-    .center-wrap {
-      width: 100%;
-      max-width: 520px;
-      text-align: center;
-    }
+    .center-wrap { width: 100%; max-width: 520px; text-align: center; }
     .logo-btn {
-      display: inline-flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: center;
-      gap: 14px;
-      background: var(--card);
-      border: 2px solid rgba(56, 189, 248, 0.45);
-      border-radius: 24px;
-      padding: 36px 44px;
-      color: var(--text);
-      text-decoration: none;
-      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
-      transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
-      cursor: pointer;
+      display: inline-flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+      background: var(--card); border: 2px solid rgba(56, 189, 248, 0.45); border-radius: 24px;
+      padding: 36px 44px; color: var(--text); text-decoration: none;
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35); transition: transform 0.18s ease, border-color 0.18s ease;
     }
-    .logo-btn:hover {
-      transform: translateY(-3px) scale(1.01);
-      border-color: var(--accent);
-      box-shadow: 0 22px 48px rgba(56, 189, 248, 0.18);
-    }
+    .logo-btn:hover { transform: translateY(-3px) scale(1.01); border-color: var(--accent); }
     .logo-mark {
-      width: 84px;
-      height: 84px;
-      border-radius: 22px;
+      width: 84px; height: 84px; border-radius: 22px;
       background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
-      color: #0f172a;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      font-size: 2rem;
-      font-weight: 900;
-      letter-spacing: -1px;
+      color: #0f172a; display: flex; align-items: center; justify-content: center;
+      font-size: 2rem; font-weight: 900;
     }
-    .logo-title {
-      font-size: 2rem;
-      font-weight: 800;
-      color: var(--text);
-      letter-spacing: 0.3px;
-    }
-    .logo-title span {
-      color: var(--accent);
-    }
-    .logo-cta {
-      font-size: 0.92rem;
-      color: var(--accent);
-      font-weight: 600;
-    }
-    .status-note {
-      margin-top: 18px;
-      font-size: 0.85rem;
-      color: var(--muted);
-    }
+    .logo-title { font-size: 2rem; font-weight: 800; }
+    .logo-title span { color: var(--accent); }
+    .logo-cta { font-size: 0.92rem; color: var(--accent); font-weight: 600; }
+    .status-note { margin-top: 18px; font-size: 0.85rem; color: var(--muted); }
   </style>
 </head>
 <body>
@@ -1094,6 +1098,7 @@ _HTML_PAGE = """<!doctype html>
       <span class="stat-item">En attente : <strong>{{ r.get("bilan", {}).get("en_attente", 0) }}</strong></span>
       <span class="stat-item">Vérifiés : <strong>{{ r.get("bilan", {}).get("verifies", 0) }}</strong></span>
       <span class="stat-item">Réussite : <strong>{{ r.get("bilan", {}).get("taux", 0.0) }}%</strong></span>
+      <span class="stat-item">PnL : <strong>{{ r.get("bilan", {}).get("pnl_total", 0.0) }}u</strong></span>
     </div>
     <div class="panel">
       <pre>{{ r.synthese or "Aucune synthèse disponible pour le moment." }}</pre>
@@ -1112,7 +1117,7 @@ def _demarrer_analyse_si_besoin(delai_sec=0.0):
         try:
             executer_analyse()
         except Exception as e:
-            print(f"[ERREUR FATALE] analyse background: {e}", flush=True)
+            logger.critical("Erreur fatale analyse background: %s", e)
 
     threading.Thread(target=_runner, daemon=True).start()
 
@@ -1147,33 +1152,28 @@ def api_analyse():
     return jsonify(rapport)
 
 
-@app.route("/api/debug-foot")
-def api_debug_foot():
-    fonctions = [n for n in dir(fb) if not n.startswith("_") and callable(getattr(fb, n, None))]
-    try:
-        source_sched = inspect.getsource(getattr(fb, "get_team_schedule"))
-    except Exception as e:
-        source_sched = f"Non disponible: {e}"
-
-    sched = get_foot_schedule_cached("160", "ligue-1", CFG.saison_foot)
-    evs = _extraire_events(sched)
-    echantillon = [
-        {
-            "id": ev.get("id"),
-            "status": ev.get("status"),
-            "date": ev.get("start_time") or ev.get("date"),
-            "home": (_normaliser_home_away(ev)[0].get("name")),
-            "away": (_normaliser_home_away(ev)[1].get("name")),
-        }
-        for ev in evs[:5]
-    ]
-    return jsonify({
-        "module": getattr(fb, "__name__", str(fb)),
-        "fonctions_disponibles": fonctions,
-        "source_get_team_schedule": source_sched,
-        "nb_events_psg": len(evs),
-        "echantillon_psg": echantillon,
-    })
+if CFG.activer_debug_routes:
+    @app.route("/api/debug-foot")
+    def api_debug_foot():
+        fonctions = [n for n in dir(fb) if not n.startswith("_") and callable(getattr(fb, n, None))]
+        sched = get_foot_schedule_cached("160", "ligue-1", CFG.saison_foot)
+        evs = _extraire_events(sched)
+        echantillon = [
+            {
+                "id": ev.get("id"),
+                "status": ev.get("status"),
+                "date": ev.get("start_time") or ev.get("date"),
+                "home": (_normaliser_home_away(ev)[0].get("name")),
+                "away": (_normaliser_home_away(ev)[1].get("name")),
+            }
+            for ev in evs[:5]
+        ]
+        return jsonify({
+            "module": getattr(fb, "__name__", str(fb)),
+            "fonctions_disponibles": fonctions,
+            "nb_events_psg": len(evs),
+            "echantillon_psg": echantillon,
+        })
 
 
 @app.route("/refresh", methods=["POST"])
