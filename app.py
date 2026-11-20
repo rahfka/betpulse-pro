@@ -712,24 +712,28 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     a_att = (0.60 * st_a["bp"]) + (0.40 * st_a["bp_away"])
     a_def = (0.60 * st_a["bc"]) + (0.40 * st_a["bc_away"])
 
-    lam_h = max(((h_att * 1.08) + a_def) / 2.0, 0.35)
-    lam_a = max(((a_att * 0.92) + h_def) / 2.0, 0.35)
+    lam_h = max(((h_att * 1.12) + a_def) / 2.0, 0.35)
+    lam_a = max(((a_att * 0.90) + h_def) / 2.0, 0.35)
     p_h, p_n, p_a, p_ov25, p_un25, score_exact, best_h, best_a = simuler_poisson_foot(lam_h, lam_a)
 
     meilleure_victoire, prob_victoire = max(
         [(f"Victoire {h_nom}", p_h), (f"Victoire {a_nom}", p_a)],
         key=lambda x: x[1],
     )
+    ecart_victoires = abs(p_h - p_a)
+    buts_label = "+2.5 buts" if p_ov25 >= p_un25 else "-2.5 buts"
+    buts_proba = round(min(max(p_ov25, p_un25), 0.85) * 100, 1)
 
-    score_nul_probable = (best_h == best_a) and abs(p_n - prob_victoire) <= 0.08
-    if p_n >= prob_victoire or score_nul_probable:
-        choix, prob = "Match nul", max(p_n, prob_victoire)
+    est_nul = False
+    if (best_h == best_a and p_n >= 0.24) or (p_n >= 0.25 and (prob_victoire - p_n) <= 0.09):
+        choix, prob = "Match nul", max(p_n, prob_victoire if best_h == best_a else p_n)
         est_nul = True
+    elif ecart_victoires < 0.055 and max(p_ov25, p_un25) > prob_victoire + 0.06:
+        choix, prob = buts_label, max(p_ov25, p_un25)
     else:
         choix, prob = meilleure_victoire, prob_victoire
-        est_nul = False
 
-    plafond = 0.80 if (fiable and not est_nul) else (0.52 if est_nul else 0.64)
+    plafond = 0.80 if (fiable and not est_nul) else (0.55 if est_nul else 0.68)
     prob_cal = min(max(prob, 0.05), plafond)
     proba_pct = round(prob_cal * 100, 1)
 
@@ -739,9 +743,6 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         delta_sec = (dt_match - datetime.now(timezone.utc)).total_seconds()
         if 0 <= delta_sec <= 7200:
             est_imminent = True
-
-    buts_label = "+2.5 buts" if p_ov25 >= p_un25 else "-2.5 buts"
-    buts_proba = round(min(max(p_ov25, p_un25), 0.85) * 100, 1)
 
     prudence = "ELEVE" if (proba_pct >= 72 and fiable and not est_nul) else ("MODERE" if proba_pct >= 56 else "PRUDENT")
     conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, fiable, 0.0, est_nul=est_nul)
