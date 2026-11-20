@@ -392,6 +392,15 @@ def _obtenir_cles_favoris():
         return set(_FAVORIS_ACTIFS.keys())
 
 
+def _safe_float(val, default=None):
+    if val is None or str(val).strip() == "":
+        return default
+    try:
+        return float(str(val).strip().replace(",", "."))
+    except Exception:
+        return default
+
+
 def basculer_favori(item_data, force_etat=None):
     cle = str(item_data.get("cle_favori") or "").strip() or _construire_cle_favori(
         item_data.get("sport"),
@@ -411,6 +420,12 @@ def basculer_favori(item_data, force_etat=None):
 
         if ajouter:
             existant = _FAVORIS_ACTIFS.get(cle, {})
+            proba_val = _safe_float(item_data.get("proba"), existant.get("proba"))
+            cote_val = _safe_float(item_data.get("cote"), existant.get("cote"))
+            mise_val = _safe_float(item_data.get("mise_u"), existant.get("mise_u"))
+            conf_sc_val = _safe_float(item_data.get("confiance_score"), existant.get("confiance_score"))
+            ts_val = _safe_float(item_data.get("ts_match"), existant.get("ts_match") or 9_999_999_999.0)
+
             _FAVORIS_ACTIFS[cle] = {
                 "cle_favori": cle,
                 "sport": str(item_data.get("sport") or existant.get("sport") or "FOOT").upper(),
@@ -418,13 +433,13 @@ def basculer_favori(item_data, force_etat=None):
                 "match": str(item_data.get("match") or existant.get("match") or ""),
                 "competition": str(item_data.get("competition") or existant.get("competition") or ""),
                 "date_match": str(item_data.get("date_match") or existant.get("date_match") or ""),
-                "ts_match": float(item_data.get("ts_match") or existant.get("ts_match") or 9_999_999_999.0),
+                "ts_match": ts_val,
                 "choix": str(item_data.get("choix") or existant.get("choix") or ""),
-                "proba": item_data.get("proba", existant.get("proba")),
-                "cote": item_data.get("cote", existant.get("cote")),
-                "mise_u": item_data.get("mise_u", existant.get("mise_u")),
-                "confiance": item_data.get("confiance", existant.get("confiance")),
-                "confiance_score": item_data.get("confiance_score", existant.get("confiance_score")),
+                "proba": proba_val,
+                "cote": cote_val,
+                "mise_u": mise_val,
+                "confiance": str(item_data.get("confiance") or existant.get("confiance") or "MOYENNE"),
+                "confiance_score": conf_sc_val,
                 "detail": str(item_data.get("detail") or existant.get("detail") or ""),
                 "ajoute_le": existant.get("ajoute_le") or datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M"),
             }
@@ -435,6 +450,31 @@ def basculer_favori(item_data, force_etat=None):
         cles_actuelles = list(_FAVORIS_ACTIFS.keys())
 
     return ajouter, cles_actuelles
+
+
+def nettoyer_favoris_termines():
+    """Supprime tous les favoris actuellement marqués TERMINE."""
+    with _STATE_LOCK:
+        suivis = list(_DERNIER_RAPPORT.get("favoris_suivis") or [])
+        cles_a_supprimer = {
+            (it.get("cle_favori") or _construire_cle_favori(it.get("sport"), it.get("event_id"), it.get("match"), it.get("date_match")))
+            for it in suivis
+            if str(it.get("etat_match") or "").upper() == "TERMINE"
+        }
+
+    if not cles_a_supprimer:
+        return 0, len(_obtenir_cles_favoris())
+
+    with _FAV_LOCK:
+        supprimes = 0
+        for cle in cles_a_supprimer:
+            if _FAVORIS_ACTIFS.pop(cle, None) is not None:
+                supprimes += 1
+        if supprimes:
+            _sauvegarder_favoris_disque_locked()
+        restants = len(_FAVORIS_ACTIFS)
+
+    return supprimes, restants
 
 
 def _charger_rapport_disque():
@@ -1764,6 +1804,7 @@ def _construire_favoris_suivis(tous_items_a_venir, live_enrichis, clos_globaux, 
             courant["cle_favori"] = cle
             courant["est_favori"] = True
             courant.setdefault("etat_match", "EN_COURS" if courant.get("en_cours") else "A_VENIR")
+            courant["ajoute_le"] = meta.get("ajoute_le") or ""
             suivis.append(courant)
             continue
 
@@ -1817,6 +1858,7 @@ def _construire_favoris_suivis(tous_items_a_venir, live_enrichis, clos_globaux, 
                 "score_final": score_final,
                 "statut_prono": statut_prono,
                 "detail": meta.get("detail") or f"Match terminé ({sport_u})",
+                "ajoute_le": meta.get("ajoute_le") or "",
             })
             continue
 
@@ -1824,6 +1866,7 @@ def _construire_favoris_suivis(tous_items_a_venir, live_enrichis, clos_globaux, 
             prev_item = dict(anciens_suivis_map[cle])
             prev_item["cle_favori"] = cle
             prev_item["est_favori"] = True
+            prev_item.setdefault("ajoute_le", meta.get("ajoute_le") or "")
             suivis.append(prev_item)
         else:
             fallback_item = dict(meta)
@@ -1835,7 +1878,11 @@ def _construire_favoris_suivis(tous_items_a_venir, live_enrichis, clos_globaux, 
             fallback_item.setdefault("confiance_score", 50.0)
             suivis.append(fallback_item)
 
-    suivis.sort(key=_cle_cle_chronologique)
+    ordre_etat = {"EN_COURS": 0, "A_VENIR": 1, "TERMINE": 2}
+    suivis.sort(key=lambda x: (
+        ordre_etat.get(str(x.get("etat_match") or "A_VENIR").upper(), 1),
+        _cle_cle_chronologique(x),
+    ))
     return suivis
 
 
@@ -2673,13 +2720,23 @@ _HTML_PAGE = """<!doctype html>
       background: var(--accent); color: #0b1220; border: none; padding: 9px 15px;
       border-radius: 9px; cursor: pointer; font-weight: 700; text-decoration: none;
       display: inline-flex; align-items: center; gap: 6px; font-size: 0.88em;
-      transition: transform 0.12s ease, opacity 0.15s ease, background 0.15s ease;
+      transition: transform 0.12s ease, opacity 0.15s ease, background 0.15s ease, border-color 0.15s ease;
     }
     select { background: #0b1220; color: var(--text); border: 1px solid var(--border); font-weight: 600; }
     .btn-cat { background: var(--card); color: var(--text); border: 1px solid var(--border); font-weight: 600; }
     .btn-cat.active { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 700; }
-    button:hover, .btn:hover { opacity: 0.92; transform: translateY(-1px); }
-    button:disabled { opacity: 0.65; cursor: wait; transform: none; }
+    .btn-ghost {
+      background: rgba(15, 23, 42, 0.85); color: var(--text); border: 1px solid var(--border);
+      font-weight: 600; padding: 7px 12px; font-size: 0.82em;
+    }
+    .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-danger-ghost {
+      background: rgba(239, 68, 68, 0.1); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.35);
+      font-weight: 700; padding: 7px 12px; font-size: 0.82em;
+    }
+    .btn-danger-ghost:hover { background: rgba(239, 68, 68, 0.2); }
+    button:hover, .btn:hover { opacity: 0.94; transform: translateY(-1px); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
     .cat-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
     .toolbar {
       display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between;
@@ -2697,19 +2754,62 @@ _HTML_PAGE = """<!doctype html>
       padding: 6px 11px; border-radius: 20px; font-size: 0.8em; font-weight: 600;
     }
     .pill-btn.active { background: rgba(56, 189, 248, 0.18); color: var(--accent); border-color: var(--accent); }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 16px; margin-bottom: 26px; }
+
+    /* --- STYLE BOOKMAKER POUR LES FAVORIS --- */
+    .fav-summary-bar {
+      display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px;
+      background: linear-gradient(135deg, rgba(19, 29, 49, 0.95) 0%, rgba(24, 37, 63, 0.85) 100%);
+      border: 1px solid rgba(251, 191, 36, 0.28);
+      border-radius: 14px; padding: 14px 16px; margin-bottom: 18px;
+    }
+    .fav-kpis { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .fav-kpi {
+      background: rgba(11, 18, 32, 0.72); border: 1px solid var(--border);
+      padding: 6px 12px; border-radius: 999px; font-size: 0.82em; color: var(--muted);
+    }
+    .fav-kpi strong { color: var(--text); }
+    .fav-kpi.gold { border-color: rgba(251, 191, 36, 0.45); color: #fde68a; }
+    .fav-kpi.live { border-color: rgba(239, 68, 68, 0.45); color: #fca5a5; }
+    .fav-section-header {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      margin: 18px 0 10px 0; padding-bottom: 6px; border-bottom: 1px solid rgba(36, 51, 77, 0.75);
+    }
+    .fav-section-title {
+      font-size: 0.95em; font-weight: 800; letter-spacing: 0.03em; text-transform: uppercase;
+      display: flex; align-items: center; gap: 8px; color: #f8fafc;
+    }
+    .fav-count-pill {
+      background: rgba(56, 189, 248, 0.14); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.3);
+      padding: 2px 8px; border-radius: 999px; font-size: 0.78em; font-weight: 800;
+    }
+    .fav-slip-footer {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      margin-top: 10px; padding-top: 9px; border-top: 1px dashed rgba(148, 163, 184, 0.22);
+      font-size: 0.8em; color: var(--muted);
+    }
+    .odds-chip {
+      background: rgba(251, 191, 36, 0.14); color: #fde68a; border: 1px solid rgba(251, 191, 36, 0.38);
+      padding: 4px 9px; border-radius: 7px; font-weight: 800; font-size: 0.85em;
+    }
+    .fav-empty-box {
+      background: var(--card); border: 1px dashed var(--border); border-radius: 14px;
+      padding: 28px 20px; text-align: center; color: var(--muted); margin-bottom: 24px;
+    }
+    .fav-empty-box strong { color: var(--text); display: block; font-size: 1.05em; margin-bottom: 6px; }
+
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 16px; margin-bottom: 24px; }
     .card {
       background: var(--card); padding: 16px; border-radius: 12px;
       border: 1px solid var(--border); border-left: 4px solid var(--accent);
       box-shadow: 0 6px 14px rgba(0,0,0,0.18);
-      transition: transform 0.14s ease, background 0.14s ease, border-color 0.14s ease;
+      transition: transform 0.14s ease, background 0.14s ease, border-color 0.14s ease, opacity 0.18s ease;
     }
     .card:hover { background: var(--card-hover); transform: translateY(-2px); }
     .card.HAUTE { border-left-color: var(--green); }
     .card.MOYENNE { border-left-color: var(--orange); }
     .card.FAIBLE { border-left-color: var(--red); }
     .card.live-card { border-left-color: var(--red); border-color: rgba(239, 68, 68, 0.35); }
-    .card.termine-card { border-left-color: #64748b; opacity: 0.94; }
+    .card.termine-card { border-left-color: #64748b; opacity: 0.92; }
     .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
     .card-title { font-size: 1.02em; font-weight: 700; line-height: 1.3; display: flex; align-items: center; gap: 6px; min-width: 0; }
     .badges-right { display: flex; align-items: center; gap: 5px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
@@ -2777,6 +2877,7 @@ _HTML_PAGE = """<!doctype html>
     pre { white-space: pre-wrap; background: #0b1220; border: 1px solid var(--border); padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 0.85em; margin: 0; line-height: 1.5; }
     .notice { background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #bae6fd; padding: 10px 14px; border-radius: 10px; margin-bottom: 18px; font-size: 0.9em; }
     .notice.warn { background: rgba(245, 158, 11, 0.14); border-color: rgba(245, 158, 11, 0.45); color: #fde68a; }
+    .notice.ok { background: rgba(16, 185, 129, 0.14); border-color: rgba(16, 185, 129, 0.42); color: #a7f3d0; }
   </style>
 </head>
 <body>
@@ -2839,90 +2940,203 @@ _HTML_PAGE = """<!doctype html>
     {% endif %}
 
     {% if page_favoris or cat == 'favoris' %}
-    <h2>★ Matchs Favoris suivis ({{ r.favoris_suivis|length }})</h2>
-    <p class="meta" style="margin-top: -8px; margin-bottom: 14px;">
-      Les matchs cochés restent affichés même une fois terminés. Décocher l'étoile d'un match terminé le retire immédiatement de cette liste.
-    </p>
-    <div class="grid" id="favoris-grid">
-      {% for it in r.favoris_suivis %}
-      {% set conf = it.get('confiance', 'MOYENNE') %}
-      {% set conf_sc = it.get('confiance_score', 50.0) %}
-      {% set ts_m = it.get('ts_match', 9999999999.0) %}
-      {% set etat = it.get('etat_match', 'A_VENIR') %}
-      <div class="card {% if etat == 'TERMINE' %}termine-card{% elif etat == 'EN_COURS' %}live-card{% endif %} {{ conf }}"
-           data-fav-card="1"
-           data-cle-favori="{{ it.get('cle_favori', '') }}"
-           data-conf="{{ conf }}"
-           data-proba="{{ it.proba or 0 }}"
-           data-conf-score="{{ conf_sc }}"
-           data-ts="{{ ts_m }}"
-           data-search="{{ ((it.choix or '') ~ ' ' ~ (it.match or '') ~ ' ' ~ (it.competition or '') ~ ' ' ~ (it.score_final or '') ~ ' ' ~ (it.detail or ''))|lower }}">
-        <div class="card-top">
-          <div class="card-title">
-            {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}
-          </div>
-          <div class="badges-right">
-            {% if etat == 'TERMINE' %}
-              <span class="badge termine">TERMINÉ</span>
-              {% if it.get('statut_prono') == 'GAGNE' %}
-                <span class="badge gagne">GAGNÉ</span>
-              {% elif it.get('statut_prono') == 'PERDU' %}
-                <span class="badge perdu">PERDU</span>
-              {% endif %}
-            {% elif etat == 'EN_COURS' %}
-              <span class="badge live"><span class="dot-red"></span> EN COURS</span>
-            {% else %}
-              <span class="badge a-venir">À VENIR</span>
-            {% endif %}
-            <button type="button"
-                    class="star-btn active"
-                    title="Retirer des favoris"
-                    onclick="toggleFavori(this)"
-                    data-cle-favori="{{ it.get('cle_favori', '') }}"
-                    data-sport="{{ it.sport or 'FOOT' }}"
-                    data-event-id="{{ it.event_id or '' }}"
-                    data-match="{{ it.match or '' }}"
-                    data-competition="{{ it.competition or '' }}"
-                    data-date-match="{{ it.date_match or '' }}"
-                    data-ts-match="{{ ts_m }}"
-                    data-choix="{{ it.choix or '' }}"
-                    data-proba="{{ it.proba if it.proba is not none else '' }}"
-                    data-cote="{{ it.cote if it.cote is not none else '' }}"
-                    data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
-                    data-confiance="{{ conf }}"
-                    data-confiance-score="{{ conf_sc }}"
-                    data-detail="{{ it.detail or '' }}">★</button>
-          </div>
-        </div>
-        <div class="card-meta">
-          {{ it.competition or it.sport }} • {{ it.date_match }}
-        </div>
-        {% if etat == 'TERMINE' %}
-        <div class="final-score-box">
-          <span class="meta">Score final</span>
-          <span class="live-score-val">{{ it.score_final or 'Terminé' }}</span>
-        </div>
-        {% elif etat == 'EN_COURS' %}
-        <div class="live-score-box">
-          <span class="meta">Score actuel</span>
-          <span class="live-score-val">{{ it.score_actuel or 'En cours' }}</span>
-        </div>
-        {% endif %}
-        <div class="pred-box">
-          <div class="pred-label">Pronostic</div>
-          <div class="pred-choice">{{ it.choix or 'Non défini' }}</div>
-          <div class="pred-sub">
-            {% if it.proba is not none %}Proba : <strong>{{ it.proba }}%</strong>{% endif %}
-            {% if it.cote %} • Cote : <strong>{{ it.cote }}</strong>{% endif %}
-          </div>
-        </div>
-        {% if it.detail %}
-        <div class="card-detail">{{ it.detail }}</div>
-        {% endif %}
+    {% set fav_live = [] %}
+    {% set fav_upcoming = [] %}
+    {% set fav_done = [] %}
+    {% for it in r.favoris_suivis %}
+      {% set st_etat = (it.get('etat_match') or 'A_VENIR')|upper %}
+      {% if st_etat == 'EN_COURS' %}
+        {% set _ = fav_live.append(it) %}
+      {% elif st_etat == 'TERMINE' %}
+        {% set _ = fav_done.append(it) %}
+      {% else %}
+        {% set _ = fav_upcoming.append(it) %}
+      {% endif %}
+    {% endfor %}
+
+    <div class="fav-summary-bar" id="fav-summary-bar">
+      <div class="fav-kpis">
+        <span class="fav-kpi gold">★ Suivis : <strong id="kpi-fav-total">{{ r.favoris_suivis|length }}</strong></span>
+        <span class="fav-kpi live">● En cours : <strong id="kpi-fav-live">{{ fav_live|length }}</strong></span>
+        <span class="fav-kpi">⏱ À venir : <strong id="kpi-fav-upcoming">{{ fav_upcoming|length }}</strong></span>
+        <span class="fav-kpi">✓ Terminés : <strong id="kpi-fav-done">{{ fav_done|length }}</strong></span>
+      </div>
+      <div class="header-actions">
+        <button type="button" class="btn-ghost" onclick="setFavGroupFilter('ALL', this)" id="fav-filter-all">Tous</button>
+        <button type="button" class="btn-ghost" onclick="setFavGroupFilter('ACTIFS', this)" id="fav-filter-actifs">Actifs (Live + À venir)</button>
+        <button type="button" class="btn-danger-ghost" id="btn-clear-done" onclick="nettoyerTermines()" {% if fav_done|length == 0 %}disabled{% endif %}>
+          🗑 Effacer terminés (<span id="kpi-fav-done-btn">{{ fav_done|length }}</span>)
+        </button>
+      </div>
+    </div>
+
+    <div id="favoris-container">
+      {% if r.favoris_suivis|length == 0 %}
+      <div class="fav-empty-box" id="fav-empty-msg">
+        <strong>Aucun match dans votre liste de favoris</strong>
+        Cliquez sur ☆ sur n'importe quel match (En cours, Top Pronostics, Foot ou Tennis) pour l'épingler ici et suivre son résultat même après la fin.
       </div>
       {% else %}
-      <div class="card" id="fav-empty-msg">Aucun match favori pour le moment. Cliquez sur ☆ sur n'importe quel match pour le suivre ici (y compris après la fin du match).</div>
-      {% endfor %}
+
+      <div class="fav-group-section" data-fav-group="ACTIFS" id="fav-sec-live" {% if fav_live|length == 0 %}style="display:none;"{% endif %}>
+        <div class="fav-section-header">
+          <div class="fav-section-title"><span class="dot-red"></span> En direct <span class="fav-count-pill" id="cnt-fav-live">{{ fav_live|length }}</span></div>
+        </div>
+        <div class="grid" id="fav-grid-live">
+          {% for it in fav_live %}
+          {% set conf = it.get('confiance', 'MOYENNE') %}
+          {% set conf_sc = it.get('confiance_score', 50.0) %}
+          {% set ts_m = it.get('ts_match', 9999999999.0) %}
+          <div class="card live-card {{ conf }}"
+               data-fav-card="1"
+               data-fav-state="EN_COURS"
+               data-cle-favori="{{ it.get('cle_favori', '') }}"
+               data-conf="{{ conf }}"
+               data-proba="{{ it.proba or 0 }}"
+               data-conf-score="{{ conf_sc }}"
+               data-ts="{{ ts_m }}"
+               data-search="{{ ((it.choix or '') ~ ' ' ~ (it.match or '') ~ ' ' ~ (it.competition or '') ~ ' ' ~ (it.score_actuel or '') ~ ' ' ~ (it.detail or ''))|lower }}">
+            <div class="card-top">
+              <div class="card-title">{% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}</div>
+              <div class="badges-right">
+                <span class="badge live"><span class="dot-red"></span> {{ it.chrono_live or 'LIVE' }}</span>
+                <button type="button" class="star-btn active" title="Retirer des favoris" onclick="toggleFavori(this)"
+                        data-cle-favori="{{ it.get('cle_favori', '') }}" data-sport="{{ it.sport or 'FOOT' }}"
+                        data-event-id="{{ it.event_id or '' }}" data-match="{{ it.match or '' }}"
+                        data-competition="{{ it.competition or '' }}" data-date-match="{{ it.date_match or '' }}"
+                        data-ts-match="{{ ts_m }}" data-choix="{{ it.choix or '' }}"
+                        data-proba="{{ it.proba if it.proba is not none else '' }}" data-cote="{{ it.cote if it.cote is not none else '' }}"
+                        data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}" data-confiance="{{ conf }}"
+                        data-confiance-score="{{ conf_sc }}" data-detail="{{ it.detail or '' }}">★</button>
+              </div>
+            </div>
+            <div class="card-meta">{{ it.competition or it.sport }} • {{ it.date_match }}</div>
+            <div class="live-score-box">
+              <span class="meta">Score en direct</span>
+              <span class="live-score-val">{{ it.score_actuel or 'En cours' }}</span>
+            </div>
+            <div class="pred-box">
+              <div class="pred-label">Sélection suivie</div>
+              <div class="pred-choice">{{ it.choix or 'Non défini' }}</div>
+              <div class="pred-sub">
+                {% if it.proba is not none %}Proba : <strong>{{ it.proba }}%</strong>{% endif %}
+                {% if it.cote %} • Cote : <strong>{{ it.cote }}</strong>{% endif %}
+              </div>
+            </div>
+            <div class="fav-slip-footer">
+              <span>Mise suggérée : <strong>{{ it.mise_u if it.mise_u is not none else '-' }}u</strong></span>
+              {% if it.cote %}<span class="odds-chip">@ {{ it.cote }}</span>{% endif %}
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="fav-group-section" data-fav-group="ACTIFS" id="fav-sec-upcoming" {% if fav_upcoming|length == 0 %}style="display:none;"{% endif %}>
+        <div class="fav-section-header">
+          <div class="fav-section-title">⏱ À venir <span class="fav-count-pill" id="cnt-fav-upcoming">{{ fav_upcoming|length }}</span></div>
+        </div>
+        <div class="grid" id="fav-grid-upcoming">
+          {% for it in fav_upcoming %}
+          {% set conf = it.get('confiance', 'MOYENNE') %}
+          {% set conf_sc = it.get('confiance_score', 50.0) %}
+          {% set ts_m = it.get('ts_match', 9999999999.0) %}
+          <div class="card {{ conf }}"
+               data-fav-card="1"
+               data-fav-state="A_VENIR"
+               data-cle-favori="{{ it.get('cle_favori', '') }}"
+               data-conf="{{ conf }}"
+               data-proba="{{ it.proba or 0 }}"
+               data-conf-score="{{ conf_sc }}"
+               data-ts="{{ ts_m }}"
+               data-search="{{ ((it.choix or '') ~ ' ' ~ (it.match or '') ~ ' ' ~ (it.competition or '') ~ ' ' ~ (it.detail or ''))|lower }}">
+            <div class="card-top">
+              <div class="card-title">{% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}</div>
+              <div class="badges-right">
+                <span class="badge a-venir">À VENIR</span>
+                <button type="button" class="star-btn active" title="Retirer des favoris" onclick="toggleFavori(this)"
+                        data-cle-favori="{{ it.get('cle_favori', '') }}" data-sport="{{ it.sport or 'FOOT' }}"
+                        data-event-id="{{ it.event_id or '' }}" data-match="{{ it.match or '' }}"
+                        data-competition="{{ it.competition or '' }}" data-date-match="{{ it.date_match or '' }}"
+                        data-ts-match="{{ ts_m }}" data-choix="{{ it.choix or '' }}"
+                        data-proba="{{ it.proba if it.proba is not none else '' }}" data-cote="{{ it.cote if it.cote is not none else '' }}"
+                        data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}" data-confiance="{{ conf }}"
+                        data-confiance-score="{{ conf_sc }}" data-detail="{{ it.detail or '' }}">★</button>
+              </div>
+            </div>
+            <div class="card-meta">{{ it.competition or it.sport }} • {{ it.date_match }}</div>
+            <div class="pred-box">
+              <div class="pred-label">Sélection suivie</div>
+              <div class="pred-choice">{{ it.choix or 'Non défini' }}</div>
+              <div class="pred-sub">
+                {% if it.proba is not none %}Proba : <strong>{{ it.proba }}%</strong>{% endif %}
+                • Confiance : <strong>{{ conf }}</strong>
+              </div>
+            </div>
+            <div class="fav-slip-footer">
+              <span>Mise : <strong>{{ it.mise_u if it.mise_u is not none else '-' }}u</strong></span>
+              {% if it.cote %}<span class="odds-chip">@ {{ it.cote }}</span>{% endif %}
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+
+      <div class="fav-group-section" data-fav-group="TERMINE" id="fav-sec-done" {% if fav_done|length == 0 %}style="display:none;"{% endif %}>
+        <div class="fav-section-header">
+          <div class="fav-section-title">✓ Terminés <span class="fav-count-pill" id="cnt-fav-done">{{ fav_done|length }}</span></div>
+        </div>
+        <div class="grid" id="fav-grid-done">
+          {% for it in fav_done %}
+          {% set conf = it.get('confiance', 'MOYENNE') %}
+          {% set conf_sc = it.get('confiance_score', 50.0) %}
+          {% set ts_m = it.get('ts_match', 9999999999.0) %}
+          <div class="card termine-card {{ conf }}"
+               data-fav-card="1"
+               data-fav-state="TERMINE"
+               data-cle-favori="{{ it.get('cle_favori', '') }}"
+               data-conf="{{ conf }}"
+               data-proba="{{ it.proba or 0 }}"
+               data-conf-score="{{ conf_sc }}"
+               data-ts="{{ ts_m }}"
+               data-search="{{ ((it.choix or '') ~ ' ' ~ (it.match or '') ~ ' ' ~ (it.competition or '') ~ ' ' ~ (it.score_final or '') ~ ' ' ~ (it.detail or ''))|lower }}">
+            <div class="card-top">
+              <div class="card-title">{% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}</div>
+              <div class="badges-right">
+                <span class="badge termine">TERMINÉ</span>
+                {% if it.get('statut_prono') == 'GAGNE' %}
+                  <span class="badge gagne">GAGNÉ</span>
+                {% elif it.get('statut_prono') == 'PERDU' %}
+                  <span class="badge perdu">PERDU</span>
+                {% endif %}
+                <button type="button" class="star-btn active" title="Retirer des favoris" onclick="toggleFavori(this)"
+                        data-cle-favori="{{ it.get('cle_favori', '') }}" data-sport="{{ it.sport or 'FOOT' }}"
+                        data-event-id="{{ it.event_id or '' }}" data-match="{{ it.match or '' }}"
+                        data-competition="{{ it.competition or '' }}" data-date-match="{{ it.date_match or '' }}"
+                        data-ts-match="{{ ts_m }}" data-choix="{{ it.choix or '' }}"
+                        data-proba="{{ it.proba if it.proba is not none else '' }}" data-cote="{{ it.cote if it.cote is not none else '' }}"
+                        data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}" data-confiance="{{ conf }}"
+                        data-confiance-score="{{ conf_sc }}" data-detail="{{ it.detail or '' }}">★</button>
+              </div>
+            </div>
+            <div class="card-meta">{{ it.competition or it.sport }} • {{ it.date_match }}</div>
+            <div class="final-score-box">
+              <span class="meta">Score final</span>
+              <span class="live-score-val">{{ it.score_final or 'Terminé' }}</span>
+            </div>
+            <div class="pred-box">
+              <div class="pred-label">Pronostic</div>
+              <div class="pred-choice">{{ it.choix or 'Non défini' }}</div>
+              <div class="pred-sub">
+                {% if it.proba is not none %}Proba : <strong>{{ it.proba }}%</strong>{% endif %}
+                {% if it.cote %} • Cote : <strong>{{ it.cote }}</strong>{% endif %}
+              </div>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
     </div>
     {% endif %}
 
@@ -3241,12 +3455,14 @@ _HTML_PAGE = """<!doctype html>
 
   <script>
     let confActif = "ALL";
+    let favGroupFilter = "ALL";
     const PAGE_FAVORIS = {{ "true" if (page_favoris or cat == "favoris") else "false" }};
     const TOKEN_REQUIS = {{ "true" if token_requis else "false" }};
 
-    function afficherBanniere(msg) {
+    function afficherBanniere(msg, type = "warn") {
       const b = document.getElementById("action-banner");
       if (!b) return;
+      b.className = "notice " + type;
       b.textContent = msg;
       b.style.display = msg ? "" : "none";
     }
@@ -3315,23 +3531,87 @@ _HTML_PAGE = """<!doctype html>
       appliquerFiltres();
     }
 
+    function setFavGroupFilter(mode, btn) {
+      favGroupFilter = mode;
+      document.querySelectorAll("#fav-filter-all, #fav-filter-actifs").forEach(b => {
+        b.classList.toggle("active", b === btn);
+      });
+      appliquerFiltres();
+    }
+
+    function rafraichirCompteursFavoris() {
+      const allFavCards = Array.from(document.querySelectorAll("#favoris-container .card[data-fav-card]"));
+      const liveCards = allFavCards.filter(c => c.dataset.favState === "EN_COURS");
+      const upCards = allFavCards.filter(c => c.dataset.favState === "A_VENIR");
+      const doneCards = allFavCards.filter(c => c.dataset.favState === "TERMINE");
+
+      const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+      setTxt("kpi-fav-total", allFavCards.length);
+      setTxt("kpi-fav-live", liveCards.length);
+      setTxt("kpi-fav-upcoming", upCards.length);
+      setTxt("kpi-fav-done", doneCards.length);
+      setTxt("kpi-fav-done-btn", doneCards.length);
+      setTxt("cnt-fav-live", liveCards.length);
+      setTxt("cnt-fav-upcoming", upCards.length);
+      setTxt("cnt-fav-done", doneCards.length);
+
+      const btnClear = document.getElementById("btn-clear-done");
+      if (btnClear) btnClear.disabled = (doneCards.length === 0);
+
+      const secLive = document.getElementById("fav-sec-live");
+      const secUp = document.getElementById("fav-sec-upcoming");
+      const secDone = document.getElementById("fav-sec-done");
+
+      if (secLive) {
+        secLive.style.display = (liveCards.length > 0 && favGroupFilter !== "TERMINE") ? "" : "none";
+      }
+      if (secUp) {
+        secUp.style.display = (upCards.length > 0 && favGroupFilter !== "TERMINE") ? "" : "none";
+      }
+      if (secDone) {
+        secDone.style.display = (doneCards.length > 0 && favGroupFilter !== "ACTIFS") ? "" : "none";
+      }
+
+      const container = document.getElementById("favoris-container");
+      if (container && allFavCards.length === 0 && !document.getElementById("fav-empty-msg")) {
+        const emptyDiv = document.createElement("div");
+        emptyDiv.className = "fav-empty-box";
+        emptyDiv.id = "fav-empty-msg";
+        emptyDiv.innerHTML = "<strong>Aucun match dans votre liste de favoris</strong>Cliquez sur ☆ sur n'importe quel match pour l'épingler ici.";
+        container.appendChild(emptyDiv);
+      } else if (allFavCards.length > 0) {
+        const emptyMsg = document.getElementById("fav-empty-msg");
+        if (emptyMsg) emptyMsg.remove();
+      }
+    }
+
     function appliquerFiltres() {
       const q = (document.getElementById("search-input")?.value || "").trim().toLowerCase();
       const probaMin = parseFloat(document.getElementById("proba-min")?.value || "0") || 0;
       let totalCartes = 0;
       let visibles = 0;
+
       document.querySelectorAll(".grid .card[data-conf]").forEach(card => {
         totalCartes += 1;
         const cConf = card.getAttribute("data-conf") || "";
         const cProba = parseFloat(card.getAttribute("data-proba") || "0") || 0;
         const cText = card.getAttribute("data-search") || "";
+        const favState = card.getAttribute("data-fav-state") || "";
+
+        let okGroup = true;
+        if (PAGE_FAVORIS && favState) {
+          if (favGroupFilter === "ACTIFS") okGroup = (favState !== "TERMINE");
+          if (favGroupFilter === "TERMINE") okGroup = (favState === "TERMINE");
+        }
+
         const okConf = (confActif === "ALL") || (cConf === confActif);
         const okProba = cProba >= probaMin;
         const okText = !q || cText.includes(q);
-        const show = okConf && okProba && okText;
+        const show = okGroup && okConf && okProba && okText;
         card.style.display = show ? "" : "none";
         if (show) visibles += 1;
       });
+
       const cpt = document.getElementById("compteur-cartes");
       if (cpt && totalCartes > 0) {
         cpt.textContent = `${visibles}/${totalCartes} affichés`;
@@ -3407,27 +3687,48 @@ _HTML_PAGE = """<!doctype html>
           if (PAGE_FAVORIS && !estFav) {
             const favCard = btn.closest(".card[data-fav-card]");
             if (favCard) favCard.remove();
-            const remaining = document.querySelectorAll("#favoris-grid .card[data-fav-card]").length;
-            if (remaining === 0) {
-              const grid = document.getElementById("favoris-grid");
-              if (grid && !document.getElementById("fav-empty-msg")) {
-                const emptyDiv = document.createElement("div");
-                emptyDiv.className = "card";
-                emptyDiv.id = "fav-empty-msg";
-                emptyDiv.textContent = "Aucun match favori pour le moment.";
-                grid.appendChild(emptyDiv);
-              }
-            }
+            rafraichirCompteursFavoris();
           }
           appliquerFiltres();
         }
       } catch (e) {
+        afficherBanniere("Impossible de mettre à jour les favoris pour le moment.");
       } finally {
         btn.disabled = false;
       }
     }
 
+    async function nettoyerTermines() {
+      const btn = document.getElementById("btn-clear-done");
+      if (btn) btn.disabled = true;
+      try {
+        const res = await fetch("/api/favoris/clear-done", { method: "POST" });
+        if (res.ok) {
+          const data = await res.json();
+          document.querySelectorAll('#favoris-container .card[data-fav-state="TERMINE"]').forEach(c => c.remove());
+          if (typeof data.total_favoris === "number") {
+            const tCpt = document.getElementById("fav-count-tab");
+            if (tCpt) tCpt.textContent = data.total_favoris;
+          }
+          rafraichirCompteursFavoris();
+          appliquerFiltres();
+          if ((data.supprimes || 0) > 0) {
+            afficherBanniere(`${data.supprimes} match(s) terminé(s) retiré(s) des favoris.`, "ok");
+          }
+        }
+      } catch (e) {
+        afficherBanniere("Erreur lors du nettoyage des matchs terminés.");
+      } finally {
+        rafraichirCompteursFavoris();
+      }
+    }
+
     trierCartes();
+    if (PAGE_FAVORIS) {
+      const allBtn = document.getElementById("fav-filter-all");
+      if (allBtn) allBtn.classList.add("active");
+      rafraichirCompteursFavoris();
+    }
     appliquerFiltres();
   </script>
 </body>
@@ -3528,7 +3829,11 @@ def api_favoris_toggle():
                     meta.setdefault("etat_match", "A_VENIR")
                     meta["est_favori"] = True
                     suivis_actuels.append(meta)
-                    suivis_actuels.sort(key=_cle_cle_chronologique)
+                    ordre_etat = {"EN_COURS": 0, "A_VENIR": 1, "TERMINE": 2}
+                    suivis_actuels.sort(key=lambda x: (
+                        ordre_etat.get(str(x.get("etat_match") or "A_VENIR").upper(), 1),
+                        _cle_cle_chronologique(x),
+                    ))
                     _DERNIER_RAPPORT["favoris_suivis"] = suivis_actuels
             _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
             rapport_copie = dict(_DERNIER_RAPPORT)
@@ -3543,6 +3848,26 @@ def api_favoris_toggle():
         "cle_favori": cle,
         "est_favori": est_fav,
         "total_favoris": len(cles_actuelles),
+    }), 200
+
+
+@app.route("/api/favoris/clear-done", methods=["POST"])
+def api_favoris_clear_done():
+    supprimes, total_restants = nettoyer_favoris_termines()
+    with _STATE_LOCK:
+        if _DERNIER_RAPPORT.get("mis_a_jour"):
+            _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
+            rapport_copie = dict(_DERNIER_RAPPORT)
+        else:
+            rapport_copie = None
+
+    if rapport_copie and rapport_copie.get("mis_a_jour"):
+        _sauvegarder_rapport_disque(rapport_copie)
+
+    return jsonify({
+        "ok": True,
+        "supprimes": supprimes,
+        "total_favoris": total_restants,
     }), 200
 
 
