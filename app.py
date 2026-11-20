@@ -52,6 +52,9 @@ STATUTS_TERMINES = {
 }
 STATUTS_TERMINES_OU_EN_COURS = STATUTS_TERMINES | {"in_progress", "live"}
 
+MOTS_ALERTE_FORT = ("forfait", "blessure", "blessé", "blessée", "opéré", "opérée", "rupture", "absent", "absente", "suspendu", "out", "injured")
+MOTS_ALERTE_FAIBLE = ("incertain", "incertaine", "doute", "gêne", "repris", "doubtful", "knock")
+
 
 @dataclass(frozen=True)
 class Config:
@@ -318,16 +321,16 @@ def moyenne_ponderee_shrinkage(valeurs, prior_moyenne, prior_poids=3.0):
     return ((moy_obs * somme_poids) + (prior_moyenne * prior_poids)) / (somme_poids + prior_poids)
 
 
-def _calculer_indice_confiance(proba_pct, fiable, nb_alertes):
+def _calculer_indice_confiance(proba_pct, fiable, gravite_alerte=0.0):
     score = proba_pct
     if not fiable:
-        score -= 14.0
-    if nb_alertes > 0:
-        score -= min(nb_alertes * 8.0, 20.0)
+        score -= 15.0
+    if gravite_alerte > 0.0:
+        score -= min(gravite_alerte * 10.0, 22.0)
     score = round(max(10.0, min(95.0, score)), 1)
-    if fiable and nb_alertes == 0 and score >= 62.0:
+    if fiable and gravite_alerte == 0.0 and score >= 60.0:
         niveau = "HAUTE"
-    elif score >= 50.0:
+    elif score >= 49.0:
         niveau = "MOYENNE"
     else:
         niveau = "FAIBLE"
@@ -424,10 +427,10 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8)
     bp_away.reverse()
     bc_away.reverse()
     nb_matchs = v + n + d
-    a_historique = nb_matchs > 0
+    a_historique = nb_matchs >= 3
 
     return {
-        "forme": f"{v}V-{n}N-{d}D" if a_historique else "Forme récente",
+        "forme": f"{v}V-{n}N-{d}D" if nb_matchs > 0 else "Forme récente",
         "a_historique": a_historique,
         "nb_matchs": nb_matchs,
         "bp": moyenne_ponderee_shrinkage(bp_all, 1.30, prior_poids=3.0),
@@ -437,6 +440,19 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8)
         "bp_away": moyenne_ponderee_shrinkage(bp_away, 1.15, prior_poids=2.5),
         "bc_away": moyenne_ponderee_shrinkage(bc_away, 1.35, prior_poids=2.5),
     }
+
+
+def _evaluer_gravite_titres(titres):
+    gravite = 0.0
+    for t in titres or []:
+        tl = str(t).lower()
+        if any(m in tl for m in MOTS_ALERTE_FORT):
+            gravite += 1.0
+        elif any(m in tl for m in MOTS_ALERTE_FAIBLE):
+            gravite += 0.5
+        else:
+            gravite += 0.35
+    return min(gravite, 2.5)
 
 
 def _requete_rss(requete_brute, max_titres=2):
@@ -462,7 +478,8 @@ def scanner_sante_cible(cible, max_titres=2):
     if cached is not None:
         return list(cached)
 
-    res = _requete_rss(f'"{cible}" (blessure OR forfait OR incertain OR absent) when:3d', max_titres)
+    requete = f'"{cible}" (blessure OR forfait OR incertain OR absent) (match OR équipe OR foot OR tennis OR ATP OR WTA) when:3d'
+    res = _requete_rss(requete, max_titres)
     _cache_set(_CACHE_SANTE, cle, res)
     return list(res)
 
@@ -492,7 +509,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         key=lambda x: x[1],
     )
 
-    plafond = 0.82 if fiable else 0.65
+    plafond = 0.80 if fiable else 0.64
     prob_cal = min(max(prob, 0.05), plafond)
     proba_pct = round(prob_cal * 100, 1)
 
@@ -500,7 +517,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     buts_proba = round(min(max(p_ov25, p_un25), 0.85) * 100, 1)
 
     prudence = "ELEVE" if (proba_pct >= 72 and fiable) else ("MODERE" if proba_pct >= 56 else "PRUDENT")
-    conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, fiable, 0)
+    conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, fiable, 0.0)
 
     return {
         "sport": "FOOT",
@@ -676,14 +693,14 @@ def analyser_tennis(heures_max=48):
                     continue
                 r1, r2 = trouver_rang(j1, rk_map), trouver_rang(j2, rk_map)
                 complet = r1 is not None and r2 is not None
-                diff = (math.log((r2 or 150) + 1) - math.log((r1 or 150) + 1)) * (0.75 if complet else 0.30)
+                diff = (math.log((r2 or 180) + 1) - math.log((r1 or 180) + 1)) * (0.68 if complet else 0.25)
                 p1 = 1 / (1 + math.exp(-diff))
                 favori, prob = (j1, p1) if p1 >= 0.5 else (j2, 1 - p1)
-                plafond = 0.80 if complet else 0.62
+                plafond = 0.78 if complet else 0.60
                 prob = min(max(prob, 0.50), plafond)
 
                 proba_pct = round(max(0.05, prob) * 100, 1)
-                conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, complet, 0)
+                conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, complet, 0.0)
                 simples.append({
                     "sport": "TENNIS",
                     "competition": t_name or "Tennis",
@@ -714,7 +731,7 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
                 equipes_a_scanner.add(nom)
 
     alertes_globales = {}
-    penalites = {}
+    gravites = {}
 
     def scanner(nom):
         try:
@@ -726,7 +743,7 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
         for nom, titres in ex.map(scanner, equipes_a_scanner):
             if titres:
                 alertes_globales[nom] = titres
-                penalites[nom] = len(titres)
+                gravites[nom] = _evaluer_gravite_titres(titres)
 
     liste_a_maj = list(items_cibles)
     if tous_les_items:
@@ -737,14 +754,15 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
                 ids_vus.add(id(x))
 
     for it in liste_a_maj:
-        nb = sum(penalites.get(n, 0) for n in it.get("equipes", []))
-        if nb:
-            it["proba"] = round(max(0.05, it["proba"] / 100 - min(nb * 0.03, 0.10)) * 100, 1)
-            it["prudence"] = "MODERE" if it["proba"] >= 62 else "PRUDENT (alerte)"
+        grav = sum(gravites.get(n, 0.0) for n in it.get("equipes", []))
+        if grav > 0.0:
+            penalite_proba = min(grav * 0.025, 0.09)
+            it["proba"] = round(max(0.05, it["proba"] / 100 - penalite_proba) * 100, 1)
+            it["prudence"] = "MODERE" if (it["proba"] >= 62 and grav < 1.0) else "PRUDENT (alerte)"
         conf_score, conf_niveau = _calculer_indice_confiance(
             it.get("proba", 50.0),
             bool(it.get("fiable", True)),
-            nb,
+            grav,
         )
         it["confiance"] = conf_niveau
         it["confiance_score"] = conf_score
