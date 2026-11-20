@@ -8,6 +8,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
@@ -41,7 +42,6 @@ def _charger_module_sport(nom_francais, nom_anglais):
     raise ImportError(f"Impossible d'importer '{nom_francais}' ni '{nom_anglais}'.")
 
 
-bt = _charger_module_sport("compétences_sportives.paris", "sports_skills.betting")
 fb = _charger_module_sport("compétences_sportives.football", "sports_skills.football")
 tn = _charger_module_sport("compétences_sportives.tennis", "sports_skills.tennis")
 
@@ -51,7 +51,9 @@ STATUTS_TERMINES = {
     "closed", "final", "post", "completed", "finished",
     "ft", "aet", "pen", "status_final", "status_post",
 }
-STATUTS_TERMINES_OU_EN_COURS = STATUTS_TERMINES | {"in_progress", "live"}
+STATUTS_EXCLUS_AVENIR = STATUTS_TERMINES | {
+    "in_progress", "live", "postponed", "cancelled", "canceled", "suspended",
+}
 
 MOTS_ALERTE_FORT = (
     "forfait", "blessure", "blessé", "blessée", "opéré", "opérée",
@@ -74,11 +76,11 @@ class Config:
     activer_debug_routes: bool = field(
         default_factory=lambda: os.getenv("ACTIVER_DEBUG_ROUTES", "false").strip().lower() in ("1", "true", "yes")
     )
+    odds_api_key: str = field(default_factory=lambda: os.getenv("ODDS_API_KEY", "").strip())
+    odds_cache_ttl_sec: int = field(default_factory=lambda: max(300, int(os.getenv("ODDS_CACHE_TTL_SEC", "7200"))))
 
 
 CFG = Config()
-ODDS_API_KEY = os.getenv("ODDS_API_KEY", "").strip()
-ODDS_CACHE_TTL_SEC = max(300, int(os.getenv("ODDS_CACHE_TTL_SEC", "7200")))
 
 MAP_COMP_ODDS_API = {
     "ligue-1": "soccer_france_ligue_one",
@@ -126,6 +128,10 @@ class _CacheBorne:
                 self._data[cle] = (now, val)
                 while len(self._data) > self._max_taille:
                     self._data.popitem(last=False)
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
 
 
 def _resoudre_chemin_historique():
@@ -328,7 +334,7 @@ def _cle_dedup_evenement(ev, fallback_idx=0):
 
 def _est_match_a_venir_dans_fenetre(ev, heures_max):
     statut = str(ev.get("status") or "").strip().lower()
-    if statut in STATUTS_TERMINES_OU_EN_COURS:
+    if statut in STATUTS_EXCLUS_AVENIR:
         return False
 
     date_str = str(ev.get("start_time") or ev.get("date") or "").strip()
@@ -437,7 +443,8 @@ def _calculer_cote_min_et_mise(proba_pct, conf_score, fiable, est_nul=False):
 
 
 def _normaliser_nom_equipe(nom):
-    s = re.sub(r"\b(fc|sc|ac|as|rc|rcd|cf|ud|cd|afc|ssc|sl|sd)\b", " ", str(nom or "").lower())
+    s = unicodedata.normalize("NFKD", str(nom or "")).encode("ascii", "ignore").decode("ascii").lower()
+    s = re.sub(r"\b(fc|sc|ac|as|rc|rcd|cf|ud|cd|afc|ssc|sl|sd)\b", " ", s)
     s = re.sub(r"[^a-z0-9\s]", " ", s)
     return " ".join(s.split())
 
@@ -451,7 +458,7 @@ def _memes_equipes(nom_a, nom_b):
 
 
 def charger_cotes_moyennes_foot(competitions):
-    if not ODDS_API_KEY:
+    if not CFG.odds_api_key:
         return {}
 
     cotes_map = {}
@@ -462,13 +469,13 @@ def charger_cotes_moyennes_foot(competitions):
         if not sport_key:
             continue
 
-        cached = _CACHE_COTES_MARCHE.get(sport_key, ODDS_CACHE_TTL_SEC)
+        cached = _CACHE_COTES_MARCHE.get(sport_key, CFG.odds_cache_ttl_sec)
         if cached is None:
             try:
                 resp = _HTTP_SESSION.get(
                     f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds/",
                     params={
-                        "apiKey": ODDS_API_KEY,
+                        "apiKey": CFG.odds_api_key,
                         "regions": "eu,fr,uk",
                         "markets": "h2h",
                         "oddsFormat": "decimal",
@@ -1002,7 +1009,7 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
         except Exception:
             return nom, []
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         for nom, titres in ex.map(scanner, equipes_a_scanner):
             if titres:
                 alertes_globales[nom] = titres
@@ -1085,21 +1092,21 @@ def _resoudre_statut_depuis_evenement(row, ev):
         for item in scores:
             if item["qualifier"] == "home":
                 h_sc = item["score"]
-                h_nm = item["name"].lower()
+                h_nm = _normaliser_nom_equipe(item["name"])
             elif item["qualifier"] == "away":
                 a_sc = item["score"]
-                a_nm = item["name"].lower()
+                a_nm = _normaliser_nom_equipe(item["name"])
         if len(scores) >= 2 and (h_sc is None or a_sc is None):
             h_sc = scores[0]["score"]
-            h_nm = scores[0]["name"].lower()
+            h_nm = _normaliser_nom_equipe(scores[0]["name"])
             a_sc = scores[1]["score"]
-            a_nm = scores[1]["name"].lower()
+            a_nm = _normaliser_nom_equipe(scores[1]["name"])
         if h_sc is None or a_sc is None:
             return None
         if choix_l == "match nul":
             return "GAGNE" if h_sc == a_sc else "PERDU"
         if choix_l.startswith("victoire "):
-            cible = choix_l.replace("victoire ", "", 1).strip()
+            cible = _normaliser_nom_equipe(choix_l.replace("victoire ", "", 1))
             if cible and h_nm and (cible == h_nm or cible in h_nm or h_nm in cible):
                 return "GAGNE" if h_sc > a_sc else "PERDU"
             if cible and a_nm and (cible == a_nm or cible in a_nm or a_nm in cible):
@@ -1107,7 +1114,7 @@ def _resoudre_statut_depuis_evenement(row, ev):
         return None
 
     if sport == "TENNIS" and choix_l.startswith("victoire "):
-        cible = choix_l.replace("victoire ", "", 1).strip()
+        cible = choix_l.replace("victoire ", "", 1).strip().lower()
         if not cible:
             return None
         for item in scores:
@@ -1331,7 +1338,7 @@ def executer_analyse():
                 bilan = dict(_DERNIER_RAPPORT.get("bilan") or {})
 
         synthese = "\n".join(
-            f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')} | Mise {x.get('mise_u', 1.0)}u | Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')})] "
+            f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')} | Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')})] "
             f"{x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
             for x in top_sur[:8]
         ) or f"Aucun match à venir dans les prochaines {CFG.fenetre_heures}h."
@@ -1583,7 +1590,7 @@ _HTML_HOME = """<!doctype html>
         }
         if (d.mis_a_jour) metaEl.textContent = "Dernière analyse : " + d.mis_a_jour;
       }
-    } catch (e) { /* blip réseau, on retente */ }
+    } catch (e) {}
     setTimeout(check, POLL_MS);
   }
   setTimeout(check, 300);
@@ -1826,7 +1833,7 @@ _HTML_PAGE = """<!doctype html>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 1.0) }}u</strong>
+          {{ it.date_match }} — {{ it.competition }}
           {% if it.get('score_exact') %}
           <br><span style="color: var(--accent); font-weight: 600;">Score exact prédit : {{ it.score_exact }}</span>
           {% endif %}
@@ -1877,7 +1884,7 @@ _HTML_PAGE = """<!doctype html>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} • Mise : <strong>{{ it.get('mise_u', 1.0) }}u</strong>
+          {{ it.date_match }}
           {% if it.get('score_exact') %}
           <br><span style="color: var(--accent); font-weight: 600;">Score exact prédit : {{ it.score_exact }}</span>
           {% endif %}
@@ -1921,7 +1928,7 @@ _HTML_PAGE = """<!doctype html>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 1.0) }}u</strong>
+          {{ it.date_match }} — {{ it.competition }}
         </div>
         <div class="conf-meter">
           <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
