@@ -60,6 +60,10 @@ MOTS_ALERTE_FORT = (
     "rupture", "suspendu", "injured",
 )
 MOTS_ALERTE_FAIBLE = ("incertain", "incertaine", "doute", "gêne", "doubtful", "knock")
+MOTS_BRUIT_RSS = (
+    "rumeur", "mercato", "transfert", "interview", "podcast", "quiz",
+    "pronostic", "pronostics", "cote", "cotes", "direct live", "résumé",
+)
 
 
 @dataclass(frozen=True)
@@ -702,10 +706,44 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8)
     }
 
 
-def _evaluer_gravite_titres(titres):
-    gravite = 0.0
+def _titre_est_pertinent_pour_cible(titre, cible):
+    t_str = str(titre or "").strip()
+    if not t_str:
+        return False
+    t_norm = unicodedata.normalize("NFKD", t_str).encode("ascii", "ignore").decode("ascii").lower()
+    c_norm = _normaliser_nom_equipe(cible)
+
+    if any(b in t_norm for b in MOTS_BRUIT_RSS):
+        return False
+
+    a_mot_alerte = any(m in t_norm for m in MOTS_ALERTE_FORT) or any(m in t_norm for m in MOTS_ALERTE_FAIBLE)
+    if not a_mot_alerte:
+        return False
+
+    if c_norm and len(c_norm) >= 3:
+        mots_cible = [m for m in c_norm.split() if len(m) >= 3]
+        if c_norm in t_norm:
+            return True
+        if mots_cible and all(m in t_norm for m in mots_cible):
+            return True
+        return False
+
+    return True
+
+
+def _filtrer_titres_pertinents(titres, cible):
+    retenus = []
     for t in titres or []:
-        tl = str(t).lower()
+        if _titre_est_pertinent_pour_cible(t, cible):
+            retenus.append(str(t).strip())
+    return retenus
+
+
+def _evaluer_gravite_titres(titres, cible=""):
+    pertinents = _filtrer_titres_pertinents(titres, cible) if cible else list(titres or [])
+    gravite = 0.0
+    for t in pertinents:
+        tl = unicodedata.normalize("NFKD", str(t)).encode("ascii", "ignore").decode("ascii").lower()
         if any(m in tl for m in MOTS_ALERTE_FORT):
             gravite += 0.75
         elif any(m in tl for m in MOTS_ALERTE_FAIBLE):
@@ -713,7 +751,7 @@ def _evaluer_gravite_titres(titres):
     return min(gravite, 2.0)
 
 
-def _requete_rss(requete_brute, max_titres=2):
+def _requete_rss(requete_brute, max_titres=2, cible=""):
     q = urllib.parse.quote(requete_brute)
     url = f"https://news.google.com/rss/search?q={q}&hl=fr&gl=FR&ceid=FR:fr"
     titres = []
@@ -721,10 +759,15 @@ def _requete_rss(requete_brute, max_titres=2):
         r = _HTTP_SESSION.get(url, timeout=CFG.timeout_http)
         if r.status_code == 200 and r.text:
             root = ET.fromstring(r.text)
-            for item in root.findall(".//item")[:4]:
+            for item in root.findall(".//item")[:8]:
                 t = (item.findtext("title") or "").strip()
-                if t:
-                    titres.append(t)
+                if not t:
+                    continue
+                if cible and not _titre_est_pertinent_pour_cible(t, cible):
+                    continue
+                titres.append(t)
+                if len(titres) >= max_titres:
+                    break
     except Exception as e:
         logger.debug("Erreur RSS (%s): %s", requete_brute, e)
     return titres[:max_titres]
@@ -734,10 +777,10 @@ def scanner_sante_cible(cible, max_titres=2):
     cle = (str(cible).strip().lower(), max_titres)
     cached = _CACHE_SANTE.get(cle, CFG.cache_ttl_sec)
     if cached is not None:
-        return list(cached)
+        return _filtrer_titres_pertinents(cached, cible)[:max_titres]
 
-    requete = f'"{cible}" (blessure OR forfait OR incertain) (match OR équipe OR foot OR tennis OR ATP OR WTA) when:2d'
-    res = _requete_rss(requete, max_titres)
+    requete = f'"{cible}" (blessure OR forfait OR incertain OR suspendu) (match OR équipe OR foot OR tennis OR ATP OR WTA) when:2d'
+    res = _requete_rss(requete, max_titres, cible=cible)
     _CACHE_SANTE.set(cle, res)
     return list(res)
 
@@ -758,7 +801,6 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     a_att = (0.60 * st_a["bp"]) + (0.40 * st_a["bp_away"])
     a_def = (0.60 * st_a["bc"]) + (0.40 * st_a["bc_away"])
 
-    # Modèle Poisson multiplicatif avec avantage domicile et désavantage extérieur
     lam_h = max(((h_att * a_def) / 1.30) * 1.12, 0.35)
     lam_a = max(((a_att * h_def) / 1.30) * 0.90, 0.35)
     p_h, p_n, p_a, p_ov25, p_un25, _, best_h, best_a = simuler_poisson_foot(lam_h, lam_a)
@@ -1040,6 +1082,20 @@ def analyser_tennis(heures_max=48):
     return simples, alertes_tennis, termines_tennis
 
 
+def _cible_concernee_par_choix(it, cible):
+    c_norm = _normaliser_nom_equipe(cible)
+    if not c_norm:
+        return True
+    choix_l = _normaliser_nom_equipe(it.get("choix") or "")
+    if "match nul" in choix_l or "+2 5" in choix_l or "-2 5" in choix_l:
+        return True
+    if choix_l.startswith("victoire "):
+        cible_choix = choix_l.replace("victoire ", "", 1).strip()
+        return _memes_equipes(cible_choix, cible)
+    equipes = it.get("equipes") or []
+    return any(_memes_equipes(eq, cible) for eq in equipes)
+
+
 def _enrichir_sante_items(items_cibles, tous_les_items=None):
     if not items_cibles:
         return {}
@@ -1051,19 +1107,20 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
                 equipes_a_scanner.add(nom)
 
     alertes_globales = {}
-    gravites = {}
+    gravites_par_cible = {}
 
     def scanner(nom):
         try:
-            return nom, scanner_sante_cible(nom, 1)
+            return nom, scanner_sante_cible(nom, 2)
         except Exception:
             return nom, []
 
     with ThreadPoolExecutor(max_workers=4) as ex:
         for nom, titres in ex.map(scanner, equipes_a_scanner):
-            if titres:
-                alertes_globales[nom] = titres
-                gravites[nom] = _evaluer_gravite_titres(titres)
+            pertinents = _filtrer_titres_pertinents(titres, nom)
+            if pertinents:
+                alertes_globales[nom] = pertinents
+                gravites_par_cible[nom] = _evaluer_gravite_titres(pertinents, cible=nom)
 
     liste_a_maj = list(items_cibles)
     if tous_les_items:
@@ -1074,7 +1131,14 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
                 ids_vus.add(id(x))
 
     for it in liste_a_maj:
-        grav = sum(gravites.get(n, 0.0) for n in it.get("equipes", []))
+        # N'appliquer la gravité qu'aux cibles réellement liées au pronostic/choix de l'item
+        grav = 0.0
+        for n in it.get("equipes", []):
+            g_cible = gravites_par_cible.get(n, 0.0)
+            if g_cible > 0.0 and _cible_concernee_par_choix(it, n):
+                grav += g_cible
+        grav = min(grav, 2.0)
+
         if grav >= 0.75:
             penalite_proba = min(grav * 0.015, 0.04)
             it["proba"] = round(max(0.05, it["proba"] / 100 - penalite_proba) * 100, 1)
@@ -1102,6 +1166,12 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
     return alertes_globales
 
 
+CHAMPS_HISTORIQUE = [
+    "date_analyse", "sport", "event_id", "match", "date_match",
+    "choix", "proba", "cote", "prudence", "mise_u", "statut",
+]
+
+
 def _calculer_bilan(lignes):
     verifies = [r for r in lignes if r.get("statut") in ("GAGNE", "PERDU")]
     gagnes = [r for r in verifies if r.get("statut") == "GAGNE"]
@@ -1114,7 +1184,24 @@ def _calculer_bilan(lignes):
             m = 0.0
         mises += m
         if r.get("statut") == "GAGNE":
-            pnl += m
+            cote_val = None
+            raw_cote = str(r.get("cote") or "").strip().replace(",", ".")
+            if raw_cote:
+                try:
+                    c_num = float(raw_cote)
+                    if c_num > 1.0:
+                        cote_val = c_num
+                except Exception:
+                    cote_val = None
+            if cote_val is None:
+                try:
+                    p_pct = float(str(r.get("proba") or "").strip().replace(",", "."))
+                    if p_pct > 0:
+                        cote_val = _calculer_cote(p_pct)
+                except Exception:
+                    cote_val = None
+            gain_net = m * (cote_val - 1.0) if cote_val is not None else m
+            pnl += gain_net
         elif r.get("statut") == "PERDU":
             pnl -= m
     taux = round((len(gagnes) / len(verifies)) * 100, 1) if verifies else 0.0
@@ -1189,10 +1276,7 @@ def _resoudre_statut_depuis_evenement(row, ev):
 
 
 def mettre_a_jour_historique(items, evenements_termines=None):
-    champs = [
-        "date_analyse", "sport", "event_id", "match", "date_match",
-        "choix", "proba", "prudence", "mise_u", "statut",
-    ]
+    champs = CHAMPS_HISTORIQUE
     clos_map = evenements_termines or {}
 
     with _CSV_LOCK:
@@ -1222,6 +1306,7 @@ def mettre_a_jour_historique(items, evenements_termines=None):
         for p in items:
             cle = f"{p['sport']}_{p['event_id']}_{p['choix']}"
             if cle not in cles:
+                cote_p = p.get("cote")
                 lignes.append({
                     "date_analyse": now_str,
                     "sport": str(p["sport"]),
@@ -1230,6 +1315,7 @@ def mettre_a_jour_historique(items, evenements_termines=None):
                     "date_match": str(p["date_match"]),
                     "choix": str(p["choix"]),
                     "proba": str(p["proba"]),
+                    "cote": str(cote_p) if cote_p is not None else "",
                     "prudence": str(p["prudence"]),
                     "mise_u": str(p.get("mise_u", CFG.mise_unite_defaut)),
                     "statut": "EN_ATTENTE",
@@ -1255,10 +1341,7 @@ def definir_statut_historique(sport, event_id, choix, statut):
     statut_norm = str(statut or "").strip().upper()
     if statut_norm not in ("GAGNE", "PERDU", "EN_ATTENTE"):
         return None
-    champs = [
-        "date_analyse", "sport", "event_id", "match", "date_match",
-        "choix", "proba", "prudence", "mise_u", "statut",
-    ]
+    champs = CHAMPS_HISTORIQUE
     cible_cle = f"{str(sport or '').strip().upper()}_{str(event_id or '').strip()}_{str(choix or '').strip()}"
 
     with _CSV_LOCK:
@@ -1325,22 +1408,6 @@ def executer_analyse():
             logger.error("Erreur Tennis: %s", e)
             tennis_res, alertes_t = [], {}
 
-        foot_sorted = sorted(foot_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
-        tennis_sorted = sorted(tennis_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
-        tous_items = foot_sorted + tennis_sorted
-
-        alertes_combines = {**alertes_f, **alertes_t}
-        try:
-            candidats_sante = sorted(
-                tous_items,
-                key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]),
-                reverse=True,
-            )[:12]
-            alertes_sante = _enrichir_sante_items(candidats_sante, tous_les_items=tous_items)
-            alertes_combines.update(alertes_sante)
-        except Exception as e:
-            logger.error("Erreur Santé: %s", e)
-
         cotes_reel_map = {}
         try:
             cotes_reel_map = charger_cotes_moyennes_foot(COMPETITIONS_CIBLES)
@@ -1374,6 +1441,22 @@ def executer_analyse():
         for it in tennis_res:
             it["cote"] = _calculer_cote(it["proba"])
             it["cote_source"] = "Estimée"
+
+        foot_sorted = sorted(foot_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
+        tennis_sorted = sorted(tennis_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
+        tous_items = foot_sorted + tennis_sorted
+
+        alertes_combines = {**alertes_f, **alertes_t}
+        try:
+            candidats_sante = sorted(
+                tous_items,
+                key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]),
+                reverse=True,
+            )[:12]
+            alertes_sante = _enrichir_sante_items(candidats_sante, tous_les_items=tous_items)
+            alertes_combines.update(alertes_sante)
+        except Exception as e:
+            logger.error("Erreur Santé: %s", e)
 
         foot_sorted = sorted(foot_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
         tennis_sorted = sorted(tennis_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
