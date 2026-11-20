@@ -321,6 +321,14 @@ def _formater_date_locale(date_str):
     return dt.astimezone(TZ_PARIS).strftime("%Y-%m-%d %H:%M")
 
 
+def _cle_cle_chronologique(item):
+    return (
+        str(item.get("date_match") or "9999-99-99 99:99"),
+        -(float(item.get("confiance_score") or item.get("proba") or 0.0)),
+        -(float(item.get("proba") or 0.0)),
+    )
+
+
 def _cle_dedup_evenement(ev, fallback_idx=0):
     eid = str(ev.get("id") or "").strip()
     if eid:
@@ -1463,9 +1471,9 @@ def executer_analyse():
             it["cote"] = _calculer_cote(it["proba"])
             it["cote_source"] = "Estimée"
 
-        foot_sorted = sorted(foot_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
-        tennis_sorted = sorted(tennis_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
-        tous_items = foot_sorted + tennis_sorted
+        foot_sorted = sorted(foot_res, key=_cle_cle_chronologique)
+        tennis_sorted = sorted(tennis_res, key=_cle_cle_chronologique)
+        tous_items = sorted(foot_sorted + tennis_sorted, key=_cle_cle_chronologique)
 
         alertes_combines = {**alertes_f, **alertes_t}
         try:
@@ -1479,17 +1487,19 @@ def executer_analyse():
         except Exception as e:
             logger.error("Erreur Santé: %s", e)
 
-        foot_sorted = sorted(foot_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
-        tennis_sorted = sorted(tennis_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
-        top_sur = sorted(
+        foot_sorted = sorted(foot_res, key=_cle_cle_chronologique)
+        tennis_sorted = sorted(tennis_res, key=_cle_cle_chronologique)
+
+        top_candidats = sorted(
             foot_sorted + tennis_sorted,
             key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]),
             reverse=True,
         )[:10]
+        top_sur = sorted(top_candidats, key=_cle_cle_chronologique)
 
         try:
             bilan = mettre_a_jour_historique(
-                [x for x in top_sur if x.get("fiable", True)],
+                [x for x in top_candidats if x.get("fiable", True)],
                 evenements_termines=clos_globaux,
             )
         except Exception as e:
@@ -1954,9 +1964,9 @@ _HTML_PAGE = """<!doctype html>
           <option value="75">≥ 75%</option>
         </select>
         <select id="sort-mode" onchange="trierCartes()" title="Tri des cartes">
+          <option value="date" selected>Tri : Date match</option>
           <option value="conf">Tri : Confiance</option>
           <option value="proba">Tri : Probabilité</option>
-          <option value="date">Tri : Date match</option>
         </select>
       </div>
     </div>
@@ -2162,7 +2172,7 @@ _HTML_PAGE = """<!doctype html>
       }
     }
     function trierCartes() {
-      const mode = document.getElementById("sort-mode")?.value || "conf";
+      const mode = document.getElementById("sort-mode")?.value || "date";
       document.querySelectorAll(".grid").forEach(grid => {
         const cards = Array.from(grid.querySelectorAll(".card[data-conf]"));
         if (cards.length < 2) return;
@@ -2170,14 +2180,15 @@ _HTML_PAGE = """<!doctype html>
           if (mode === "proba") {
             return (parseFloat(b.dataset.proba) || 0) - (parseFloat(a.dataset.proba) || 0);
           }
-          if (mode === "date") {
-            return (a.dataset.date || "").localeCompare(b.dataset.date || "");
+          if (mode === "conf") {
+            return (parseFloat(b.dataset.confScore) || 0) - (parseFloat(a.dataset.confScore) || 0);
           }
-          return (parseFloat(b.dataset.confScore) || 0) - (parseFloat(a.dataset.confScore) || 0);
+          return (a.dataset.date || "").localeCompare(b.dataset.date || "");
         });
         cards.forEach(c => grid.appendChild(c));
       });
     }
+    trierCartes();
     appliquerFiltres();
   </script>
 </body>
