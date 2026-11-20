@@ -51,8 +51,12 @@ STATUTS_TERMINES = {
     "closed", "final", "post", "completed", "finished",
     "ft", "aet", "pen", "status_final", "status_post",
 }
-STATUTS_EXCLUS_AVENIR = STATUTS_TERMINES | {
-    "in_progress", "live", "postponed", "cancelled", "canceled", "suspended",
+STATUTS_EN_COURS = {
+    "in_progress", "live", "ht", "halftime", "1st_half", "2nd_half",
+    "et", "extra_time", "pen_live", "playing", "status_in_progress",
+}
+STATUTS_EXCLUS_AVENIR = STATUTS_TERMINES | STATUTS_EN_COURS | {
+    "postponed", "cancelled", "canceled", "suspended",
 }
 
 MOTS_ALERTE_FORT = (
@@ -188,6 +192,7 @@ _DERNIER_RAPPORT = {
     "mis_a_jour": None,
     "stats_comp": {},
     "apercu_bruts": "",
+    "en_cours_matchs": [],
     "top_sur": [],
     "foot": [],
     "tennis": [],
@@ -204,6 +209,7 @@ def _charger_rapport_disque():
             with open(FICHIER_RAPPORT, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict) and data.get("mis_a_jour"):
+                    data.setdefault("en_cours_matchs", [])
                     with _STATE_LOCK:
                         _DERNIER_RAPPORT = data
     except Exception as e:
@@ -344,7 +350,26 @@ def _cle_dedup_evenement(ev, fallback_idx=0):
     return f"fallback:{fallback_idx}"
 
 
+def _est_match_en_cours(ev):
+    statut = str(ev.get("status") or "").strip().lower()
+    if statut in STATUTS_TERMINES or statut in {"postponed", "cancelled", "canceled", "suspended", "scheduled", "pre"}:
+        return False
+    if statut in STATUTS_EN_COURS or "live" in statut or "progress" in statut:
+        return True
+
+    # Secours si le statut est générique mais qu'une horloge/période est active et que le match a commencé
+    clock = str(ev.get("clock") or ev.get("minute") or ev.get("display_clock") or "").strip()
+    dt = _parse_date_utc(ev.get("start_time") or ev.get("date"))
+    if clock and dt:
+        maintenant = datetime.now(timezone.utc)
+        if timedelta(minutes=0) <= (maintenant - dt) <= timedelta(hours=4):
+            return True
+    return False
+
+
 def _est_match_a_venir_dans_fenetre(ev, heures_max):
+    if _est_match_en_cours(ev):
+        return False
     statut = str(ev.get("status") or "").strip().lower()
     if statut in STATUTS_EXCLUS_AVENIR:
         return False
@@ -648,6 +673,25 @@ def _extraire_scores_evenement(ev):
     return res
 
 
+def _formater_score_live(ev, sport="FOOT"):
+    scores = _extraire_scores_evenement(ev)
+    if len(scores) >= 2:
+        s0 = scores[0]["score"] if scores[0]["score"] is not None else 0
+        s1 = scores[1]["score"] if scores[1]["score"] is not None else 0
+        if sport == "FOOT":
+            return f"{s0} - {s1}"
+        return f"{scores[0]['name']} {s0} - {s1} {scores[1]['name']}"
+    return "En cours"
+
+
+def _formater_chrono_live(ev):
+    for champ in ("display_clock", "clock", "minute", "period", "status_detail"):
+        val = ev.get(champ)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return "LIVE"
+
+
 def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8):
     events = list(events_override or [])
     joues = [ev for ev in events if str(ev.get("status", "")).lower() in STATUTS_TERMINES]
@@ -749,9 +793,9 @@ def _titre_est_pertinent_pour_cible(titre, cible):
 
     if c_norm and len(c_norm) >= 3:
         mots_cible = [m for m in c_norm.split() if len(m) >= 3]
-        if c_norm in t_norm:
+        if re.search(rf"\b{re.escape(c_norm)}\b", t_norm):
             return True
-        if mots_cible and all(m in t_norm for m in mots_cible):
+        if mots_cible and all(re.search(rf"\b{re.escape(m)}\b", t_norm) for m in mots_cible):
             return True
         return False
 
@@ -897,6 +941,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
 
 def analyser_foot_competitions(competitions, heures_max=48):
     resultats_a_venir = []
+    live_foot = []
     alertes_globales = {}
     stats_par_comp = {}
     apercu_lignes = []
@@ -971,6 +1016,15 @@ def analyser_foot_competitions(competitions, heures_max=48):
         a_venir_48h = [ev for ev in events_comp if _est_match_a_venir_dans_fenetre(ev, heures_max)]
         a_venir_48h.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
 
+        en_cours_evs = [ev for ev in events_comp if _est_match_en_cours(ev)]
+        live_comp = []
+        for ev in en_cours_evs:
+            entree = _construire_entree_foot(ev, label_comp, events_comp)
+            entree["en_cours"] = True
+            entree["score_actuel"] = _formater_score_live(ev, "FOOT")
+            entree["chrono_live"] = _formater_chrono_live(ev)
+            live_comp.append(entree)
+
         clos_comp = {}
         for ev in events_comp:
             if str(ev.get("status") or "").strip().lower() in STATUTS_TERMINES:
@@ -992,20 +1046,23 @@ def analyser_foot_competitions(competitions, heures_max=48):
                     f"{h.get('short_name') or h.get('name') or '?'} vs {a.get('short_name') or a.get('name') or '?'}"
                 )
 
-        return label_comp, res_comp, {}, len(clos_comp), len(events_comp), apercu_comp, clos_comp
+        return label_comp, res_comp, live_comp, {}, len(clos_comp), len(events_comp), apercu_comp, clos_comp
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         res_comps = list(ex.map(analyser_comp, competitions))
 
-    for label_comp, res_comp, alertes_comp, nb_clos, total_events, apercu_comp, clos_comp in res_comps:
+    for label_comp, res_comp, live_comp, alertes_comp, nb_clos, total_events, apercu_comp, clos_comp in res_comps:
         resultats_a_venir.extend(res_comp)
+        live_foot.extend(live_comp)
         alertes_globales.update(alertes_comp)
         apercu_lignes.extend(apercu_comp)
         evenements_termines.update(clos_comp)
-        stats_par_comp[label_comp] = f"À venir: {len(res_comp)} | Terminés: {nb_clos} (bruts: {total_events})"
+        stats_par_comp[label_comp] = (
+            f"Live: {len(live_comp)} | À venir: {len(res_comp)} | Terminés: {nb_clos} (bruts: {total_events})"
+        )
 
     logger.info("Couverture Foot : %s", " • ".join(f"{k}: {v}" for k, v in stats_par_comp.items()))
-    return resultats_a_venir, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12]), evenements_termines
+    return resultats_a_venir, live_foot, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12]), evenements_termines
 
 
 def trouver_rang(nom, rk_map):
@@ -1042,9 +1099,10 @@ def analyser_tennis(heures_max=48):
         sb = tn.get_scoreboard()
     except Exception as e:
         logger.warning("Erreur récupération données tennis: %s", e)
-        return [], {}, {}
+        return [], [], {}, {}
 
     simples = []
+    live_tennis = []
     alertes_tennis = {}
     termines_tennis = {}
 
@@ -1059,8 +1117,11 @@ def analyser_tennis(heures_max=48):
                 statut = str(m.get("status") or "").strip().lower()
                 if statut in STATUTS_TERMINES and mid:
                     termines_tennis[mid] = m
-                if not _est_match_a_venir_dans_fenetre(m, heures_max):
+
+                est_live = _est_match_en_cours(m)
+                if not est_live and not _est_match_a_venir_dans_fenetre(m, heures_max):
                     continue
+
                 comps = m.get("competitors", [])
                 if len(comps) != 2:
                     continue
@@ -1086,7 +1147,7 @@ def analyser_tennis(heures_max=48):
 
                 conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, complet, 0.0)
                 cote_min, mise_u = _calculer_cote_min_et_mise(proba_pct, conf_score, complet, est_nul=False)
-                simples.append({
+                entree = {
                     "sport": "TENNIS",
                     "competition": t_name or "Tennis",
                     "fiable": complet,
@@ -1108,8 +1169,83 @@ def analyser_tennis(heures_max=48):
                     "confiance_score": conf_score,
                     "mise_u": mise_u,
                     "equipes": [favori],
-                })
-    return simples, alertes_tennis, termines_tennis
+                }
+                if est_live:
+                    entree["en_cours"] = True
+                    entree["score_actuel"] = _formater_score_live(m, "TENNIS")
+                    entree["chrono_live"] = _formater_chrono_live(m)
+                    live_tennis.append(entree)
+                else:
+                    simples.append(entree)
+
+    return simples, live_tennis, alertes_tennis, termines_tennis
+
+
+def _charger_historique_lignes():
+    with _CSV_LOCK:
+        if not os.path.exists(FICHIER_HISTORIQUE):
+            return []
+        try:
+            with open(FICHIER_HISTORIQUE, "r", newline="", encoding="utf-8") as f:
+                return [
+                    {k: (row.get(k) or "").strip() for k in CHAMPS_HISTORIQUE}
+                    for row in csv.DictReader(f)
+                    if any((v or "").strip() for v in row.values())
+                ]
+        except Exception as e:
+            logger.warning("Erreur lecture historique CSV pour matchs live: %s", e)
+            return []
+
+
+def _enrichir_matchs_live_avec_pronostics(live_items, candidats_precalcul):
+    lignes_hist = _charger_historique_lignes()
+    par_event = {}
+    for r in lignes_hist:
+        cle_ev = f"{r.get('sport', '').upper()}_{r.get('event_id', '').strip()}"
+        if r.get("event_id"):
+            par_event.setdefault(cle_ev, []).append(r)
+
+    precalcul_par_event = {
+        f"{str(it.get('sport') or '').upper()}_{str(it.get('event_id') or '').strip()}": it
+        for it in (candidats_precalcul or [])
+        if it.get("event_id")
+    }
+
+    enrichis = []
+    for m in live_items:
+        copie = dict(m)
+        sport_u = str(copie.get("sport") or "").upper()
+        eid = str(copie.get("event_id") or "").strip()
+        cle_ev = f"{sport_u}_{eid}"
+
+        hist_match = par_event.get(cle_ev) or []
+        if not hist_match and " vs " in copie.get("match", ""):
+            eq_h, eq_a = [x.strip() for x in copie["match"].split(" vs ", 1)]
+            for r in lignes_hist:
+                if str(r.get("sport") or "").upper() == sport_u and " vs " in r.get("match", ""):
+                    rh, ra = [x.strip() for x in r["match"].split(" vs ", 1)]
+                    if _memes_equipes(eq_h, rh) and _memes_equipes(eq_a, ra):
+                        hist_match = [r]
+                        break
+
+        if hist_match:
+            dernier = hist_match[-1]
+            copie["pronostic_predi"] = dernier.get("choix") or copie.get("choix")
+            copie["pronostic_proba"] = dernier.get("proba") or copie.get("proba")
+            copie["pronostic_cote"] = dernier.get("cote") or copie.get("cote")
+            copie["pronostic_statut"] = dernier.get("statut") or "EN_ATTENTE"
+            copie["pronostic_source"] = "Enregistré"
+        else:
+            base = precalcul_par_event.get(cle_ev) or copie
+            copie["pronostic_predi"] = base.get("choix")
+            copie["pronostic_proba"] = base.get("proba")
+            copie["pronostic_cote"] = base.get("cote")
+            copie["pronostic_statut"] = "EN_ATTENTE"
+            copie["pronostic_source"] = "Calculé"
+
+        enrichis.append(copie)
+
+    return enrichis
 
 
 def _cible_concernee_par_choix(it, cible):
@@ -1420,19 +1556,22 @@ def executer_analyse():
     try:
         logger.info("Analyse en cours (fenetre: %sh)...", CFG.fenetre_heures)
         clos_globaux = {}
+        live_globaux = []
 
         try:
-            foot_res, alertes_f, stats_comp, apercu_bruts, clos_foot = analyser_foot_competitions(
+            foot_res, live_f, alertes_f, stats_comp, apercu_bruts, clos_foot = analyser_foot_competitions(
                 COMPETITIONS_CIBLES, CFG.fenetre_heures
             )
             clos_globaux.update(clos_foot)
+            live_globaux.extend(live_f)
         except Exception as e:
             logger.error("Erreur Foot: %s", e)
             foot_res, alertes_f, stats_comp, apercu_bruts = [], {}, {}, f"Erreur Foot: {e}"
 
         try:
-            tennis_res, alertes_t, clos_tennis = analyser_tennis(CFG.fenetre_heures)
+            tennis_res, live_t, alertes_t, clos_tennis = analyser_tennis(CFG.fenetre_heures)
             clos_globaux.update(clos_tennis)
+            live_globaux.extend(live_t)
         except Exception as e:
             logger.error("Erreur Tennis: %s", e)
             tennis_res, alertes_t = [], {}
@@ -1471,9 +1610,7 @@ def executer_analyse():
             it["cote"] = _calculer_cote(it["proba"])
             it["cote_source"] = "Estimée"
 
-        foot_sorted = sorted(foot_res, key=_cle_cle_chronologique)
-        tennis_sorted = sorted(tennis_res, key=_cle_cle_chronologique)
-        tous_items = sorted(foot_sorted + tennis_sorted, key=_cle_cle_chronologique)
+        tous_items = sorted(foot_res + tennis_res, key=_cle_cle_chronologique)
 
         alertes_combines = {**alertes_f, **alertes_t}
         try:
@@ -1507,6 +1644,11 @@ def executer_analyse():
             with _STATE_LOCK:
                 bilan = dict(_DERNIER_RAPPORT.get("bilan") or {})
 
+        live_enrichis = sorted(
+            _enrichir_matchs_live_avec_pronostics(live_globaux, tous_items),
+            key=_cle_cle_chronologique,
+        )
+
         synthese = "\n".join(
             f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')} | "
             f"Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')})] "
@@ -1518,6 +1660,7 @@ def executer_analyse():
             "mis_a_jour": datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M %Z"),
             "stats_comp": stats_comp,
             "apercu_bruts": apercu_bruts,
+            "en_cours_matchs": live_enrichis,
             "top_sur": top_sur,
             "foot": foot_sorted,
             "tennis": tennis_sorted,
@@ -1893,12 +2036,14 @@ _HTML_PAGE = """<!doctype html>
     .card.HAUTE { border-left-color: var(--green); }
     .card.MOYENNE { border-left-color: var(--orange); }
     .card.FAIBLE { border-left-color: var(--red); }
+    .card.live-card { border-left-color: var(--red); border-color: rgba(239, 68, 68, 0.35); }
     .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
     .card-title { font-size: 1.02em; font-weight: 700; line-height: 1.3; display: flex; align-items: center; gap: 6px; min-width: 0; }
     .badges-right { display: flex; align-items: center; gap: 5px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
     .badge { font-size: 0.73em; padding: 3px 7px; border-radius: 999px; font-weight: 800; white-space: nowrap; }
     .badge.proba { background: rgba(56, 189, 248, 0.16); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35); }
     .badge.cote { background: rgba(148, 163, 184, 0.18); color: #e2e8f0; border: 1px solid rgba(148, 163, 184, 0.32); }
+    .badge.live { background: rgba(239, 68, 68, 0.18); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.45); display: inline-flex; align-items: center; gap: 5px; }
     .badge.HAUTE { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }
     .badge.MOYENNE { background: rgba(245, 158, 11, 0.2); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.4); }
     .badge.FAIBLE { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
@@ -1907,6 +2052,19 @@ _HTML_PAGE = """<!doctype html>
     @keyframes pulse-red { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); } 70% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
     .card-meta { font-size: 0.86em; color: var(--muted); margin-bottom: 10px; line-height: 1.45; }
     .card-meta strong { color: var(--text); }
+    .live-score-box {
+      display: flex; justify-content: space-between; align-items: center;
+      background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3);
+      border-radius: 8px; padding: 8px 11px; margin-bottom: 10px;
+    }
+    .live-score-val { font-size: 1.08em; font-weight: 800; color: #f8fafc; }
+    .pred-box {
+      background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.32);
+      border-radius: 8px; padding: 9px 11px; margin-top: 8px;
+    }
+    .pred-label { font-size: 0.73em; text-transform: uppercase; letter-spacing: 0.04em; color: #7dd3fc; font-weight: 800; margin-bottom: 3px; }
+    .pred-choice { font-size: 0.96em; font-weight: 800; color: #f8fafc; }
+    .pred-sub { font-size: 0.78em; color: var(--muted); margin-top: 2px; }
     .conf-meter { margin: 8px 0 4px 0; }
     .conf-label { display: flex; justify-content: space-between; font-size: 0.76em; color: var(--muted); margin-bottom: 4px; }
     .meter-track { height: 6px; background: #0b1220; border-radius: 999px; overflow: hidden; }
@@ -1943,6 +2101,7 @@ _HTML_PAGE = """<!doctype html>
 
     <div class="cat-bar">
       <a href="{{ url_for('app_view', cat='all') }}" class="btn btn-cat {% if cat == 'all' %}active{% endif %}">Tout</a>
+      <a href="{{ url_for('app_view', cat='live') }}" class="btn btn-cat {% if cat == 'live' %}active{% endif %}">En cours ({{ r.en_cours_matchs|length }})</a>
       <a href="{{ url_for('app_view', cat='top') }}" class="btn btn-cat {% if cat == 'top' %}active{% endif %}">Top Pronostics ({{ r.top_sur|length }})</a>
       <a href="{{ url_for('app_view', cat='foot') }}" class="btn btn-cat {% if cat == 'foot' %}active{% endif %}">Football ({{ r.foot|length }})</a>
       <a href="{{ url_for('app_view', cat='tennis') }}" class="btn btn-cat {% if cat == 'tennis' %}active{% endif %}">Tennis ({{ r.tennis|length }})</a>
@@ -1975,6 +2134,49 @@ _HTML_PAGE = """<!doctype html>
     <div class="notice">Mise à jour en arrière-plan en cours — les données affichées restent accessibles.</div>
     {% endif %}
 
+    {% if cat in ('all', 'live') %}
+    <h2><span class="dot-red"></span> Matchs en cours ({{ r.en_cours_matchs|length }})</h2>
+    <div class="grid">
+      {% for it in r.en_cours_matchs %}
+      {% set conf = it.get('confiance', 'MOYENNE') %}
+      {% set conf_sc = it.get('confiance_score', it.proba) %}
+      <div class="card live-card {{ conf }}"
+           data-conf="{{ conf }}"
+           data-proba="{{ it.pronostic_proba or it.proba }}"
+           data-conf-score="{{ conf_sc }}"
+           data-date="{{ it.date_match }}"
+           data-search="{{ ((it.pronostic_predi or it.choix) ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.score_actuel or ''))|lower }}">
+        <div class="card-top">
+          <div class="card-title">
+            {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}
+          </div>
+          <div class="badges-right">
+            <span class="badge live"><span class="dot-red"></span> {{ it.chrono_live or 'LIVE' }}</span>
+          </div>
+        </div>
+        <div class="card-meta">
+          {{ it.competition }} • Début : {{ it.date_match }}
+        </div>
+        <div class="live-score-box">
+          <span class="meta">Score actuel</span>
+          <span class="live-score-val">{{ it.score_actuel or 'En cours' }}</span>
+        </div>
+        <div class="pred-box">
+          <div class="pred-label">Pronostic prédit ({{ it.pronostic_source or 'Bot' }})</div>
+          <div class="pred-choice">{{ it.pronostic_predi or it.choix }}</div>
+          <div class="pred-sub">
+            Proba : <strong>{{ it.pronostic_proba or it.proba }}%</strong>
+            {% if it.pronostic_cote or it.cote %} • Cote : <strong>{{ it.pronostic_cote or it.cote }}</strong>{% endif %}
+            • Statut : <strong>{{ it.pronostic_statut or 'EN_ATTENTE' }}</strong>
+          </div>
+        </div>
+      </div>
+      {% else %}
+      <div class="card">Aucun match en cours pour le moment.</div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
     {% if cat in ('all', 'top') %}
     <h2>★ Top pronostics (Foot &amp; Tennis)</h2>
     <div class="grid">
@@ -1996,7 +2198,7 @@ _HTML_PAGE = """<!doctype html>
             {% if it.get('cote') %}
             <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
             {% endif %}
-            <span class="badge proba" title="Probabilité du score exact cohérent">{{ pct_score }}%</span>
+            <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
             {% if it.get('est_imminent') %}
             <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
             {% endif %}
@@ -2047,7 +2249,7 @@ _HTML_PAGE = """<!doctype html>
             {% if it.get('cote') %}
             <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
             {% endif %}
-            <span class="badge proba" title="Probabilité du score exact cohérent">{{ pct_score }}%</span>
+            <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
             {% if it.get('est_imminent') %}
             <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
             {% endif %}
@@ -2091,7 +2293,7 @@ _HTML_PAGE = """<!doctype html>
             {% if it.get('cote') %}
             <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
             {% endif %}
-            <span class="badge proba" title="Probabilité du score exact cohérent">{{ pct_score }}%</span>
+            <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
             {% if it.get('est_imminent') %}
             <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
             {% endif %}
@@ -2329,7 +2531,7 @@ def index():
 @app.route("/app")
 def app_view():
     cat = (request.args.get("cat") or "all").strip().lower()
-    if cat not in {"all", "top", "foot", "tennis", "alertes", "bilan"}:
+    if cat not in {"all", "live", "top", "foot", "tennis", "alertes", "bilan"}:
         cat = "all"
 
     with _STATE_LOCK:
