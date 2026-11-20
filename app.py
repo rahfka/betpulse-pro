@@ -50,9 +50,13 @@ STATUTS_TERMINES = {
     "closed", "final", "post", "completed", "finished",
     "ft", "aet", "pen", "status_final", "status_post",
 }
+STATUTS_ANNULES = {"canceled", "cancelled", "postponed", "suspended", "walkover", "retired", "abandoned"}
 STATUTS_TERMINES_OU_EN_COURS = STATUTS_TERMINES | {"in_progress", "live"}
 
-MOTS_ALERTE_FORT = ("forfait", "blessure", "blessé", "blessée", "opéré", "opérée", "rupture", "absent", "absente", "suspendu", "out", "injured")
+MOTS_ALERTE_FORT = (
+    "forfait", "blessure", "blessé", "blessée", "opéré", "opérée",
+    "rupture", "absent", "absente", "suspendu", "out", "injured",
+)
 MOTS_ALERTE_FAIBLE = ("incertain", "incertaine", "doute", "gêne", "repris", "doubtful", "knock")
 
 
@@ -63,7 +67,9 @@ class Config:
     fenetre_heures: int = field(default_factory=lambda: max(1, int(os.getenv("FENETRE_HEURES", "48"))))
     timeout_http: float = field(default_factory=lambda: max(1.0, float(os.getenv("TIMEOUT_HTTP", "4"))))
     cache_ttl_sec: int = field(default_factory=lambda: max(60, int(os.getenv("CACHE_TTL_SEC", "900"))))
-    mise_unite_defaut: float = field(default_factory=lambda: max(0.0, float(os.getenv("MISE_UNITE_DEFAUT", "1.0"))))
+    mise_unite_defaut: float = field(default_factory=lambda: max(0.1, float(os.getenv("MISE_UNITE_DEFAUT", "1.0"))))
+    mise_max_unites: float = field(default_factory=lambda: max(0.5, float(os.getenv("MISE_MAX_UNITES", "1.5"))))
+    marge_value_pct: float = field(default_factory=lambda: max(0.0, float(os.getenv("MARGE_VALUE_PCT", "4.0"))))
     activer_debug_routes: bool = field(
         default_factory=lambda: os.getenv("ACTIVER_DEBUG_ROUTES", "false").strip().lower() in ("1", "true", "yes")
     )
@@ -223,6 +229,88 @@ def _normaliser_home_away(ev):
     return ev.get("home_team") or {}, ev.get("away_team") or {}
 
 
+def _extraire_cote_numerique(val):
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        f = float(val)
+        return round(f, 2) if f > 1.01 else None
+    if isinstance(val, str):
+        s = val.strip().replace(",", ".")
+        m = re.search(r"\d+(?:\.\d+)?", s)
+        if m:
+            f = float(m.group(0))
+            return round(f, 2) if f > 1.01 else None
+    if isinstance(val, dict):
+        for k in ("odds", "odd", "price", "decimal", "value", "home", "away", "win"):
+            if k in val:
+                c = _extraire_cote_numerique(val[k])
+                if c:
+                    return c
+    return None
+
+
+def _extraire_cote_match(ev, role=None):
+    if not isinstance(ev, dict):
+        return None
+    if role:
+        comps = ev.get("competitors")
+        if isinstance(comps, dict) and isinstance(comps.get(role), dict):
+            for k in ("odds", "odd", "price", "decimal_odds"):
+                c = _extraire_cote_numerique(comps[role].get(k))
+                if c:
+                    return c
+        elif isinstance(comps, list):
+            for idx, item in enumerate(comps):
+                if not isinstance(item, dict):
+                    continue
+                qual = str(item.get("qualifier") or item.get("homeAway") or "").strip().lower()
+                if qual == role or (not qual and ((role == "home" and idx == 0) or (role == "away" and idx == 1))):
+                    for k in ("odds", "odd", "price", "decimal_odds"):
+                        c = _extraire_cote_numerique(item.get(k))
+                        if c:
+                            return c
+    for k in ("odds", "odd", "price", "best_odds", "market_odds"):
+        c = _extraire_cote_numerique(ev.get(k))
+        if c:
+            return c
+    return None
+
+
+def _calculer_value_et_mise(proba_pct, conf_score, fiable, cote_observee=None):
+    p = max(0.05, min(0.95, proba_pct / 100.0))
+    marge_facteur = 1.0 + (CFG.marge_value_pct / 100.0)
+    cote_min = round((1.0 / p) * marge_facteur, 2)
+
+    ev_pct = None
+    cote_utilisee = None
+    if cote_observee and cote_observee > 1.01:
+        cote_utilisee = round(float(cote_observee), 2)
+        ev_pct = round(((p * cote_utilisee) - 1.0) * 100.0, 1)
+
+    # Mise fractionnée en unités (bankroll simple)
+    if not fiable or proba_pct < 50.0:
+        mise = round(CFG.mise_unite_defaut * 0.25, 2)
+    else:
+        facteur_conf = max(0.35, min(1.35, conf_score / 62.0))
+        facteur_ev = 1.0
+        if ev_pct is not None:
+            if ev_pct <= -3.0:
+                facteur_ev = 0.25
+            elif ev_pct < 0.0:
+                facteur_ev = 0.50
+            elif ev_pct >= 8.0:
+                facteur_ev = 1.35
+            elif ev_pct >= 3.0:
+                facteur_ev = 1.15
+        mise = round(
+            min(CFG.mise_max_unites, max(0.25, CFG.mise_unite_defaut * facteur_conf * facteur_ev)),
+            2,
+        )
+
+    return cote_min, cote_utilisee, ev_pct, mise
+
+
 def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year=None):
     saison = str(season_year or CFG.saison_foot)
     cle = (str(team_id), str(league_slug), saison)
@@ -269,7 +357,7 @@ def _formater_date_locale(date_str):
 
 def _est_match_a_venir_dans_fenetre(ev, heures_max):
     statut = str(ev.get("status") or "").strip().lower()
-    if statut in STATUTS_TERMINES_OU_EN_COURS:
+    if statut in STATUTS_TERMINES_OU_EN_COURS or statut in STATUTS_ANNULES:
         return False
 
     date_str = str(ev.get("start_time") or ev.get("date") or "").strip()
@@ -321,20 +409,57 @@ def moyenne_ponderee_shrinkage(valeurs, prior_moyenne, prior_poids=3.0):
     return ((moy_obs * somme_poids) + (prior_moyenne * prior_poids)) / (somme_poids + prior_poids)
 
 
-def _calculer_indice_confiance(proba_pct, fiable, gravite_alerte=0.0):
+def _calculer_indice_confiance(proba_pct, fiable, gravite_alerte=0.0, ev_pct=None, est_nul=False, cote_courte=False):
     score = proba_pct
     if not fiable:
         score -= 15.0
     if gravite_alerte > 0.0:
         score -= min(gravite_alerte * 10.0, 22.0)
+    if est_nul:
+        score -= 7.0
+    if cote_courte:
+        score -= 5.0
+    if ev_pct is not None:
+        if ev_pct >= 5.0:
+            score += 4.0
+        elif ev_pct < 0.0:
+            score -= 8.0
+
     score = round(max(10.0, min(95.0, score)), 1)
-    if fiable and gravite_alerte == 0.0 and score >= 60.0:
+    if fiable and gravite_alerte == 0.0 and not est_nul and score >= 60.0 and (ev_pct is None or ev_pct >= 0.0):
         niveau = "HAUTE"
     elif score >= 49.0:
         niveau = "MOYENNE"
     else:
         niveau = "FAIBLE"
     return score, niveau
+
+
+def _jours_depuis_dernier_match(events, team_id="", team_name="", ref_dt=None):
+    nom_l = (team_name or "").strip().lower()
+    dernier_dt = None
+    for ev in events or []:
+        if str(ev.get("status", "")).strip().lower() not in STATUTS_TERMINES:
+            continue
+        dt = _parse_date_utc(ev.get("start_time") or ev.get("date"))
+        if dt is None:
+            continue
+        h_info, a_info = _normaliser_home_away(ev)
+        match_eq = False
+        for info in (h_info, a_info):
+            tid = str(info.get("id") or "")
+            tnm = str(info.get("short_name") or info.get("name") or "").strip().lower()
+            if (team_id and tid and tid == str(team_id)) or (
+                nom_l and tnm and (tnm == nom_l or nom_l in tnm or tnm in nom_l)
+            ):
+                match_eq = True
+                break
+        if match_eq and (dernier_dt is None or dt > dernier_dt):
+            dernier_dt = dt
+    if dernier_dt is None:
+        return None
+    base = ref_dt or datetime.now(timezone.utc)
+    return max(0.0, (base - dernier_dt).total_seconds() / 86400.0)
 
 
 def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8):
@@ -487,6 +612,7 @@ def scanner_sante_cible(cible, max_titres=2):
 def _construire_entree_foot(ev, label_comp, events_comp):
     ev_id = str(ev.get("id") or "")
     start_str = str(ev.get("start_time") or ev.get("date") or "")
+    dt_match = _parse_date_utc(start_str)
     h_info, a_info = _normaliser_home_away(ev)
     h_nom = h_info.get("short_name") or h_info.get("name") or "Home"
     a_nom = a_info.get("short_name") or a_info.get("name") or "Away"
@@ -495,9 +621,15 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     st_a = stats_foot_detail(a_info.get("id", ""), a_nom, events_comp, CFG.n_derniers_matchs)
     fiable = st_h["a_historique"] and st_a["a_historique"]
 
-    h_att = (0.60 * st_h["bp"]) + (0.40 * st_h["bp_home"])
+    # Fraîcheur / calendrier chargé (< 3.5 jours entre deux matchs)
+    repos_h = _jours_depuis_dernier_match(events_comp, h_info.get("id", ""), h_nom, dt_match)
+    repos_a = _jours_depuis_dernier_match(events_comp, a_info.get("id", ""), a_nom, dt_match)
+    fatigue_h = 0.90 if (repos_h is not None and repos_h < 3.5) else 1.0
+    fatigue_a = 0.90 if (repos_a is not None and repos_a < 3.5) else 1.0
+
+    h_att = ((0.60 * st_h["bp"]) + (0.40 * st_h["bp_home"])) * fatigue_h
     h_def = (0.60 * st_h["bc"]) + (0.40 * st_h["bc_home"])
-    a_att = (0.60 * st_a["bp"]) + (0.40 * st_a["bp_away"])
+    a_att = ((0.60 * st_a["bp"]) + (0.40 * st_a["bp_away"])) * fatigue_a
     a_def = (0.60 * st_a["bc"]) + (0.40 * st_a["bc_away"])
 
     lam_h = max(((h_att * 1.08) + a_def) / 2.0, 0.35)
@@ -508,16 +640,32 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         [(f"Victoire {h_nom}", p_h), ("Match nul", p_n), (f"Victoire {a_nom}", p_a)],
         key=lambda x: x[1],
     )
+    est_nul = choix == "Match nul"
 
-    plafond = 0.80 if fiable else 0.64
+    plafond = 0.78 if (fiable and not est_nul) else (0.52 if est_nul else 0.64)
     prob_cal = min(max(prob, 0.05), plafond)
     proba_pct = round(prob_cal * 100, 1)
+
+    cote_obs = _extraire_cote_match(ev, "home" if choix.startswith("Victoire " + h_nom) else ("away" if choix.startswith("Victoire " + a_nom) else None))
+    cote_courte = bool(cote_obs and cote_obs < 1.30)
 
     buts_label = "+2.5 buts" if p_ov25 >= p_un25 else "-2.5 buts"
     buts_proba = round(min(max(p_ov25, p_un25), 0.85) * 100, 1)
 
-    prudence = "ELEVE" if (proba_pct >= 72 and fiable) else ("MODERE" if proba_pct >= 56 else "PRUDENT")
-    conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, fiable, 0.0)
+    conf_score, conf_niveau = _calculer_indice_confiance(
+        proba_pct, fiable, 0.0, ev_pct=None, est_nul=est_nul, cote_courte=cote_courte
+    )
+    cote_min, cote_val, ev_pct, mise_u = _calculer_value_et_mise(proba_pct, conf_score, fiable, cote_obs)
+    conf_score, conf_niveau = _calculer_indice_confiance(
+        proba_pct, fiable, 0.0, ev_pct=ev_pct, est_nul=est_nul, cote_courte=cote_courte
+    )
+
+    prudence = "ELEVE" if (proba_pct >= 72 and fiable and not est_nul) else ("MODERE" if proba_pct >= 56 else "PRUDENT")
+    fatigue_note = ""
+    if fatigue_h < 1.0 or fatigue_a < 1.0:
+        fatigue_note = " | Calendrier serré"
+    nul_note = " | Attention nul sec" if est_nul else ""
+    cote_note = f" | Cote {cote_val} (EV {ev_pct:+.1f}%)" if cote_val and ev_pct is not None else f" | Cote min @{cote_min}"
 
     return {
         "sport": "FOOT",
@@ -528,16 +676,78 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "date_match": _formater_date_locale(start_str),
         "detail": (
             f"[{label_comp}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] "
-            f"| Buts: {buts_label} ({buts_proba:.0f}%)"
+            f"| Buts: {buts_label} ({buts_proba:.0f}%){cote_note}{fatigue_note}{nul_note}"
         ),
         "choix": choix,
         "proba": proba_pct,
         "prudence": prudence,
         "confiance": conf_niveau,
         "confiance_score": conf_score,
-        "mise_u": CFG.mise_unite_defaut,
+        "cote": cote_val,
+        "cote_min": cote_min,
+        "ev_pct": ev_pct,
+        "mise_u": mise_u,
         "equipes": [h_nom, a_nom],
     }
+
+
+def _collecter_resultats_termines(events_list):
+    """Extrait les résultats des matchs terminés ou annulés pour résoudre l'historique CSV."""
+    resultats = {}
+    for ev in events_list or []:
+        if not isinstance(ev, dict):
+            continue
+        eid = str(ev.get("id") or "").strip()
+        if not eid:
+            continue
+        statut = str(ev.get("status") or "").strip().lower()
+        if statut in STATUTS_ANNULES:
+            resultats[eid] = {"statut": "ANNULE"}
+            continue
+        if statut not in STATUTS_TERMINES:
+            continue
+
+        h_info, a_info = _normaliser_home_away(ev)
+        h_nom = str(h_info.get("short_name") or h_info.get("name") or "").strip()
+        a_nom = str(a_info.get("short_name") or a_info.get("name") or "").strip()
+
+        comps = ev.get("competitors")
+        scores = {}
+        if isinstance(comps, dict):
+            for role in ("home", "away"):
+                obj = comps.get(role)
+                if isinstance(obj, dict) and obj.get("score") is not None:
+                    try:
+                        scores[role] = float(obj["score"])
+                    except Exception:
+                        pass
+        elif isinstance(comps, list):
+            for idx, item in enumerate(comps):
+                if not isinstance(item, dict) or item.get("score") is None:
+                    continue
+                qual = str(item.get("qualifier") or item.get("homeAway") or "").strip().lower()
+                role = qual if qual in ("home", "away") else ("home" if idx == 0 else "away")
+                try:
+                    scores[role] = float(item["score"])
+                except Exception:
+                    pass
+
+        vainqueur_nom = None
+        est_nul = False
+        if "home" in scores and "away" in scores:
+            if scores["home"] > scores["away"]:
+                vainqueur_nom = h_nom.lower()
+            elif scores["away"] > scores["home"]:
+                vainqueur_nom = a_nom.lower()
+            else:
+                est_nul = True
+
+        resultats[eid] = {
+            "statut": "RESOLU",
+            "vainqueur": vainqueur_nom,
+            "nul": est_nul,
+        }
+    return resultats
 
 
 def analyser_foot_competitions(competitions, heures_max=48):
@@ -545,6 +755,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
     alertes_globales = {}
     stats_par_comp = {}
     apercu_lignes = []
+    resultats_termines = {}
 
     aujourdhui = datetime.now(timezone.utc).date()
 
@@ -612,6 +823,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
                 dedup_comp[eid] = ev
 
         events_comp = list(dedup_comp.values())
+        res_clos_comp = _collecter_resultats_termines(events_comp)
         a_venir_48h = [ev for ev in events_comp if _est_match_a_venir_dans_fenetre(ev, heures_max)]
         a_venir_48h.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
 
@@ -631,19 +843,20 @@ def analyser_foot_competitions(competitions, heures_max=48):
                     f"{h.get('short_name') or h.get('name') or '?'} vs {a.get('short_name') or a.get('name') or '?'}"
                 )
 
-        return label_comp, res_comp, {}, nb_clos, len(events_comp), apercu_comp
+        return label_comp, res_comp, {}, nb_clos, len(events_comp), apercu_comp, res_clos_comp
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         res_comps = list(ex.map(analyser_comp, competitions))
 
-    for label_comp, res_comp, alertes_comp, nb_clos, total_events, apercu_comp in res_comps:
+    for label_comp, res_comp, alertes_comp, nb_clos, total_events, apercu_comp, res_clos_comp in res_comps:
         resultats_a_venir.extend(res_comp)
         alertes_globales.update(alertes_comp)
         apercu_lignes.extend(apercu_comp)
+        resultats_termines.update(res_clos_comp)
         stats_par_comp[label_comp] = f"À venir: {len(res_comp)} | Terminés: {nb_clos} (bruts: {total_events})"
 
     logger.info("Couverture Foot : %s", " • ".join(f"{k}: {v}" for k, v in stats_par_comp.items()))
-    return resultats_a_venir, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12])
+    return resultats_a_venir, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12]), resultats_termines
 
 
 def trouver_rang(nom, rk_map):
@@ -658,7 +871,19 @@ def trouver_rang(nom, rk_map):
     return None
 
 
+def _detecter_surface_tennis(nom_tournoi):
+    tl = str(nom_tournoi or "").lower()
+    if any(w in tl for w in ("roland", "madrid", "rome", "monte carlo", "clay", "terre")):
+        return "Terre battue"
+    if any(w in tl for w in ("wimbledon", "halle", "queen", "grass", "gazon")):
+        return "Gazon"
+    if any(w in tl for w in ("indoor", "paris", "basel", "vienna", "rotterdam", "finals")):
+        return "Dur indoor"
+    return "Dur"
+
+
 def analyser_tennis(heures_max=48):
+    resultats_termines = {}
     try:
         atp_rk = {
             " ".join(p["name"].lower().split()): p["rank"]
@@ -671,21 +896,46 @@ def analyser_tennis(heures_max=48):
         sb = tn.get_scoreboard()
     except Exception as e:
         logger.warning("Erreur récupération données tennis: %s", e)
-        return [], {}
+        return [], {}, resultats_termines
 
     simples = []
     alertes_tennis = {}
 
     for t in sb.get("data", {}).get("tournaments", []):
-        t_name = t.get("name")
+        t_name = t.get("name") or "Tennis"
+        surface = _detecter_surface_tennis(t_name)
         for d in t.get("draws", []):
             if "Doubles" in d.get("name", ""):
                 continue
             rk_map = atp_rk if "Men" in d.get("name", "") else wta_rk
             for m in d.get("matches", []):
+                mid = str(m.get("id") or "").strip()
+                comps = m.get("competitors", [])
+                statut = str(m.get("status") or "").strip().lower()
+                if mid and len(comps) == 2:
+                    j1_raw = str(comps[0].get("name") or "").strip().lower()
+                    j2_raw = str(comps[1].get("name") or "").strip().lower()
+                    if statut in STATUTS_ANNULES:
+                        resultats_termines[mid] = {"statut": "ANNULE"}
+                    elif statut in STATUTS_TERMINES:
+                        vainqueur = None
+                        for c in comps:
+                            if c.get("winner") is True:
+                                vainqueur = str(c.get("name") or "").strip().lower()
+                        if not vainqueur:
+                            try:
+                                s0 = float(comps[0].get("score"))
+                                s1 = float(comps[1].get("score"))
+                                if s0 > s1:
+                                    vainqueur = j1_raw
+                                elif s1 > s0:
+                                    vainqueur = j2_raw
+                            except Exception:
+                                pass
+                        resultats_termines[mid] = {"statut": "RESOLU", "vainqueur": vainqueur, "nul": False}
+
                 if not _est_match_a_venir_dans_fenetre(m, heures_max):
                     continue
-                comps = m.get("competitors", [])
                 if len(comps) != 2:
                     continue
                 j1, j2 = comps[0].get("name", ""), comps[1].get("name", "")
@@ -700,24 +950,38 @@ def analyser_tennis(heures_max=48):
                 prob = min(max(prob, 0.50), plafond)
 
                 proba_pct = round(max(0.05, prob) * 100, 1)
-                conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, complet, 0.0)
+                cote_obs = _extraire_cote_match(m, "home" if favori == j1 else "away")
+                cote_courte = bool(cote_obs and cote_obs < 1.25)
+
+                conf_score, conf_niveau = _calculer_indice_confiance(
+                    proba_pct, complet, 0.0, ev_pct=None, est_nul=False, cote_courte=cote_courte
+                )
+                cote_min, cote_val, ev_pct, mise_u = _calculer_value_et_mise(proba_pct, conf_score, complet, cote_obs)
+                conf_score, conf_niveau = _calculer_indice_confiance(
+                    proba_pct, complet, 0.0, ev_pct=ev_pct, est_nul=False, cote_courte=cote_courte
+                )
+
+                cote_note = f" | Cote {cote_val} (EV {ev_pct:+.1f}%)" if cote_val and ev_pct is not None else f" | Cote min @{cote_min}"
                 simples.append({
                     "sport": "TENNIS",
-                    "competition": t_name or "Tennis",
+                    "competition": t_name,
                     "fiable": complet,
-                    "event_id": str(m.get("id", "")),
+                    "event_id": mid,
                     "match": f"{j1} (#{r1 or 'NC'}) vs {j2} (#{r2 or 'NC'})",
                     "date_match": _formater_date_locale(str(m.get("date", ""))),
-                    "detail": f"{t_name}",
+                    "detail": f"{t_name} • Surface: {surface}{cote_note}",
                     "choix": f"Victoire {favori}",
                     "proba": proba_pct,
                     "prudence": "MODERE" if (proba_pct >= 58 and complet) else "PRUDENT",
                     "confiance": conf_niveau,
                     "confiance_score": conf_score,
-                    "mise_u": CFG.mise_unite_defaut,
+                    "cote": cote_val,
+                    "cote_min": cote_min,
+                    "ev_pct": ev_pct,
+                    "mise_u": mise_u,
                     "equipes": [favori],
                 })
-    return simples, alertes_tennis
+    return simples, alertes_tennis, resultats_termines
 
 
 def _enrichir_sante_items(items_cibles, tous_les_items=None):
@@ -759,15 +1023,53 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
             penalite_proba = min(grav * 0.025, 0.09)
             it["proba"] = round(max(0.05, it["proba"] / 100 - penalite_proba) * 100, 1)
             it["prudence"] = "MODERE" if (it["proba"] >= 62 and grav < 1.0) else "PRUDENT (alerte)"
+        est_nul = str(it.get("choix") or "").strip().lower() == "match nul"
+        cote_val = it.get("cote")
+        cote_courte = bool(cote_val and cote_val < 1.28)
+        cote_min, _, ev_pct, mise_u = _calculer_value_et_mise(
+            it.get("proba", 50.0),
+            it.get("confiance_score", it.get("proba", 50.0)),
+            bool(it.get("fiable", True)),
+            cote_val,
+        )
         conf_score, conf_niveau = _calculer_indice_confiance(
             it.get("proba", 50.0),
             bool(it.get("fiable", True)),
             grav,
+            ev_pct=ev_pct,
+            est_nul=est_nul,
+            cote_courte=cote_courte,
         )
+        it["cote_min"] = cote_min
+        it["ev_pct"] = ev_pct
+        it["mise_u"] = mise_u
         it["confiance"] = conf_niveau
         it["confiance_score"] = conf_score
 
     return alertes_globales
+
+
+def _evaluer_ligne_contre_resultat(row, info_match):
+    if not info_match:
+        return None
+    if info_match.get("statut") == "ANNULE":
+        return "ANNULE"
+    if info_match.get("statut") != "RESOLU":
+        return None
+
+    choix_l = str(row.get("choix") or "").strip().lower()
+    if info_match.get("nul"):
+        return "GAGNE" if choix_l == "match nul" else "PERDU"
+
+    vainqueur = str(info_match.get("vainqueur") or "").strip().lower()
+    if not vainqueur:
+        return None
+    if choix_l == "match nul":
+        return "PERDU"
+    cible_choix = choix_l.replace("victoire ", "", 1).strip()
+    if cible_choix and (cible_choix == vainqueur or cible_choix in vainqueur or vainqueur in cible_choix):
+        return "GAGNE"
+    return "PERDU"
 
 
 def _calculer_bilan(lignes):
@@ -780,9 +1082,14 @@ def _calculer_bilan(lignes):
             m = float(r.get("mise_u") or 0.0)
         except Exception:
             m = 0.0
+        try:
+            cote = float(r.get("cote") or 0.0)
+        except Exception:
+            cote = 0.0
         mises += m
         if r.get("statut") == "GAGNE":
-            pnl += m
+            gain_net = m * (cote - 1.0) if cote > 1.01 else m
+            pnl += gain_net
         elif r.get("statut") == "PERDU":
             pnl -= m
     taux = round((len(gagnes) / len(verifies)) * 100, 1) if verifies else 0.0
@@ -799,10 +1106,10 @@ def _calculer_bilan(lignes):
     }
 
 
-def mettre_a_jour_historique(items):
+def mettre_a_jour_historique(items, resultats_termines=None):
     champs = [
         "date_analyse", "sport", "event_id", "match", "date_match",
-        "choix", "proba", "prudence", "mise_u", "statut",
+        "choix", "proba", "prudence", "cote", "mise_u", "statut",
     ]
     lignes = []
     cles = set()
@@ -815,6 +1122,14 @@ def mettre_a_jour_historique(items):
                         cles.add(f"{row.get('sport')}_{row.get('event_id')}_{row.get('choix')}")
         except Exception as e:
             logger.warning("Erreur lecture historique CSV: %s", e)
+
+    if resultats_termines:
+        for row in lignes:
+            if row.get("statut") == "EN_ATTENTE":
+                eid = str(row.get("event_id") or "").strip()
+                nouveau_statut = _evaluer_ligne_contre_resultat(row, resultats_termines.get(eid))
+                if nouveau_statut:
+                    row["statut"] = nouveau_statut
 
     now_str = datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M")
     for p in items:
@@ -829,6 +1144,7 @@ def mettre_a_jour_historique(items):
                 "choix": p["choix"],
                 "proba": str(p["proba"]),
                 "prudence": p["prudence"],
+                "cote": str(p.get("cote") or ""),
                 "mise_u": str(p.get("mise_u", CFG.mise_unite_defaut)),
                 "statut": "EN_ATTENTE",
             })
@@ -858,18 +1174,18 @@ def executer_analyse():
         logger.info("Analyse en cours (fenetre: %sh)...", CFG.fenetre_heures)
 
         try:
-            foot_res, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
+            foot_res, alertes_f, stats_comp, apercu_bruts, res_clos_f = analyser_foot_competitions(
                 COMPETITIONS_CIBLES, CFG.fenetre_heures
             )
         except Exception as e:
             logger.error("Erreur Foot: %s", e)
-            foot_res, alertes_f, stats_comp, apercu_bruts = [], {}, {}, f"Erreur Foot: {e}"
+            foot_res, alertes_f, stats_comp, apercu_bruts, res_clos_f = [], {}, {}, f"Erreur Foot: {e}", {}
 
         try:
-            tennis_res, alertes_t = analyser_tennis(CFG.fenetre_heures)
+            tennis_res, alertes_t, res_clos_t = analyser_tennis(CFG.fenetre_heures)
         except Exception as e:
             logger.error("Erreur Tennis: %s", e)
-            tennis_res, alertes_t = [], {}
+            tennis_res, alertes_t, res_clos_t = [], {}, {}
 
         foot_sorted = sorted(foot_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
         tennis_sorted = sorted(tennis_res, key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]), reverse=True)
@@ -895,15 +1211,20 @@ def executer_analyse():
             reverse=True,
         )[:10]
 
+        resultats_termines = {**res_clos_f, **res_clos_t}
         try:
-            bilan = mettre_a_jour_historique([x for x in top_sur if x.get("fiable", True)])
+            bilan = mettre_a_jour_historique(
+                [x for x in top_sur if x.get("fiable", True)],
+                resultats_termines=resultats_termines,
+            )
         except Exception as e:
             logger.error("Erreur Historique: %s", e)
             with _STATE_LOCK:
                 bilan = dict(_DERNIER_RAPPORT.get("bilan") or {})
 
         synthese = "\n".join(
-            f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')}] {x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
+            f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')} | Mise {x.get('mise_u', 1.0)}u | Min @{x.get('cote_min', '-')}] "
+            f"{x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
             for x in top_sur[:8]
         ) or f"Aucun match à venir dans les prochaines {CFG.fenetre_heures}h."
 
@@ -1192,7 +1513,7 @@ _HTML_PAGE = """<!doctype html>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} — {{ it.competition }}
+          {{ it.date_match }} — {{ it.competition }} • Mise conseillée : <strong>{{ it.get('mise_u', 1.0) }}u</strong>
         </div>
         <div class="conf-meter">
           <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
@@ -1229,7 +1550,7 @@ _HTML_PAGE = """<!doctype html>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }}
+          {{ it.date_match }} • Mise : <strong>{{ it.get('mise_u', 1.0) }}u</strong>
         </div>
         <div class="conf-meter">
           <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
@@ -1259,12 +1580,15 @@ _HTML_PAGE = """<!doctype html>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} — {{ it.competition }}
+          {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 1.0) }}u</strong>
         </div>
         <div class="conf-meter">
           <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
           <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
         </div>
+        {% if it.detail %}
+        <div class="card-detail">{{ it.detail }}</div>
+        {% endif %}
       </div>
       {% else %}
       <div class="card">Aucun match de tennis à venir dans cette fenêtre.</div>
@@ -1293,6 +1617,7 @@ _HTML_PAGE = """<!doctype html>
       <span class="stat-item">En attente : <strong>{{ r.get("bilan", {}).get("en_attente", 0) }}</strong></span>
       <span class="stat-item">Vérifiés : <strong>{{ r.get("bilan", {}).get("verifies", 0) }}</strong></span>
       <span class="stat-item">Réussite : <strong>{{ r.get("bilan", {}).get("taux", 0.0) }}%</strong></span>
+      <span class="stat-item">ROI : <strong>{{ r.get("bilan", {}).get("roi_pct", 0.0) }}%</strong></span>
       <span class="stat-item">PnL : <strong>{{ r.get("bilan", {}).get("pnl_total", 0.0) }}u</strong></span>
     </div>
     <div class="panel">
