@@ -10,6 +10,7 @@ import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -52,7 +53,10 @@ STATUTS_TERMINES = {
 }
 STATUTS_TERMINES_OU_EN_COURS = STATUTS_TERMINES | {"in_progress", "live"}
 
-MOTS_ALERTE_FORT = ("forfait", "blessure", "blessé", "blessée", "opéré", "opérée", "rupture", "absent", "absente", "suspendu", "out", "injured")
+MOTS_ALERTE_FORT = (
+    "forfait", "blessure", "blessé", "blessée", "opéré", "opérée",
+    "rupture", "absent", "absente", "suspendu", "out", "injured",
+)
 MOTS_ALERTE_FAIBLE = ("incertain", "incertaine", "doute", "gêne", "repris", "doubtful", "knock")
 
 
@@ -64,12 +68,44 @@ class Config:
     timeout_http: float = field(default_factory=lambda: max(1.0, float(os.getenv("TIMEOUT_HTTP", "4"))))
     cache_ttl_sec: int = field(default_factory=lambda: max(60, int(os.getenv("CACHE_TTL_SEC", "900"))))
     mise_unite_defaut: float = field(default_factory=lambda: max(0.0, float(os.getenv("MISE_UNITE_DEFAUT", "1.0"))))
+    auto_refresh_sec: int = field(default_factory=lambda: max(0, int(os.getenv("AUTO_REFRESH_SEC", "0"))))
     activer_debug_routes: bool = field(
         default_factory=lambda: os.getenv("ACTIVER_DEBUG_ROUTES", "false").strip().lower() in ("1", "true", "yes")
     )
 
 
 CFG = Config()
+
+
+class _CacheBorne:
+    def __init__(self, max_taille=512):
+        self._max_taille = max(32, int(max_taille))
+        self._data = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, cle, ttl_sec):
+        now = time.monotonic()
+        with self._lock:
+            entree = self._data.get(cle)
+            if not entree:
+                return None
+            ts, val = entree
+            if (now - ts) > ttl_sec:
+                self._data.pop(cle, None)
+                return None
+            self._data.move_to_end(cle)
+            return val
+
+    def set(self, cle, val):
+        now = time.monotonic()
+        with self._lock:
+            if cle in self._data:
+                self._data[cle] = (now, val)
+                self._data.move_to_end(cle)
+            else:
+                self._data[cle] = (now, val)
+                while len(self._data) > self._max_taille:
+                    self._data.popitem(last=False)
 
 
 def _resoudre_chemin_historique():
@@ -110,10 +146,12 @@ _HTTP_SESSION.headers.update({
     )
 })
 
-_CACHE_FOOT_SCHED = {}
-_CACHE_SANTE = {}
+_CACHE_FOOT_SCHED = _CacheBorne(max_taille=400)
+_CACHE_SANTE = _CacheBorne(max_taille=400)
 _STATE_LOCK = threading.Lock()
+_CSV_LOCK = threading.Lock()
 _ANALYSE_EN_COURS = False
+_SCHEDULER_DEMARRE = False
 
 _DERNIER_RAPPORT = {
     "mis_a_jour": None,
@@ -157,21 +195,6 @@ def _sauvegarder_rapport_disque(rapport):
                 os.remove(tmp_path)
         except Exception:
             pass
-
-
-def _cache_get(cache_dict, cle):
-    entree = cache_dict.get(cle)
-    if not entree:
-        return None
-    ts, val = entree
-    if (time.monotonic() - ts) > CFG.cache_ttl_sec:
-        cache_dict.pop(cle, None)
-        return None
-    return val
-
-
-def _cache_set(cache_dict, cle, val):
-    cache_dict[cle] = (time.monotonic(), val)
 
 
 def _extraire_events(payload):
@@ -226,7 +249,7 @@ def _normaliser_home_away(ev):
 def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year=None):
     saison = str(season_year or CFG.saison_foot)
     cle = (str(team_id), str(league_slug), saison)
-    cached = _cache_get(_CACHE_FOOT_SCHED, cle)
+    cached = _CACHE_FOOT_SCHED.get(cle, CFG.cache_ttl_sec)
     if cached is not None:
         return cached
 
@@ -243,7 +266,7 @@ def get_foot_schedule_cached(team_id, league_slug="ligue-1", season_year=None):
         except Exception as e:
             logger.warning("get_team_schedule(%s) erreur: %s", cle, e)
 
-    _cache_set(_CACHE_FOOT_SCHED, cle, res)
+    _CACHE_FOOT_SCHED.set(cle, res)
     return res
 
 
@@ -265,6 +288,21 @@ def _formater_date_locale(date_str):
     if dt is None:
         return str(date_str or "")[:16].replace("T", " ")
     return dt.astimezone(TZ_PARIS).strftime("%Y-%m-%d %H:%M")
+
+
+def _cle_dedup_evenement(ev, fallback_idx=0):
+    eid = str(ev.get("id") or "").strip()
+    if eid:
+        return f"id:{eid}"
+    h_info, a_info = _normaliser_home_away(ev)
+    h_nom = str(h_info.get("short_name") or h_info.get("name") or "").strip().lower()
+    a_nom = str(a_info.get("short_name") or a_info.get("name") or "").strip().lower()
+    dt = _parse_date_utc(ev.get("start_time") or ev.get("date"))
+    dt_bucket = dt.strftime("%Y-%m-%d-%H") if dt else str(ev.get("start_time") or ev.get("date") or "")[:13]
+    equipes = tuple(sorted(x for x in (h_nom, a_nom) if x))
+    if len(equipes) == 2:
+        return f"match:{dt_bucket}:{equipes[0]}:{equipes[1]}"
+    return f"fallback:{fallback_idx}"
 
 
 def _est_match_a_venir_dans_fenetre(ev, heures_max):
@@ -290,10 +328,11 @@ def poisson_prob(k, lam):
 
 
 def simuler_poisson_foot(lam_h, lam_a):
+    max_buts = 11
     p_h = p_n = p_a = p_over_25 = 0.0
-    for h in range(8):
+    for h in range(max_buts):
         pr_h = poisson_prob(h, lam_h)
-        for a in range(8):
+        for a in range(max_buts):
             pr = pr_h * poisson_prob(a, lam_a)
             if h > a:
                 p_h += pr
@@ -307,7 +346,7 @@ def simuler_poisson_foot(lam_h, lam_a):
     if tot <= 0:
         return 1 / 3, 1 / 3, 1 / 3, 0.5, 0.5
     p_h, p_n, p_a = p_h / tot, p_n / tot, p_a / tot
-    p_ov25_norm = min(max(p_over_25 / tot, 0.0), 1.0)
+    p_ov25_norm = min(max(p_over_25, 0.0), 1.0)
     return p_h, p_n, p_a, p_ov25_norm, 1.0 - p_ov25_norm
 
 
@@ -337,6 +376,46 @@ def _calculer_indice_confiance(proba_pct, fiable, gravite_alerte=0.0):
     return score, niveau
 
 
+def _extraire_scores_evenement(ev):
+    comps = ev.get("competitors")
+    if isinstance(comps, dict):
+        comps_liste = [
+            {**comps.get("home", {}), "qualifier": "home"},
+            {**comps.get("away", {}), "qualifier": "away"},
+        ]
+    elif isinstance(comps, list):
+        comps_liste = comps
+    else:
+        comps_liste = []
+
+    res = []
+    for idx_c, c in enumerate(comps_liste):
+        if not isinstance(c, dict):
+            continue
+        t_obj = c.get("team") if isinstance(c.get("team"), dict) else c
+        tid = str(t_obj.get("id") or c.get("id") or "")
+        tnm = str(t_obj.get("name") or t_obj.get("short_name") or c.get("name") or "").strip()
+        qual = str(c.get("qualifier") or c.get("homeAway") or "").strip().lower()
+        if not qual:
+            qual = "home" if idx_c == 0 else "away"
+        sc = c.get("score")
+        sc_int = None
+        if sc is not None and str(sc).strip() != "":
+            try:
+                sc_int = int(float(sc))
+            except Exception:
+                sc_int = None
+        winner = c.get("winner")
+        res.append({
+            "id": tid,
+            "name": tnm,
+            "qualifier": qual,
+            "score": sc_int,
+            "winner": winner,
+        })
+    return res
+
+
 def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8):
     events = list(events_override or [])
     joues = [ev for ev in events if str(ev.get("status", "")).lower() in STATUTS_TERMINES]
@@ -349,39 +428,19 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8)
     nom_l = (team_name or "").strip().lower()
 
     for ev in reversed(joues):
-        comps = ev.get("competitors")
-        if isinstance(comps, dict):
-            comps_liste = [
-                {**comps.get("home", {}), "qualifier": "home"},
-                {**comps.get("away", {}), "qualifier": "away"},
-            ]
-        elif isinstance(comps, list):
-            comps_liste = comps
-        else:
-            comps_liste = []
-
         scores_par_role = []
         moi = None
         mon_role = ""
-        for idx_c, c in enumerate(comps_liste):
-            if not isinstance(c, dict):
+        for item in _extraire_scores_evenement(ev):
+            sc_int = item["score"]
+            if sc_int is None:
                 continue
-            t_obj = c.get("team") if isinstance(c.get("team"), dict) else c
-            tid = str(t_obj.get("id") or c.get("id") or "")
-            tnm = str(t_obj.get("name") or t_obj.get("short_name") or c.get("name") or "").strip().lower()
-            qual = str(c.get("qualifier") or c.get("homeAway") or "").strip().lower()
-            if not qual:
-                qual = "home" if idx_c == 0 else "away"
-            sc = c.get("score")
-            if sc is None:
-                continue
-            try:
-                sc_int = int(float(sc))
-            except Exception:
-                continue
-            scores_par_role.append((tid, tnm, qual, sc_int))
+            tid = item["id"]
+            tnm_l = item["name"].lower()
+            qual = item["qualifier"]
+            scores_par_role.append((tid, tnm_l, qual, sc_int))
             est_moi = (team_id and tid and tid == str(team_id)) or (
-                nom_l and tnm and (tnm == nom_l or nom_l in tnm or tnm in nom_l)
+                nom_l and tnm_l and (tnm_l == nom_l or nom_l in tnm_l or tnm_l in nom_l)
             )
             if est_moi and moi is None:
                 moi = sc_int
@@ -389,8 +448,8 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8)
 
         adv = None
         if moi is not None and len(scores_par_role) >= 2:
-            for tid, tnm, _, sc_int in scores_par_role:
-                if not ((team_id and tid and tid == str(team_id)) or (nom_l and tnm and tnm == nom_l)):
+            for tid, tnm_l, _, sc_int in scores_par_role:
+                if not ((team_id and tid and tid == str(team_id)) or (nom_l and tnm_l and tnm_l == nom_l)):
                     adv = sc_int
                     break
             if adv is None:
@@ -450,8 +509,6 @@ def _evaluer_gravite_titres(titres):
             gravite += 1.0
         elif any(m in tl for m in MOTS_ALERTE_FAIBLE):
             gravite += 0.5
-        else:
-            gravite += 0.35
     return min(gravite, 2.5)
 
 
@@ -474,13 +531,13 @@ def _requete_rss(requete_brute, max_titres=2):
 
 def scanner_sante_cible(cible, max_titres=2):
     cle = (str(cible).strip().lower(), max_titres)
-    cached = _cache_get(_CACHE_SANTE, cle)
+    cached = _CACHE_SANTE.get(cle, CFG.cache_ttl_sec)
     if cached is not None:
         return list(cached)
 
     requete = f'"{cible}" (blessure OR forfait OR incertain OR absent) (match OR équipe OR foot OR tennis OR ATP OR WTA) when:3d'
     res = _requete_rss(requete, max_titres)
-    _cache_set(_CACHE_SANTE, cle, res)
+    _CACHE_SANTE.set(cle, res)
     return list(res)
 
 
@@ -545,6 +602,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
     alertes_globales = {}
     stats_par_comp = {}
     apercu_lignes = []
+    evenements_termines = {}
 
     aujourdhui = datetime.now(timezone.utc).date()
 
@@ -607,15 +665,20 @@ def analyser_foot_competitions(competitions, heures_max=48):
         raw_comp_events = events_hist_par_slug[slug] + events_upcoming_par_slug[slug]
         dedup_comp = {}
         for idx, ev in enumerate(raw_comp_events):
-            eid = str(ev.get("id") or f"{slug}_{idx}")
-            if eid not in dedup_comp:
-                dedup_comp[eid] = ev
+            cle = _cle_dedup_evenement(ev, idx)
+            if cle not in dedup_comp:
+                dedup_comp[cle] = ev
 
         events_comp = list(dedup_comp.values())
         a_venir_48h = [ev for ev in events_comp if _est_match_a_venir_dans_fenetre(ev, heures_max)]
         a_venir_48h.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
 
-        nb_clos = sum(1 for ev in events_comp if str(ev.get("status") or "").strip().lower() in STATUTS_TERMINES)
+        clos_comp = {}
+        for ev in events_comp:
+            if str(ev.get("status") or "").strip().lower() in STATUTS_TERMINES:
+                eid = str(ev.get("id") or "").strip()
+                if eid:
+                    clos_comp[eid] = ev
 
         res_comp = []
         apercu_comp = []
@@ -631,19 +694,20 @@ def analyser_foot_competitions(competitions, heures_max=48):
                     f"{h.get('short_name') or h.get('name') or '?'} vs {a.get('short_name') or a.get('name') or '?'}"
                 )
 
-        return label_comp, res_comp, {}, nb_clos, len(events_comp), apercu_comp
+        return label_comp, res_comp, {}, len(clos_comp), len(events_comp), apercu_comp, clos_comp
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         res_comps = list(ex.map(analyser_comp, competitions))
 
-    for label_comp, res_comp, alertes_comp, nb_clos, total_events, apercu_comp in res_comps:
+    for label_comp, res_comp, alertes_comp, nb_clos, total_events, apercu_comp, clos_comp in res_comps:
         resultats_a_venir.extend(res_comp)
         alertes_globales.update(alertes_comp)
         apercu_lignes.extend(apercu_comp)
+        evenements_termines.update(clos_comp)
         stats_par_comp[label_comp] = f"À venir: {len(res_comp)} | Terminés: {nb_clos} (bruts: {total_events})"
 
     logger.info("Couverture Foot : %s", " • ".join(f"{k}: {v}" for k, v in stats_par_comp.items()))
-    return resultats_a_venir, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12])
+    return resultats_a_venir, alertes_globales, stats_par_comp, "\n".join(apercu_lignes[:12]), evenements_termines
 
 
 def trouver_rang(nom, rk_map):
@@ -671,10 +735,11 @@ def analyser_tennis(heures_max=48):
         sb = tn.get_scoreboard()
     except Exception as e:
         logger.warning("Erreur récupération données tennis: %s", e)
-        return [], {}
+        return [], {}, {}
 
     simples = []
     alertes_tennis = {}
+    termines_tennis = {}
 
     for t in sb.get("data", {}).get("tournaments", []):
         t_name = t.get("name")
@@ -683,6 +748,10 @@ def analyser_tennis(heures_max=48):
                 continue
             rk_map = atp_rk if "Men" in d.get("name", "") else wta_rk
             for m in d.get("matches", []):
+                mid = str(m.get("id") or "").strip()
+                statut = str(m.get("status") or "").strip().lower()
+                if statut in STATUTS_TERMINES and mid:
+                    termines_tennis[mid] = m
                 if not _est_match_a_venir_dans_fenetre(m, heures_max):
                     continue
                 comps = m.get("competitors", [])
@@ -705,7 +774,7 @@ def analyser_tennis(heures_max=48):
                     "sport": "TENNIS",
                     "competition": t_name or "Tennis",
                     "fiable": complet,
-                    "event_id": str(m.get("id", "")),
+                    "event_id": mid,
                     "match": f"{j1} (#{r1 or 'NC'}) vs {j2} (#{r2 or 'NC'})",
                     "date_match": _formater_date_locale(str(m.get("date", ""))),
                     "detail": f"{t_name}",
@@ -717,7 +786,7 @@ def analyser_tennis(heures_max=48):
                     "mise_u": CFG.mise_unite_defaut,
                     "equipes": [favori],
                 })
-    return simples, alertes_tennis
+    return simples, alertes_tennis, termines_tennis
 
 
 def _enrichir_sante_items(items_cibles, tous_les_items=None):
@@ -799,52 +868,167 @@ def _calculer_bilan(lignes):
     }
 
 
-def mettre_a_jour_historique(items):
+def _resoudre_statut_depuis_evenement(row, ev):
+    if not ev:
+        return None
+    sport = str(row.get("sport") or "").upper()
+    choix_l = str(row.get("choix") or "").strip().lower()
+    scores = _extraire_scores_evenement(ev)
+
+    if sport == "FOOT":
+        h_sc = a_sc = None
+        h_nm = a_nm = ""
+        for item in scores:
+            if item["qualifier"] == "home":
+                h_sc = item["score"]
+                h_nm = item["name"].lower()
+            elif item["qualifier"] == "away":
+                a_sc = item["score"]
+                a_nm = item["name"].lower()
+        if len(scores) >= 2 and (h_sc is None or a_sc is None):
+            h_sc = scores[0]["score"]
+            h_nm = scores[0]["name"].lower()
+            a_sc = scores[1]["score"]
+            a_nm = scores[1]["name"].lower()
+        if h_sc is None or a_sc is None:
+            return None
+        if choix_l == "match nul":
+            return "GAGNE" if h_sc == a_sc else "PERDU"
+        if choix_l.startswith("victoire "):
+            cible = choix_l.replace("victoire ", "", 1).strip()
+            if cible and h_nm and (cible == h_nm or cible in h_nm or h_nm in cible):
+                return "GAGNE" if h_sc > a_sc else "PERDU"
+            if cible and a_nm and (cible == a_nm or cible in a_nm or a_nm in cible):
+                return "GAGNE" if a_sc > h_sc else "PERDU"
+        return None
+
+    if sport == "TENNIS" and choix_l.startswith("victoire "):
+        cible = choix_l.replace("victoire ", "", 1).strip()
+        if not cible:
+            return None
+        for item in scores:
+            nm = item["name"].lower()
+            if nm and (cible == nm or cible in nm or nm in cible):
+                if item["winner"] is True:
+                    return "GAGNE"
+                if item["winner"] is False:
+                    return "PERDU"
+        if len(scores) == 2 and scores[0]["score"] is not None and scores[1]["score"] is not None:
+            s0, s1 = scores[0]["score"], scores[1]["score"]
+            if s0 != s1:
+                gagnant = scores[0]["name"].lower() if s0 > s1 else scores[1]["name"].lower()
+                return "GAGNE" if (cible == gagnant or cible in gagnant or gagnant in cible) else "PERDU"
+    return None
+
+
+def mettre_a_jour_historique(items, evenements_termines=None):
     champs = [
         "date_analyse", "sport", "event_id", "match", "date_match",
         "choix", "proba", "prudence", "mise_u", "statut",
     ]
-    lignes = []
-    cles = set()
-    if os.path.exists(FICHIER_HISTORIQUE):
+    clos_map = evenements_termines or {}
+
+    with _CSV_LOCK:
+        lignes = []
+        cles = set()
+        if os.path.exists(FICHIER_HISTORIQUE):
+            try:
+                with open(FICHIER_HISTORIQUE, "r", newline="", encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        if any((v or "").strip() for v in row.values()):
+                            clean_row = {k: (row.get(k) or "").strip() for k in champs}
+                            if not clean_row["statut"]:
+                                clean_row["statut"] = "EN_ATTENTE"
+                            lignes.append(clean_row)
+                            cles.add(f"{clean_row['sport']}_{clean_row['event_id']}_{clean_row['choix']}")
+            except Exception as e:
+                logger.warning("Erreur lecture historique CSV: %s", e)
+
+        for r in lignes:
+            if r.get("statut") == "EN_ATTENTE":
+                ev_clos = clos_map.get(str(r.get("event_id") or "").strip())
+                nouveau_statut = _resoudre_statut_depuis_evenement(r, ev_clos)
+                if nouveau_statut in ("GAGNE", "PERDU"):
+                    r["statut"] = nouveau_statut
+
+        now_str = datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M")
+        for p in items:
+            cle = f"{p['sport']}_{p['event_id']}_{p['choix']}"
+            if cle not in cles:
+                lignes.append({
+                    "date_analyse": now_str,
+                    "sport": str(p["sport"]),
+                    "event_id": str(p["event_id"]),
+                    "match": str(p["match"]),
+                    "date_match": str(p["date_match"]),
+                    "choix": str(p["choix"]),
+                    "proba": str(p["proba"]),
+                    "prudence": str(p["prudence"]),
+                    "mise_u": str(p.get("mise_u", CFG.mise_unite_defaut)),
+                    "statut": "EN_ATTENTE",
+                })
+                cles.add(cle)
+
         try:
-            with open(FICHIER_HISTORIQUE, "r", newline="", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    if any((v or "").strip() for v in row.values()):
-                        lignes.append(row)
-                        cles.add(f"{row.get('sport')}_{row.get('event_id')}_{row.get('choix')}")
+            os.makedirs(os.path.dirname(FICHIER_HISTORIQUE) or ".", exist_ok=True)
+            tmp_csv = f"{FICHIER_HISTORIQUE}.tmp"
+            with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=champs)
+                writer.writeheader()
+                for r in lignes:
+                    writer.writerow({k: r.get(k, "") for k in champs})
+            os.replace(tmp_csv, FICHIER_HISTORIQUE)
         except Exception as e:
-            logger.warning("Erreur lecture historique CSV: %s", e)
+            logger.warning("Erreur écriture historique CSV: %s", e)
 
-    now_str = datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M")
-    for p in items:
-        cle = f"{p['sport']}_{p['event_id']}_{p['choix']}"
-        if cle not in cles:
-            lignes.append({
-                "date_analyse": now_str,
-                "sport": p["sport"],
-                "event_id": p["event_id"],
-                "match": p["match"],
-                "date_match": p["date_match"],
-                "choix": p["choix"],
-                "proba": str(p["proba"]),
-                "prudence": p["prudence"],
-                "mise_u": str(p.get("mise_u", CFG.mise_unite_defaut)),
-                "statut": "EN_ATTENTE",
-            })
-            cles.add(cle)
+        return _calculer_bilan(lignes)
 
-    try:
-        os.makedirs(os.path.dirname(FICHIER_HISTORIQUE) or ".", exist_ok=True)
-        with open(FICHIER_HISTORIQUE, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=champs)
-            writer.writeheader()
-            for r in lignes:
-                writer.writerow({k: r.get(k, "") for k in champs})
-    except Exception as e:
-        logger.warning("Erreur écriture historique CSV: %s", e)
 
-    return _calculer_bilan(lignes)
+def definir_statut_historique(sport, event_id, choix, statut):
+    statut_norm = str(statut or "").strip().upper()
+    if statut_norm not in ("GAGNE", "PERDU", "EN_ATTENTE"):
+        return None
+    champs = [
+        "date_analyse", "sport", "event_id", "match", "date_match",
+        "choix", "proba", "prudence", "mise_u", "statut",
+    ]
+    cible_cle = f"{str(sport or '').strip().upper()}_{str(event_id or '').strip()}_{str(choix or '').strip()}"
+
+    with _CSV_LOCK:
+        lignes = []
+        if os.path.exists(FICHIER_HISTORIQUE):
+            try:
+                with open(FICHIER_HISTORIQUE, "r", newline="", encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        if any((v or "").strip() for v in row.values()):
+                            lignes.append({k: (row.get(k) or "").strip() for k in champs})
+            except Exception as e:
+                logger.warning("Erreur lecture historique pour mise à jour statut: %s", e)
+                return None
+
+        modifie = False
+        for r in lignes:
+            cle_r = f"{r.get('sport', '').upper()}_{r.get('event_id', '')}_{r.get('choix', '')}"
+            if cle_r == cible_cle:
+                r["statut"] = statut_norm
+                modifie = True
+
+        if not modifie:
+            return None
+
+        try:
+            tmp_csv = f"{FICHIER_HISTORIQUE}.tmp"
+            with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=champs)
+                writer.writeheader()
+                for r in lignes:
+                    writer.writerow({k: r.get(k, "") for k in champs})
+            os.replace(tmp_csv, FICHIER_HISTORIQUE)
+        except Exception as e:
+            logger.warning("Erreur sauvegarde statut historique: %s", e)
+            return None
+
+        return _calculer_bilan(lignes)
 
 
 def executer_analyse():
@@ -856,17 +1040,20 @@ def executer_analyse():
 
     try:
         logger.info("Analyse en cours (fenetre: %sh)...", CFG.fenetre_heures)
+        clos_globaux = {}
 
         try:
-            foot_res, alertes_f, stats_comp, apercu_bruts = analyser_foot_competitions(
+            foot_res, alertes_f, stats_comp, apercu_bruts, clos_foot = analyser_foot_competitions(
                 COMPETITIONS_CIBLES, CFG.fenetre_heures
             )
+            clos_globaux.update(clos_foot)
         except Exception as e:
             logger.error("Erreur Foot: %s", e)
             foot_res, alertes_f, stats_comp, apercu_bruts = [], {}, {}, f"Erreur Foot: {e}"
 
         try:
-            tennis_res, alertes_t = analyser_tennis(CFG.fenetre_heures)
+            tennis_res, alertes_t, clos_tennis = analyser_tennis(CFG.fenetre_heures)
+            clos_globaux.update(clos_tennis)
         except Exception as e:
             logger.error("Erreur Tennis: %s", e)
             tennis_res, alertes_t = [], {}
@@ -896,7 +1083,10 @@ def executer_analyse():
         )[:10]
 
         try:
-            bilan = mettre_a_jour_historique([x for x in top_sur if x.get("fiable", True)])
+            bilan = mettre_a_jour_historique(
+                [x for x in top_sur if x.get("fiable", True)],
+                evenements_termines=clos_globaux,
+            )
         except Exception as e:
             logger.error("Erreur Historique: %s", e)
             with _STATE_LOCK:
@@ -1071,12 +1261,13 @@ _HTML_PAGE = """<!doctype html>
       font-size: 1.05rem;
     }
     .meta { color: var(--muted); font-size: 0.88em; }
-    button, .btn {
+    button, .btn, select {
       background: var(--accent); color: #0b1220; border: none; padding: 9px 15px;
       border-radius: 9px; cursor: pointer; font-weight: 700; text-decoration: none;
       display: inline-flex; align-items: center; gap: 6px; font-size: 0.88em;
       transition: transform 0.12s ease, opacity 0.15s ease, background 0.15s ease;
     }
+    select { background: #0b1220; color: var(--text); border: 1px solid var(--border); font-weight: 600; }
     .btn-cat { background: var(--card); color: var(--text); border: 1px solid var(--border); font-weight: 600; }
     .btn-cat.active { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 700; }
     button:hover, .btn:hover { opacity: 0.92; transform: translateY(-1px); }
@@ -1085,14 +1276,14 @@ _HTML_PAGE = """<!doctype html>
     .toolbar {
       display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between;
       background: rgba(19, 29, 49, 0.75); border: 1px solid var(--border);
-      padding: 10px 12px; border-radius: 12px; margin-bottom: 22px;
+      padding: 10px 12px; border-radius: 12px; margin-bottom: 18px;
     }
     .search-input {
       background: #0b1220; color: var(--text); border: 1px solid var(--border);
-      border-radius: 8px; padding: 8px 12px; font-size: 0.88em; min-width: 220px; flex: 1; max-width: 340px;
+      border-radius: 8px; padding: 8px 12px; font-size: 0.88em; min-width: 210px; flex: 1; max-width: 320px;
     }
     .search-input:focus { outline: none; border-color: var(--accent); }
-    .filter-pills { display: flex; flex-wrap: wrap; gap: 6px; }
+    .filter-pills { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
     .pill-btn {
       background: #0b1220; color: var(--muted); border: 1px solid var(--border);
       padding: 6px 11px; border-radius: 20px; font-size: 0.8em; font-weight: 600;
@@ -1131,11 +1322,25 @@ _HTML_PAGE = """<!doctype html>
       padding: 8px 10px; border-radius: 8px; margin-top: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       line-height: 1.4;
     }
+    .card-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+    .mini-btn {
+      background: #0b1220; color: var(--text); border: 1px solid var(--border);
+      padding: 5px 9px; border-radius: 7px; font-size: 0.75em; font-weight: 600;
+    }
+    .mini-btn.win:hover { border-color: var(--green); color: #6ee7b7; }
+    .mini-btn.loss:hover { border-color: var(--red); color: #fca5a5; }
     .panel { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 24px; }
     .stats-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
     .stat-item { background: var(--card); border: 1px solid var(--border); padding: 8px 13px; border-radius: 999px; font-size: 0.84em; }
     pre { white-space: pre-wrap; background: #0b1220; border: 1px solid var(--border); padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 0.85em; margin: 0; line-height: 1.5; }
     .notice { background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #bae6fd; padding: 10px 14px; border-radius: 10px; margin-bottom: 18px; font-size: 0.9em; }
+    .toast {
+      position: fixed; bottom: 18px; right: 18px; background: #1e293b; color: #f8fafc;
+      border: 1px solid var(--accent); padding: 10px 14px; border-radius: 10px;
+      font-size: 0.84em; font-weight: 600; box-shadow: 0 10px 24px rgba(0,0,0,0.4);
+      opacity: 0; pointer-events: none; transition: opacity 0.2s ease; z-index: 99;
+    }
+    .toast.show { opacity: 1; }
   </style>
 </head>
 <body>
@@ -1146,7 +1351,7 @@ _HTML_PAGE = """<!doctype html>
           <span class="brand-badge">BP</span>
           <h1 style="margin: 0;">BetPulse Pro</h1>
         </a><br>
-        <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }} • Fenêtre : {{ fenetre_heures }}h</span>
+        <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }} • Fenêtre : {{ fenetre_heures }}h • <span id="compteur-cartes">Filtre actif</span></span>
       </div>
       <form method="post" action="/refresh" style="margin: 0;" onsubmit="document.getElementById('btn-refresh').disabled=true; document.getElementById('btn-refresh').innerText='Actualisation…';">
         <button id="btn-refresh" type="submit">↻ Actualiser</button>
@@ -1169,6 +1374,17 @@ _HTML_PAGE = """<!doctype html>
         <button type="button" class="pill-btn" data-conf="HAUTE" onclick="setConf('HAUTE', this)">Haute</button>
         <button type="button" class="pill-btn" data-conf="MOYENNE" onclick="setConf('MOYENNE', this)">Moyenne</button>
         <button type="button" class="pill-btn" data-conf="FAIBLE" onclick="setConf('FAIBLE', this)">Faible</button>
+        <select id="proba-min" onchange="appliquerFiltres()" title="Probabilité minimale">
+          <option value="0">Proba min : Tous</option>
+          <option value="55">≥ 55%</option>
+          <option value="65">≥ 65%</option>
+          <option value="75">≥ 75%</option>
+        </select>
+        <select id="sort-mode" onchange="trierCartes()" title="Tri des cartes">
+          <option value="conf">Tri : Confiance</option>
+          <option value="proba">Tri : Probabilité</option>
+          <option value="date">Tri : Date match</option>
+        </select>
       </div>
     </div>
 
@@ -1182,7 +1398,12 @@ _HTML_PAGE = """<!doctype html>
       {% for it in r.top_sur %}
       {% set conf = it.get('confiance', 'MOYENNE') %}
       {% set conf_sc = it.get('confiance_score', it.proba) %}
-      <div class="card {{ conf }}" data-conf="{{ conf }}" data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
+      <div class="card {{ conf }}"
+           data-conf="{{ conf }}"
+           data-proba="{{ it.proba }}"
+           data-conf-score="{{ conf_sc }}"
+           data-date="{{ it.date_match }}"
+           data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
         <div class="card-top">
           <div class="card-title">{{ it.choix }}</div>
           <div class="badges-right">
@@ -1201,6 +1422,11 @@ _HTML_PAGE = """<!doctype html>
         {% if it.detail %}
         <div class="card-detail">{{ it.detail }}</div>
         {% endif %}
+        <div class="card-actions">
+          <button type="button" class="mini-btn" onclick="copierProno(this)" data-copy="[{{ it.sport }}] {{ it.match }} ({{ it.date_match }}) -> {{ it.choix }} ({{ it.proba }}% | Confiance {{ conf }})">Copier</button>
+          <button type="button" class="mini-btn win" onclick="majStatut('{{ it.sport }}', '{{ it.event_id }}', {{ it.choix|tojson }}, 'GAGNE')">✓ Gagné</button>
+          <button type="button" class="mini-btn loss" onclick="majStatut('{{ it.sport }}', '{{ it.event_id }}', {{ it.choix|tojson }}, 'PERDU')">✕ Perdu</button>
+        </div>
       </div>
       {% else %}
       <div class="card">Aucun pronostic disponible.</div>
@@ -1219,7 +1445,12 @@ _HTML_PAGE = """<!doctype html>
       {% for it in r.foot %}
       {% set conf = it.get('confiance', 'MOYENNE') %}
       {% set conf_sc = it.get('confiance_score', it.proba) %}
-      <div class="card {{ conf }}" data-conf="{{ conf }}" data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
+      <div class="card {{ conf }}"
+           data-conf="{{ conf }}"
+           data-proba="{{ it.proba }}"
+           data-conf-score="{{ conf_sc }}"
+           data-date="{{ it.date_match }}"
+           data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
         <div class="card-top">
           <div class="card-title">{{ it.choix }}</div>
           <div class="badges-right">
@@ -1236,6 +1467,9 @@ _HTML_PAGE = """<!doctype html>
           <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
         </div>
         <div class="card-detail">{{ it.detail }}</div>
+        <div class="card-actions">
+          <button type="button" class="mini-btn" onclick="copierProno(this)" data-copy="[FOOT] {{ it.match }} ({{ it.date_match }}) -> {{ it.choix }} ({{ it.proba }}% | Confiance {{ conf }})">Copier</button>
+        </div>
       </div>
       {% else %}
       <div class="card">Aucun match de foot à venir dans cette fenêtre.</div>
@@ -1249,7 +1483,12 @@ _HTML_PAGE = """<!doctype html>
       {% for it in r.tennis %}
       {% set conf = it.get('confiance', 'MOYENNE') %}
       {% set conf_sc = it.get('confiance_score', it.proba) %}
-      <div class="card {{ conf }}" data-conf="{{ conf }}" data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
+      <div class="card {{ conf }}"
+           data-conf="{{ conf }}"
+           data-proba="{{ it.proba }}"
+           data-conf-score="{{ conf_sc }}"
+           data-date="{{ it.date_match }}"
+           data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
         <div class="card-top">
           <div class="card-title">{{ it.choix }}</div>
           <div class="badges-right">
@@ -1264,6 +1503,9 @@ _HTML_PAGE = """<!doctype html>
         <div class="conf-meter">
           <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
           <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
+        </div>
+        <div class="card-actions">
+          <button type="button" class="mini-btn" onclick="copierProno(this)" data-copy="[TENNIS] {{ it.match }} ({{ it.date_match }}) -> {{ it.choix }} ({{ it.proba }}% | Confiance {{ conf }})">Copier</button>
         </div>
       </div>
       {% else %}
@@ -1301,8 +1543,17 @@ _HTML_PAGE = """<!doctype html>
     {% endif %}
   </div>
 
+  <div id="toast" class="toast"></div>
+
   <script>
     let confActif = "ALL";
+    function afficherToast(msg) {
+      const el = document.getElementById("toast");
+      if (!el) return;
+      el.textContent = msg;
+      el.classList.add("show");
+      setTimeout(() => el.classList.remove("show"), 2200);
+    }
     function setConf(val, btn) {
       confActif = val;
       document.querySelectorAll(".pill-btn").forEach(b => b.classList.remove("active"));
@@ -1311,14 +1562,70 @@ _HTML_PAGE = """<!doctype html>
     }
     function appliquerFiltres() {
       const q = (document.getElementById("search-input")?.value || "").trim().toLowerCase();
+      const probaMin = parseFloat(document.getElementById("proba-min")?.value || "0") || 0;
+      let totalCartes = 0;
+      let visibles = 0;
       document.querySelectorAll(".grid .card[data-conf]").forEach(card => {
+        totalCartes += 1;
         const cConf = card.getAttribute("data-conf") || "";
+        const cProba = parseFloat(card.getAttribute("data-proba") || "0") || 0;
         const cText = card.getAttribute("data-search") || "";
         const okConf = (confActif === "ALL") || (cConf === confActif);
+        const okProba = cProba >= probaMin;
         const okText = !q || cText.includes(q);
-        card.style.display = (okConf && okText) ? "" : "none";
+        const show = okConf && okProba && okText;
+        card.style.display = show ? "" : "none";
+        if (show) visibles += 1;
+      });
+      const cpt = document.getElementById("compteur-cartes");
+      if (cpt && totalCartes > 0) {
+        cpt.textContent = `${visibles}/${totalCartes} affichés`;
+      }
+    }
+    function trierCartes() {
+      const mode = document.getElementById("sort-mode")?.value || "conf";
+      document.querySelectorAll(".grid").forEach(grid => {
+        const cards = Array.from(grid.querySelectorAll(".card[data-conf]"));
+        if (cards.length < 2) return;
+        cards.sort((a, b) => {
+          if (mode === "proba") {
+            return (parseFloat(b.dataset.proba) || 0) - (parseFloat(a.dataset.proba) || 0);
+          }
+          if (mode === "date") {
+            return (a.dataset.date || "").localeCompare(b.dataset.date || "");
+          }
+          return (parseFloat(b.dataset.confScore) || 0) - (parseFloat(a.dataset.confScore) || 0);
+        });
+        cards.forEach(c => grid.appendChild(c));
       });
     }
+    async function copierProno(btn) {
+      const txt = btn?.getAttribute("data-copy") || "";
+      if (!txt) return;
+      try {
+        await navigator.clipboard.writeText(txt);
+        afficherToast("Pronostic copié !");
+      } catch (e) {
+        afficherToast("Copie impossible sur ce navigateur");
+      }
+    }
+    async function majStatut(sport, eventId, choix, statut) {
+      try {
+        const res = await fetch("/api/historique/statut", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sport, event_id: eventId, choix, statut })
+        });
+        if (res.ok) {
+          afficherToast(`Statut mis à jour : ${statut}`);
+        } else {
+          afficherToast("Pronostic non trouvé dans l'historique");
+        }
+      } catch (e) {
+        afficherToast("Erreur réseau");
+      }
+    }
+    appliquerFiltres();
   </script>
 </body>
 </html>
@@ -1335,6 +1642,26 @@ def _demarrer_analyse_si_besoin(delai_sec=0.0):
             logger.critical("Erreur fatale analyse background: %s", e)
 
     threading.Thread(target=_runner, daemon=True).start()
+
+
+def _demarrer_scheduler_si_actif():
+    global _SCHEDULER_DEMARRE
+    if CFG.auto_refresh_sec <= 0:
+        return
+    with _STATE_LOCK:
+        if _SCHEDULER_DEMARRE:
+            return
+        _SCHEDULER_DEMARRE = True
+
+    def _loop():
+        while True:
+            time.sleep(CFG.auto_refresh_sec)
+            try:
+                executer_analyse()
+            except Exception as e:
+                logger.warning("Erreur scheduler auto-refresh: %s", e)
+
+    threading.Thread(target=_loop, daemon=True).start()
 
 
 @app.route("/health")
@@ -1365,6 +1692,24 @@ def api_analyse():
     if not rapport.get("mis_a_jour"):
         rapport = executer_analyse()
     return jsonify(rapport)
+
+
+@app.route("/api/historique/statut", methods=["POST"])
+def api_historique_statut():
+    payload = request.get_json(silent=True) or request.form or {}
+    bilan = definir_statut_historique(
+        payload.get("sport"),
+        payload.get("event_id"),
+        payload.get("choix"),
+        payload.get("statut"),
+    )
+    if bilan is None:
+        return jsonify({"ok": False, "error": "Entrée introuvable ou statut invalide"}), 404
+    with _STATE_LOCK:
+        _DERNIER_RAPPORT["bilan"] = bilan
+        rapport_copie = dict(_DERNIER_RAPPORT)
+    _sauvegarder_rapport_disque(rapport_copie)
+    return jsonify({"ok": True, "bilan": bilan}), 200
 
 
 if CFG.activer_debug_routes:
@@ -1444,6 +1789,7 @@ def app_view():
 
 
 _charger_rapport_disque()
+_demarrer_scheduler_si_actif()
 
 
 if __name__ == "__main__":
