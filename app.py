@@ -15,6 +15,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 import requests
@@ -69,12 +70,26 @@ MOTS_BRUIT_RSS = (
     "pronostic", "pronostics", "cote", "cotes", "direct live", "résumé",
 )
 
+# Coefficients calibrés par compétition (moyenne de buts attendue + avantage domicile/extérieur)
+COEFFS_COMP_FOOT = {
+    "Ligue 1": {"base_buts": 1.28, "mult_home": 1.12, "mult_away": 0.90},
+    "Liga Espagnole": {"base_buts": 1.26, "mult_home": 1.13, "mult_away": 0.89},
+    "Bundesliga": {"base_buts": 1.44, "mult_home": 1.14, "mult_away": 0.93},
+    "Liga Portugaise": {"base_buts": 1.32, "mult_home": 1.15, "mult_away": 0.88},
+    "Premier League": {"base_buts": 1.38, "mult_home": 1.11, "mult_away": 0.92},
+    "Serie A": {"base_buts": 1.27, "mult_home": 1.12, "mult_away": 0.89},
+    "Ligue des Champions": {"base_buts": 1.36, "mult_home": 1.10, "mult_away": 0.91},
+    "Europa League": {"base_buts": 1.34, "mult_home": 1.11, "mult_away": 0.90},
+}
+COEFF_COMP_DEFAUT = {"base_buts": 1.32, "mult_home": 1.12, "mult_away": 0.90}
+
 
 @dataclass(frozen=True)
 class Config:
     saison_foot: str = field(default_factory=lambda: (os.getenv("SAISON_FOOT") or "2026").strip())
     n_derniers_matchs: int = field(default_factory=lambda: max(1, int(os.getenv("N_DERNIERS_MATCHS", "8"))))
     fenetre_heures: int = field(default_factory=lambda: max(1, int(os.getenv("FENETRE_HEURES", "48"))))
+    max_age_rss_heures: int = field(default_factory=lambda: max(6, int(os.getenv("MAX_AGE_RSS_HEURES", "48"))))
     timeout_http: float = field(default_factory=lambda: max(1.0, float(os.getenv("TIMEOUT_HTTP", "4"))))
     cache_ttl_sec: int = field(default_factory=lambda: max(60, int(os.getenv("CACHE_TTL_SEC", "900"))))
     mise_unite_defaut: float = field(default_factory=lambda: max(0.0, float(os.getenv("MISE_UNITE_DEFAUT", "1.0"))))
@@ -171,7 +186,6 @@ def _nettoyer_fichiers_tmp_orphelins():
             base = os.path.basename(chemin)
             cibles.append((dossier, f"{base}.tmp"))
 
-    # Ajoute aussi les .tmp éventuels de rapport.json / historique_paris.csv dans /tmp
     cibles.append(("/tmp", "rapport.json.tmp"))
     cibles.append(("/tmp", "historique_paris.csv.tmp"))
 
@@ -352,6 +366,18 @@ def _parse_date_utc(date_str):
         return None
 
 
+def _parse_pubdate_utc(pubdate_str):
+    """Parse une date RSS RFC-2822 (<pubDate>) ou ISO en UTC."""
+    if not pubdate_str:
+        return None
+    s = str(pubdate_str).strip()
+    try:
+        dt = parsedate_to_datetime(s)
+        return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return _parse_date_utc(s)
+
+
 def _timestamp_match(date_str):
     dt = _parse_date_utc(date_str)
     if dt is not None:
@@ -390,7 +416,6 @@ def _cle_dedup_evenement(ev, fallback_idx=0):
 
 
 def _priorite_statut_evenement(ev):
-    """Plus la priorité est haute, plus l'événement est frais / actif (évite d'écraser un match à venir ou live)."""
     statut = str(ev.get("status") or "").strip().lower()
     if statut in STATUTS_EN_COURS or "live" in statut or "progress" in statut:
         return 3
@@ -402,7 +427,6 @@ def _priorite_statut_evenement(ev):
 
 
 def _fusionner_evenements(existant, nouveau):
-    """Fusionne deux dicts représentant le même match sans laisser une ancienne entrée écraser un statut plus frais."""
     p_ex = _priorite_statut_evenement(existant)
     p_nv = _priorite_statut_evenement(nouveau)
 
@@ -603,7 +627,6 @@ def _calculer_cote_min_et_mise(proba_pct, conf_score, fiable, est_nul=False, cot
     else:
         facteur_conf = max(0.35, min(1.35, conf_score / 60.0))
         facteur_nul = 0.65 if est_nul else 1.0
-        # Légère majoration (plafonnée par mise_max_unites) quand une vraie value est détectée sur cote réelle
         facteur_value = 1.15 if est_value_bet else (0.75 if (est_cote_reelle and ecart_value_pct < -8.0) else 1.0)
         mise = round(
             min(CFG.mise_max_unites, max(0.25, CFG.mise_unite_defaut * facteur_conf * facteur_nul * facteur_value)),
@@ -838,11 +861,16 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8)
     bc_away.reverse()
     nb_matchs = v + n + d
     a_historique = nb_matchs >= 2
+    dynamique = max(-0.12, min(0.12, ((v - d) / nb_matchs) * 0.12)) if nb_matchs > 0 else 0.0
 
     return {
         "forme": f"{v}V-{n}N-{d}D" if nb_matchs > 0 else "Forme récente",
         "a_historique": a_historique,
         "nb_matchs": nb_matchs,
+        "v": v,
+        "n": n,
+        "d": d,
+        "dynamique": dynamique,
         "bp": moyenne_ponderee_shrinkage(bp_all, 1.35, prior_poids=1.5),
         "bc": moyenne_ponderee_shrinkage(bc_all, 1.20, prior_poids=1.5),
         "bp_home": moyenne_ponderee_shrinkage(bp_home, 1.50, prior_poids=1.2),
@@ -897,18 +925,27 @@ def _evaluer_gravite_titres(titres, cible=""):
     return min(gravite, 2.0)
 
 
-def _requete_rss(requete_brute, max_titres=2, cible=""):
+def _requete_rss(requete_brute, max_titres=2, cible="", max_age_heures=None):
     q = urllib.parse.quote(requete_brute)
     url = f"https://news.google.com/rss/search?q={q}&hl=fr&gl=FR&ceid=FR:fr"
+    age_limite_h = max_age_heures if max_age_heures is not None else CFG.max_age_rss_heures
+    seuil_dt = datetime.now(timezone.utc) - timedelta(hours=max(1, int(age_limite_h)))
     titres = []
     try:
         r = _HTTP_SESSION.get(url, timeout=CFG.timeout_http)
         if r.status_code == 200 and r.text:
             root = ET.fromstring(r.text)
-            for item in root.findall(".//item")[:8]:
+            for item in root.findall(".//item")[:10]:
                 t = (item.findtext("title") or "").strip()
                 if not t:
                     continue
+
+                pub_raw = (item.findtext("pubDate") or item.findtext("dc:date") or "").strip()
+                pub_dt = _parse_pubdate_utc(pub_raw)
+                if pub_dt is not None and pub_dt < seuil_dt:
+                    logger.debug("Titre RSS ignoré car trop ancien (%s): %s", pub_dt.isoformat(), t)
+                    continue
+
                 if cible and not _titre_est_pertinent_pour_cible(t, cible):
                     continue
                 titres.append(t)
@@ -926,7 +963,7 @@ def scanner_sante_cible(cible, max_titres=2):
         return _filtrer_titres_pertinents(cached, cible)[:max_titres]
 
     requete = f'"{cible}" (blessure OR forfait OR incertain OR suspendu) (match OR équipe OR foot OR tennis OR ATP OR WTA) when:2d'
-    res = _requete_rss(requete, max_titres, cible=cible)
+    res = _requete_rss(requete, max_titres, cible=cible, max_age_heures=CFG.max_age_rss_heures)
     _CACHE_SANTE.set(cle, res)
     return list(res)
 
@@ -943,13 +980,18 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     st_a = stats_foot_detail(a_info.get("id", ""), a_nom, events_comp, CFG.n_derniers_matchs)
     fiable = st_h["a_historique"] and st_a["a_historique"]
 
-    h_att = (0.60 * st_h["bp"]) + (0.40 * st_h["bp_home"])
-    h_def = (0.60 * st_h["bc"]) + (0.40 * st_h["bc_home"])
-    a_att = (0.60 * st_a["bp"]) + (0.40 * st_a["bp_away"])
-    a_def = (0.60 * st_a["bc"]) + (0.40 * st_a["bc_away"])
+    coeffs = COEFFS_COMP_FOOT.get(label_comp, COEFF_COMP_DEFAUT)
+    base_buts = max(0.8, float(coeffs.get("base_buts", 1.32)))
+    mult_home = float(coeffs.get("mult_home", 1.12))
+    mult_away = float(coeffs.get("mult_away", 0.90))
 
-    lam_h = max(((h_att * a_def) / 1.30) * 1.12, 0.35)
-    lam_a = max(((a_att * h_def) / 1.30) * 0.90, 0.35)
+    h_att = ((0.55 * st_h["bp"]) + (0.45 * st_h["bp_home"])) * (1.0 + st_h["dynamique"])
+    h_def = ((0.55 * st_h["bc"]) + (0.45 * st_h["bc_home"])) * (1.0 - (0.5 * st_h["dynamique"]))
+    a_att = ((0.55 * st_a["bp"]) + (0.45 * st_a["bp_away"])) * (1.0 + st_a["dynamique"])
+    a_def = ((0.55 * st_a["bc"]) + (0.45 * st_a["bc_away"])) * (1.0 - (0.5 * st_a["dynamique"]))
+
+    lam_h = max(((h_att * a_def) / base_buts) * mult_home, 0.35)
+    lam_a = max(((a_att * h_def) / base_buts) * mult_away, 0.35)
     p_h, p_n, p_a, p_ov25, p_un25, _, best_h, best_a, matrice_scores = simuler_poisson_foot(lam_h, lam_a)
 
     meilleure_victoire, prob_victoire = max(
@@ -999,7 +1041,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "date_match": _formater_date_locale(start_str),
         "ts_match": ts_match,
         "detail": (
-            f"[{label_comp}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] "
+            f"[{label_comp} | λ {lam_h:.2f}-{lam_a:.2f}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] "
             f"| Buts: {buts_label} ({buts_proba:.0f}%){nul_note}"
         ),
         "choix": choix,
@@ -1087,7 +1129,6 @@ def analyser_foot_competitions(competitions, heures_max=48):
         slug = comp["slug"]
         label_comp = comp["label"]
 
-        # Ordre : upcoming d'abord, puis historique, avec fusion priorisant les statuts live/à venir
         raw_comp_events = events_upcoming_par_slug[slug] + events_hist_par_slug[slug]
         dedup_par_id = {}
         sans_id = []
@@ -1105,7 +1146,6 @@ def analyser_foot_competitions(competitions, heures_max=48):
         dedup_comp = dict(dedup_par_id)
         for idx, ev in sans_id:
             cle_sec = _cle_dedup_evenement(ev, idx)
-            # Ne pas écraser une entrée déjà indexée par event_id
             if cle_sec not in dedup_comp:
                 dedup_comp[cle_sec] = ev
             else:
@@ -1185,6 +1225,89 @@ def _selectionner_classement_tennis(tournoi_nom, draw_nom, atp_rk, wta_rk):
     return atp_rk
 
 
+def _detecter_surface_tennis(tournoi_nom, draw_nom, match_obj=None):
+    """Détecte la surface du tournoi ('clay', 'grass', 'indoor', 'hard') et retourne (label, facteur_log)."""
+    parties = [str(tournoi_nom or ""), str(draw_nom or "")]
+    if isinstance(match_obj, dict):
+        for champ in ("surface", "court", "venue_surface"):
+            if match_obj.get(champ):
+                parties.append(str(match_obj[champ]))
+        venue = match_obj.get("venue")
+        if isinstance(venue, dict) and venue.get("surface"):
+            parties.append(str(venue["surface"]))
+
+    texte = unicodedata.normalize("NFKD", " ".join(parties)).encode("ascii", "ignore").decode("ascii").lower()
+    if any(tok in texte for tok in ("terre battue", "clay", "roland garros", "rome", "madrid", "monte carlo", "barcelona", "buenos aires", "rio")):
+        return "Terre battue", 1.06
+    if any(tok in texte for tok in ("gazon", "grass", "wimbledon", "halle", "queen", "s-hertogenbosch", "mallorca")):
+        return "Gazon", 1.08
+    if any(tok in texte for tok in ("indoor", "salle", "paris masters", "bercy", "atp finals", "wta finals")):
+        return "Indoor", 1.04
+    return "Dur", 1.00
+
+
+def _collecter_resultats_tennis(sb_data):
+    """Extrait les résultats récents terminés depuis le scoreboard tennis pour estimer la forme récente."""
+    historique_joueurs = {}
+    for t in sb_data.get("tournaments", []):
+        for d in t.get("draws", []):
+            if "Doubles" in d.get("name", ""):
+                continue
+            for m in d.get("matches", []):
+                if str(m.get("status") or "").strip().lower() not in STATUTS_TERMINES:
+                    continue
+                comps = m.get("competitors", [])
+                if len(comps) != 2:
+                    continue
+                j1, j2 = str(comps[0].get("name") or "").strip(), str(comps[1].get("name") or "").strip()
+                if not j1 or not j2 or "TBD" in (j1, j2):
+                    continue
+
+                gagnant = None
+                if comps[0].get("winner") is True:
+                    gagnant = j1
+                elif comps[1].get("winner") is True:
+                    gagnant = j2
+                else:
+                    try:
+                        s0 = float(comps[0].get("score"))
+                        s1 = float(comps[1].get("score"))
+                        if s0 != s1:
+                            gagnant = j1 if s0 > s1 else j2
+                    except Exception:
+                        gagnant = None
+
+                if not gagnant:
+                    continue
+                perdant = j2 if gagnant == j1 else j1
+                ts = _timestamp_match(str(m.get("date") or m.get("start_time") or ""))
+                historique_joueurs.setdefault(" ".join(gagnant.lower().split()), []).append((ts, 1))
+                historique_joueurs.setdefault(" ".join(perdant.lower().split()), []).append((ts, 0))
+
+    for cle in historique_joueurs:
+        historique_joueurs[cle].sort(key=lambda x: x[0])
+    return historique_joueurs
+
+
+def _ratio_forme_tennis(nom_joueur, hist_map, max_matchs=6):
+    """Retourne un ratio de forme récent autour de 0.5 (None si insuffisant)."""
+    if not nom_joueur or not hist_map:
+        return None
+    cle = " ".join(nom_joueur.lower().strip().split())
+    series = hist_map.get(cle)
+    if not series:
+        for k, v in hist_map.items():
+            if len(cle) >= 5 and (cle in k or k in cle):
+                series = v
+                break
+    if not series:
+        return None
+    recents = [res for _, res in series[-max_matchs:]]
+    if not recents:
+        return None
+    return sum(recents) / len(recents)
+
+
 def analyser_tennis(heures_max=48):
     try:
         atp_rk = {
@@ -1200,12 +1323,15 @@ def analyser_tennis(heures_max=48):
         logger.warning("Erreur récupération données tennis: %s", e)
         return [], [], {}, {}
 
+    sb_data = sb.get("data", {}) if isinstance(sb, dict) else {}
+    hist_tennis = _collecter_resultats_tennis(sb_data)
+
     simples = []
     live_tennis = []
     alertes_tennis = {}
     termines_tennis = {}
 
-    for t in sb.get("data", {}).get("tournaments", []):
+    for t in sb_data.get("tournaments", []):
         t_name = t.get("name")
         for d in t.get("draws", []):
             if "Doubles" in d.get("name", ""):
@@ -1229,10 +1355,23 @@ def analyser_tennis(heures_max=48):
                     continue
                 r1, r2 = trouver_rang(j1, rk_map), trouver_rang(j2, rk_map)
                 complet = r1 is not None and r2 is not None
-                diff = (math.log((r2 or 180) + 1) - math.log((r1 or 180) + 1)) * (0.68 if complet else 0.25)
+
+                surface_lbl, mult_surface = _detecter_surface_tennis(t_name, d.get("name", ""), m)
+                forme1 = _ratio_forme_tennis(j1, hist_tennis)
+                forme2 = _ratio_forme_tennis(j2, hist_tennis)
+                ajust_forme = 0.0
+                if forme1 is not None and forme2 is not None:
+                    ajust_forme = (forme1 - forme2) * 0.45
+                elif forme1 is not None:
+                    ajust_forme = (forme1 - 0.5) * 0.25
+                elif forme2 is not None:
+                    ajust_forme = (0.5 - forme2) * 0.25
+
+                diff_rang = (math.log((r2 or 180) + 1) - math.log((r1 or 180) + 1)) * (0.68 if complet else 0.25)
+                diff = (diff_rang * mult_surface) + ajust_forme
                 p1 = 1 / (1 + math.exp(-diff))
                 favori, prob = (j1, p1) if p1 >= 0.5 else (j2, 1 - p1)
-                plafond = 0.82 if complet else 0.62
+                plafond = 0.84 if complet else 0.65
                 prob = min(max(prob, 0.50), plafond)
 
                 proba_pct = round(max(0.05, prob) * 100, 1)
@@ -1251,15 +1390,19 @@ def analyser_tennis(heures_max=48):
                 cote_min, mise_u, est_value_bet, ecart_value_pct = _calculer_cote_min_et_mise(
                     proba_pct, conf_score, complet, est_nul=False, cote_reelle=cote_estimee, est_cote_reelle=False
                 )
+
+                f1_str = f" ({round(forme1 * 100)}%)" if forme1 is not None else ""
+                f2_str = f" ({round(forme2 * 100)}%)" if forme2 is not None else ""
+
                 entree = {
                     "sport": "TENNIS",
                     "competition": t_name or "Tennis",
                     "fiable": complet,
                     "event_id": mid,
-                    "match": f"{j1} (#{r1 or 'NC'}) vs {j2} (#{r2 or 'NC'})",
+                    "match": f"{j1} (#{r1 or 'NC'}{f1_str}) vs {j2} (#{r2 or 'NC'}{f2_str})",
                     "date_match": _formater_date_locale(date_raw),
                     "ts_match": ts_match,
-                    "detail": f"{t_name}",
+                    "detail": f"{t_name} • Surface : {surface_lbl}",
                     "choix": f"Victoire {favori}",
                     "est_nul": False,
                     "proba": proba_pct,
@@ -1600,9 +1743,9 @@ def mettre_a_jour_historique(items, evenements_termines=None):
                 })
                 cles.add(cle)
 
+        tmp_csv = f"{FICHIER_HISTORIQUE}.tmp"
         try:
             os.makedirs(os.path.dirname(FICHIER_HISTORIQUE) or ".", exist_ok=True)
-            tmp_csv = f"{FICHIER_HISTORIQUE}.tmp"
             with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=champs)
                 writer.writeheader()
@@ -2478,6 +2621,9 @@ _HTML_PAGE = """<!doctype html>
           <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
           <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
         </div>
+        {% if it.detail %}
+        <div class="card-detail">{{ it.detail }}</div>
+        {% endif %}
       </div>
       {% else %}
       <div class="card">Aucun match de tennis à venir dans cette fenêtre.</div>
