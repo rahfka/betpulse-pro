@@ -330,10 +330,17 @@ def poisson_prob(k, lam):
 def simuler_poisson_foot(lam_h, lam_a):
     max_buts = 11
     p_h = p_n = p_a = p_over_25 = 0.0
+    best_h = best_a = 0
+    max_pr = -1.0
+    
     for h in range(max_buts):
         pr_h = poisson_prob(h, lam_h)
         for a in range(max_buts):
             pr = pr_h * poisson_prob(a, lam_a)
+            if pr > max_pr:
+                max_pr = pr
+                best_h, best_a = h, a
+                
             if h > a:
                 p_h += pr
             elif h == a:
@@ -342,12 +349,13 @@ def simuler_poisson_foot(lam_h, lam_a):
                 p_a += pr
             if (h + a) > 2:
                 p_over_25 += pr
+                
     tot = p_h + p_n + p_a
     if tot <= 0:
-        return 1 / 3, 1 / 3, 1 / 3, 0.5, 0.5
+        return 1 / 3, 1 / 3, 1 / 3, 0.5, 0.5, "0 - 0"
     p_h, p_n, p_a = p_h / tot, p_n / tot, p_a / tot
     p_ov25_norm = min(max(p_over_25, 0.0), 1.0)
-    return p_h, p_n, p_a, p_ov25_norm, 1.0 - p_ov25_norm
+    return p_h, p_n, p_a, p_ov25_norm, 1.0 - p_ov25_norm, f"{best_h} - {best_a}"
 
 
 def moyenne_ponderee_shrinkage(valeurs, prior_moyenne, prior_poids=3.0):
@@ -559,7 +567,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
 
     lam_h = max(((h_att * 1.08) + a_def) / 2.0, 0.35)
     lam_a = max(((a_att * 0.92) + h_def) / 2.0, 0.35)
-    p_h, p_n, p_a, p_ov25, p_un25 = simuler_poisson_foot(lam_h, lam_a)
+    p_h, p_n, p_a, p_ov25, p_un25, score_exact = simuler_poisson_foot(lam_h, lam_a)
 
     choix, prob = max(
         [(f"Victoire {h_nom}", p_h), ("Match nul", p_n), (f"Victoire {a_nom}", p_a)],
@@ -569,6 +577,17 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     plafond = 0.80 if fiable else 0.64
     prob_cal = min(max(prob, 0.05), plafond)
     proba_pct = round(prob_cal * 100, 1)
+    
+    # Calcul de la cote implicite
+    cote = round(1 / prob_cal, 2) if prob_cal > 0 else 0.0
+
+    # Détection de match imminent (< 2 heures)
+    dt_match = _parse_date_utc(start_str)
+    est_imminent = False
+    if dt_match:
+        delta_sec = (dt_match - datetime.now(timezone.utc)).total_seconds()
+        if 0 <= delta_sec <= 7200:
+            est_imminent = True
 
     buts_label = "+2.5 buts" if p_ov25 >= p_un25 else "-2.5 buts"
     buts_proba = round(min(max(p_ov25, p_un25), 0.85) * 100, 1)
@@ -589,6 +608,9 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         ),
         "choix": choix,
         "proba": proba_pct,
+        "cote": cote,
+        "score_exact": score_exact,
+        "est_imminent": est_imminent,
         "prudence": prudence,
         "confiance": conf_niveau,
         "confiance_score": conf_score,
@@ -769,6 +791,15 @@ def analyser_tennis(heures_max=48):
                 prob = min(max(prob, 0.50), plafond)
 
                 proba_pct = round(max(0.05, prob) * 100, 1)
+                cote = round(1 / prob, 2) if prob > 0 else 0.0
+                
+                dt_match = _parse_date_utc(str(m.get("date", "")))
+                est_imminent = False
+                if dt_match:
+                    delta_sec = (dt_match - datetime.now(timezone.utc)).total_seconds()
+                    if 0 <= delta_sec <= 7200:
+                        est_imminent = True
+
                 conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, complet, 0.0)
                 simples.append({
                     "sport": "TENNIS",
@@ -780,6 +811,9 @@ def analyser_tennis(heures_max=48):
                     "detail": f"{t_name}",
                     "choix": f"Victoire {favori}",
                     "proba": proba_pct,
+                    "cote": cote,
+                    "score_exact": None,
+                    "est_imminent": est_imminent,
                     "prudence": "MODERE" if (proba_pct >= 58 and complet) else "PRUDENT",
                     "confiance": conf_niveau,
                     "confiance_score": conf_score,
@@ -1122,9 +1156,6 @@ def executer_analyse():
 
 app = Flask(__name__, static_folder="statique", static_url_path="/statique")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# PAGE D'ACCUEIL ANIMÉE (ballons foot + balles tennis qui rebondissent)
-# ═══════════════════════════════════════════════════════════════════════════
 _HTML_HOME = """<!doctype html>
 <html lang="fr">
 <head>
@@ -1483,13 +1514,17 @@ _HTML_PAGE = """<!doctype html>
     .card.MOYENNE { border-left-color: var(--orange); }
     .card.FAIBLE { border-left-color: var(--red); }
     .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
-    .card-title { font-size: 1.06em; font-weight: 700; line-height: 1.3; }
-    .badges-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .card-title { font-size: 1.06em; font-weight: 700; line-height: 1.3; display: flex; align-items: center; gap: 6px; }
+    .badges-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
     .badge { font-size: 0.74em; padding: 3px 8px; border-radius: 999px; font-weight: 800; white-space: nowrap; }
     .badge.proba { background: rgba(56, 189, 248, 0.16); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35); }
+    .badge.cote { background: rgba(255, 255, 255, 0.1); color: #e2e8f0; border: 1px solid rgba(255, 255, 255, 0.2); }
     .badge.HAUTE { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }
     .badge.MOYENNE { background: rgba(245, 158, 11, 0.2); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.4); }
     .badge.FAIBLE { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
+    .badge.imminent { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); display: inline-flex; align-items: center; gap: 4px; }
+    .dot-red { width: 8px; height: 8px; background-color: #ef4444; border-radius: 50%; animation: pulse-red 1.5s infinite; }
+    @keyframes pulse-red { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); } 70% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
     .card-meta { font-size: 0.86em; color: var(--muted); margin-bottom: 10px; line-height: 1.45; }
     .card-meta strong { color: var(--text); }
     .conf-meter { margin: 8px 0 4px 0; }
@@ -1504,25 +1539,11 @@ _HTML_PAGE = """<!doctype html>
       padding: 8px 10px; border-radius: 8px; margin-top: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
       line-height: 1.4;
     }
-    .card-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
-    .mini-btn {
-      background: #0b1220; color: var(--text); border: 1px solid var(--border);
-      padding: 5px 9px; border-radius: 7px; font-size: 0.75em; font-weight: 600;
-    }
-    .mini-btn.win:hover { border-color: var(--green); color: #6ee7b7; }
-    .mini-btn.loss:hover { border-color: var(--red); color: #fca5a5; }
     .panel { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 24px; }
     .stats-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
     .stat-item { background: var(--card); border: 1px solid var(--border); padding: 8px 13px; border-radius: 999px; font-size: 0.84em; }
     pre { white-space: pre-wrap; background: #0b1220; border: 1px solid var(--border); padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 0.85em; margin: 0; line-height: 1.5; }
     .notice { background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #bae6fd; padding: 10px 14px; border-radius: 10px; margin-bottom: 18px; font-size: 0.9em; }
-    .toast {
-      position: fixed; bottom: 18px; right: 18px; background: #1e293b; color: #f8fafc;
-      border: 1px solid var(--accent); padding: 10px 14px; border-radius: 10px;
-      font-size: 0.84em; font-weight: 600; box-shadow: 0 10px 24px rgba(0,0,0,0.4);
-      opacity: 0; pointer-events: none; transition: opacity 0.2s ease; z-index: 99;
-    }
-    .toast.show { opacity: 1; }
   </style>
 </head>
 <body>
@@ -1587,8 +1608,16 @@ _HTML_PAGE = """<!doctype html>
            data-date="{{ it.date_match }}"
            data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
         <div class="card-top">
-          <div class="card-title">{{ it.choix }}</div>
+          <div class="card-title">
+            {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.choix }}
+          </div>
           <div class="badges-right">
+            {% if it.get('est_imminent') %}
+            <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
+            {% endif %}
+            {% if it.get('cote') %}
+            <span class="badge cote">Cote {{ it.cote }}</span>
+            {% endif %}
             <span class="badge proba">{{ it.proba }}%</span>
             <span class="badge {{ conf }}">{{ conf }}</span>
           </div>
@@ -1596,6 +1625,9 @@ _HTML_PAGE = """<!doctype html>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
           {{ it.date_match }} — {{ it.competition }}
+          {% if it.get('score_exact') %}
+          <br><span style="color: var(--accent); font-weight: 600;">Score exact prédit : {{ it.score_exact }}</span>
+          {% endif %}
         </div>
         <div class="conf-meter">
           <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
@@ -1604,11 +1636,6 @@ _HTML_PAGE = """<!doctype html>
         {% if it.detail %}
         <div class="card-detail">{{ it.detail }}</div>
         {% endif %}
-        <div class="card-actions">
-          <button type="button" class="mini-btn" onclick="copierProno(this)" data-copy="[{{ it.sport }}] {{ it.match }} ({{ it.date_match }}) -> {{ it.choix }} ({{ it.proba }}% | Confiance {{ conf }})">Copier</button>
-          <button type="button" class="mini-btn win" onclick="majStatut('{{ it.sport }}', '{{ it.event_id }}', {{ it.choix|tojson }}, 'GAGNE')">✓ Gagné</button>
-          <button type="button" class="mini-btn loss" onclick="majStatut('{{ it.sport }}', '{{ it.event_id }}', {{ it.choix|tojson }}, 'PERDU')">✕ Perdu</button>
-        </div>
       </div>
       {% else %}
       <div class="card">Aucun pronostic disponible.</div>
@@ -1634,8 +1661,14 @@ _HTML_PAGE = """<!doctype html>
            data-date="{{ it.date_match }}"
            data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
         <div class="card-top">
-          <div class="card-title">{{ it.choix }}</div>
+          <div class="card-title">⚽ {{ it.choix }}</div>
           <div class="badges-right">
+            {% if it.get('est_imminent') %}
+            <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
+            {% endif %}
+            {% if it.get('cote') %}
+            <span class="badge cote">Cote {{ it.cote }}</span>
+            {% endif %}
             <span class="badge proba">{{ it.proba }}%</span>
             <span class="badge {{ conf }}">{{ conf }}</span>
           </div>
@@ -1643,15 +1676,15 @@ _HTML_PAGE = """<!doctype html>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
           {{ it.date_match }}
+          {% if it.get('score_exact') %}
+          <br><span style="color: var(--accent); font-weight: 600;">Score exact prédit : {{ it.score_exact }}</span>
+          {% endif %}
         </div>
         <div class="conf-meter">
           <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
           <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
         </div>
         <div class="card-detail">{{ it.detail }}</div>
-        <div class="card-actions">
-          <button type="button" class="mini-btn" onclick="copierProno(this)" data-copy="[FOOT] {{ it.match }} ({{ it.date_match }}) -> {{ it.choix }} ({{ it.proba }}% | Confiance {{ conf }})">Copier</button>
-        </div>
       </div>
       {% else %}
       <div class="card">Aucun match de foot à venir dans cette fenêtre.</div>
@@ -1672,8 +1705,14 @@ _HTML_PAGE = """<!doctype html>
            data-date="{{ it.date_match }}"
            data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
         <div class="card-top">
-          <div class="card-title">{{ it.choix }}</div>
+          <div class="card-title">🎾 {{ it.choix }}</div>
           <div class="badges-right">
+            {% if it.get('est_imminent') %}
+            <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
+            {% endif %}
+            {% if it.get('cote') %}
+            <span class="badge cote">Cote {{ it.cote }}</span>
+            {% endif %}
             <span class="badge proba">{{ it.proba }}%</span>
             <span class="badge {{ conf }}">{{ conf }}</span>
           </div>
@@ -1685,9 +1724,6 @@ _HTML_PAGE = """<!doctype html>
         <div class="conf-meter">
           <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
           <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
-        </div>
-        <div class="card-actions">
-          <button type="button" class="mini-btn" onclick="copierProno(this)" data-copy="[TENNIS] {{ it.match }} ({{ it.date_match }}) -> {{ it.choix }} ({{ it.proba }}% | Confiance {{ conf }})">Copier</button>
         </div>
       </div>
       {% else %}
@@ -1725,17 +1761,8 @@ _HTML_PAGE = """<!doctype html>
     {% endif %}
   </div>
 
-  <div id="toast" class="toast"></div>
-
   <script>
     let confActif = "ALL";
-    function afficherToast(msg) {
-      const el = document.getElementById("toast");
-      if (!el) return;
-      el.textContent = msg;
-      el.classList.add("show");
-      setTimeout(() => el.classList.remove("show"), 2200);
-    }
     function setConf(val, btn) {
       confActif = val;
       document.querySelectorAll(".pill-btn").forEach(b => b.classList.remove("active"));
@@ -1780,32 +1807,6 @@ _HTML_PAGE = """<!doctype html>
         });
         cards.forEach(c => grid.appendChild(c));
       });
-    }
-    async function copierProno(btn) {
-      const txt = btn?.getAttribute("data-copy") || "";
-      if (!txt) return;
-      try {
-        await navigator.clipboard.writeText(txt);
-        afficherToast("Pronostic copié !");
-      } catch (e) {
-        afficherToast("Copie impossible sur ce navigateur");
-      }
-    }
-    async function majStatut(sport, eventId, choix, statut) {
-      try {
-        const res = await fetch("/api/historique/statut", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sport, event_id: eventId, choix, statut })
-        });
-        if (res.ok) {
-          afficherToast(`Statut mis à jour : ${statut}`);
-        } else {
-          afficherToast("Pronostic non trouvé dans l'historique");
-        }
-      } catch (e) {
-        afficherToast("Erreur réseau");
-      }
     }
     appliquerFiltres();
   </script>
