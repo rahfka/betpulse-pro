@@ -1,4 +1,3 @@
-import copy
 import csv
 import importlib
 import json
@@ -20,20 +19,12 @@ from zoneinfo import ZoneInfo
 
 import requests
 from flask import Flask, jsonify, make_response, redirect, render_template_string, request, url_for
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-# --- Logging robuste -----------------------------------------------------
-_log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-_log_level = getattr(logging, _log_level_name, logging.INFO)
 
 logging.basicConfig(
-    level=_log_level,
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("betpulse")
-logging.getLogger("urllib3").setLevel(logging.WARNING)
-logging.getLogger("requests").setLevel(logging.WARNING)
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -43,17 +34,12 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 def _charger_module_sport(nom_francais, nom_anglais):
-    last_err = None
     for mod_name in (nom_francais, nom_anglais):
         try:
             return importlib.import_module(mod_name)
-        except ImportError as e:
-            last_err = e
-            logger.debug("Import de %s a échoué: %s", mod_name, e)
+        except Exception:
             continue
-    raise ImportError(
-        f"Impossible d'importer '{nom_francais}' ni '{nom_anglais}'."
-    ) from last_err
+    raise ImportError(f"Impossible d'importer '{nom_francais}' ni '{nom_anglais}'.")
 
 
 fb = _charger_module_sport("compétences_sportives.football", "sports_skills.football")
@@ -79,17 +65,12 @@ MOTS_BRUIT_RSS = (
     "pronostic", "pronostics", "cote", "cotes", "direct live", "résumé",
 )
 
-HOME_ALIASES = {"home", "home_team", "1", "h", "domicile"}
-AWAY_ALIASES = {"away", "away_team", "2", "a", "extérieur", "exterieur"}
-
 
 @dataclass(frozen=True)
 class Config:
     saison_foot: str = field(default_factory=lambda: (os.getenv("SAISON_FOOT") or "2026").strip())
     n_derniers_matchs: int = field(default_factory=lambda: max(1, int(os.getenv("N_DERNIERS_MATCHS", "8"))))
     fenetre_heures: int = field(default_factory=lambda: max(1, int(os.getenv("FENETRE_HEURES", "48"))))
-    fenetre_match_minutes: int = field(default_factory=lambda: max(0, int(os.getenv("FENETRE_MATCH_MINUTES", "15"))))
-    est_imminent_sec: int = field(default_factory=lambda: max(0, int(os.getenv("EST_IMMINENT_SEC", "7200"))))
     timeout_http: float = field(default_factory=lambda: max(1.0, float(os.getenv("TIMEOUT_HTTP", "4"))))
     cache_ttl_sec: int = field(default_factory=lambda: max(60, int(os.getenv("CACHE_TTL_SEC", "900"))))
     mise_unite_defaut: float = field(default_factory=lambda: max(0.0, float(os.getenv("MISE_UNITE_DEFAUT", "1.0"))))
@@ -104,17 +85,6 @@ class Config:
 
 
 CFG = Config()
-
-if CFG.fenetre_heures > 48:
-    logger.info(
-        "FENETRE_HEURES=%sh (>48h) : les alertes RSS Google News ne couvrent que 2 jours.",
-        CFG.fenetre_heures,
-    )
-if CFG.mise_max_unites < CFG.mise_unite_defaut:
-    logger.warning(
-        "MISE_MAX_UNITES (%s) < MISE_UNITE_DEFAUT (%s) : les mises seront plafonnées.",
-        CFG.mise_max_unites, CFG.mise_unite_defaut,
-    )
 
 MAP_COMP_ODDS_API = {
     "ligue-1": "soccer_france_ligue_one",
@@ -163,17 +133,6 @@ class _CacheBorne:
                 while len(self._data) > self._max_taille:
                     self._data.popitem(last=False)
 
-    def purge_expired(self, ttl_sec):
-        now = time.monotonic()
-        with self._lock:
-            a_purger = [k for k, (ts, _) in self._data.items() if (now - ts) > ttl_sec]
-            for k in a_purger:
-                self._data.pop(k, None)
-
-    def size(self):
-        with self._lock:
-            return len(self._data)
-
     def clear(self):
         with self._lock:
             self._data.clear()
@@ -209,7 +168,6 @@ COMPETITIONS_CIBLES = [
     {"slug": "uefa-europa-league", "label": "Europa League", "equipes": ["176", "174", "360", "111"]},
 ]
 
-# --- Session HTTP avec retry --------------------------------------------
 _HTTP_SESSION = requests.Session()
 _HTTP_SESSION.headers.update({
     "User-Agent": (
@@ -218,30 +176,13 @@ _HTTP_SESSION.headers.update({
     )
 })
 
-_retry_strategy = Retry(
-    total=2,
-    backoff_factor=0.3,
-    status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=frozenset({"GET", "HEAD"}),
-    raise_on_status=False,
-)
-_http_adapter = HTTPAdapter(max_retries=_retry_strategy, pool_maxsize=20)
-_HTTP_SESSION.mount("https://", _http_adapter)
-_HTTP_SESSION.mount("http://", _http_adapter)
-
 _CACHE_FOOT_SCHED = _CacheBorne(max_taille=400)
 _CACHE_SANTE = _CacheBorne(max_taille=400)
 _CACHE_COTES_MARCHE = _CacheBorne(max_taille=64)
 _STATE_LOCK = threading.Lock()
 _CSV_LOCK = threading.Lock()
 _ANALYSE_EN_COURS = False
-_ANALYSE_THREAD_LANCE = False
 _SCHEDULER_DEMARRE = False
-
-CLES_RAPPORT = (
-    "mis_a_jour", "stats_comp", "apercu_bruts", "top_sur",
-    "foot", "tennis", "alertes", "bilan", "synthese",
-)
 
 _DERNIER_RAPPORT = {
     "mis_a_jour": None,
@@ -263,10 +204,8 @@ def _charger_rapport_disque():
             with open(FICHIER_RAPPORT, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict) and data.get("mis_a_jour"):
-                    rapport_filtre = {k: data.get(k, _DERNIER_RAPPORT.get(k)) for k in CLES_RAPPORT}
-                    rapport_filtre["mis_a_jour"] = data["mis_a_jour"]
                     with _STATE_LOCK:
-                        _DERNIER_RAPPORT = rapport_filtre
+                        _DERNIER_RAPPORT = data
     except Exception as e:
         logger.warning("Impossible de charger le rapport disque : %s", e)
 
@@ -279,11 +218,6 @@ def _sauvegarder_rapport_disque(rapport):
             os.makedirs(parent, exist_ok=True)
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(rapport, f, ensure_ascii=False)
-            f.flush()
-            try:
-                os.fsync(f.fileno())
-            except OSError:
-                pass
         os.replace(tmp_path, FICHIER_RAPPORT)
     except Exception as e:
         logger.warning("Impossible de sauvegarder le rapport disque : %s", e)
@@ -330,9 +264,9 @@ def _normaliser_home_away(ev):
                 continue
             qual = str(c.get("qualifier") or c.get("homeAway") or "").strip().lower()
             t_obj = c.get("team") if isinstance(c.get("team"), dict) else c
-            if qual in HOME_ALIASES:
+            if qual == "home":
                 h_info = t_obj
-            elif qual in AWAY_ALIASES:
+            elif qual == "away":
                 a_info = t_obj
         if (not h_info or not a_info) and len(comps) >= 2:
             t0 = comps[0].get("team") if isinstance(comps[0].get("team"), dict) else comps[0]
@@ -374,11 +308,7 @@ def _parse_date_utc(date_str):
     try:
         if len(s) == 10 and re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
             return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        s2 = s.replace("Z", "+00:00")
-        # Compatibilité Python < 3.11 : fromisoformat n'accepte pas l'espace
-        if "T" not in s2 and " " in s2:
-            s2 = s2.replace(" ", "T", 1)
-        dt = datetime.fromisoformat(s2)
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
@@ -425,10 +355,7 @@ def _est_match_a_venir_dans_fenetre(ev, heures_max):
         return False
 
     maintenant = datetime.now(timezone.utc)
-    return (
-        (maintenant - timedelta(minutes=CFG.fenetre_match_minutes)) <= dt
-        <= (maintenant + timedelta(hours=heures_max))
-    )
+    return (maintenant - timedelta(minutes=15)) <= dt <= (maintenant + timedelta(hours=heures_max))
 
 
 def poisson_prob(k, lam):
@@ -858,11 +785,7 @@ def _requete_rss(requete_brute, max_titres=2, cible=""):
     try:
         r = _HTTP_SESSION.get(url, timeout=CFG.timeout_http)
         if r.status_code == 200 and r.text:
-            txt = r.text
-            if len(txt) > 2_000_000:
-                logger.debug("RSS payload trop grand (%d octets), ignoré (%s)", len(txt), requete_brute)
-                return titres[:max_titres]
-            root = ET.fromstring(txt)
+            root = ET.fromstring(r.text)
             for item in root.findall(".//item")[:8]:
                 t = (item.findtext("title") or "").strip()
                 if not t:
@@ -883,11 +806,7 @@ def scanner_sante_cible(cible, max_titres=2):
     if cached is not None:
         return _filtrer_titres_pertinents(cached, cible)[:max_titres]
 
-    cible_echappee = str(cible).replace('"', '\\"')
-    requete = (
-        f'"{cible_echappee}" (blessure OR forfait OR incertain OR suspendu) '
-        f'(match OR équipe OR foot OR tennis OR ATP OR WTA) when:2d'
-    )
+    requete = f'"{cible}" (blessure OR forfait OR incertain OR suspendu) (match OR équipe OR foot OR tennis OR ATP OR WTA) when:2d'
     res = _requete_rss(requete, max_titres, cible=cible)
     _CACHE_SANTE.set(cle, res)
     return list(res)
@@ -940,7 +859,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     est_imminent = False
     if dt_match:
         delta_sec = (dt_match - datetime.now(timezone.utc)).total_seconds()
-        if 0 <= delta_sec <= CFG.est_imminent_sec:
+        if 0 <= delta_sec <= 7200:
             est_imminent = True
 
     prudence = "ELEVE" if (proba_pct >= 70 and fiable and not est_nul) else ("MODERE" if proba_pct >= 55 else "PRUDENT")
@@ -1162,7 +1081,7 @@ def analyser_tennis(heures_max=48):
                 est_imminent = False
                 if dt_match:
                     delta_sec = (dt_match - datetime.now(timezone.utc)).total_seconds()
-                    if 0 <= delta_sec <= CFG.est_imminent_sec:
+                    if 0 <= delta_sec <= 7200:
                         est_imminent = True
 
                 conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, complet, 0.0)
@@ -1212,7 +1131,7 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
         return {}
 
     equipes_a_scanner = set()
-    for it in items_cibles:
+    for it in items_cibles[:10]:
         for nom in it.get("equipes", []):
             if nom:
                 equipes_a_scanner.add(nom)
@@ -1511,7 +1430,6 @@ def executer_analyse():
             logger.error("Erreur Foot: %s", e)
             foot_res, alertes_f, stats_comp, apercu_bruts = [], {}, {}, f"Erreur Foot: {e}"
 
-        clos_tennis = {}
         try:
             tennis_res, alertes_t, clos_tennis = analyser_tennis(CFG.fenetre_heures)
             clos_globaux.update(clos_tennis)
@@ -1620,15 +1538,6 @@ def executer_analyse():
 
 
 app = Flask(__name__, static_folder="statique", static_url_path="/statique")
-
-
-@app.after_request
-def _ajouter_entetes_securite(resp):
-    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-    resp.headers.setdefault("X-Frame-Options", "DENY")
-    resp.headers.setdefault("Referrer-Policy", "no-referrer")
-    return resp
-
 
 _HTML_HOME = """<!doctype html>
 <html lang="fr">
@@ -1839,11 +1748,8 @@ _HTML_HOME = """<!doctype html>
   var statusEl = document.getElementById('status');
   var metaEl   = document.getElementById('meta');
   var POLL_MS  = 1500;
-  var MAX_ATTEMPTS = 400;
-  var attempts = 0;
 
   async function check() {
-    attempts += 1;
     try {
       var r = await fetch("/api/status", { cache: "no-store" });
       if (r.ok) {
@@ -1856,10 +1762,6 @@ _HTML_HOME = """<!doctype html>
         if (d.mis_a_jour) metaEl.textContent = "Dernière analyse : " + d.mis_a_jour;
       }
     } catch (e) {}
-    if (attempts >= MAX_ATTEMPTS) {
-      statusEl.textContent = "Analyse longue — actualisez la page.";
-      return;
-    }
     setTimeout(check, POLL_MS);
   }
   setTimeout(check, 300);
@@ -1890,10 +1792,7 @@ _HTML_LOADING = """<!doctype html>
   <p id="status-msg">Récupération des matchs et pronostics en cours…</p>
   <a href="/">← Retour à l'accueil</a>
   <script>
-    var MAX_ATTEMPTS = 300;
-    var attempts = 0;
     async function verifierEtat() {
-      attempts += 1;
       try {
         const res = await fetch("/api/status", { cache: "no-store" });
         if (res.ok) {
@@ -1904,10 +1803,6 @@ _HTML_LOADING = """<!doctype html>
           }
         }
       } catch (e) {}
-      if (attempts >= MAX_ATTEMPTS) {
-        document.getElementById('status-msg').textContent = "Analyse longue — actualisez la page.";
-        return;
-      }
       setTimeout(verifierEtat, 2000);
     }
     verifierEtat();
@@ -2089,7 +1984,7 @@ _HTML_PAGE = """<!doctype html>
       {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
       <div class="card {{ conf }}"
            data-conf="{{ conf }}"
-           data-proba="{{ it.proba or 0 }}"
+           data-proba="{{ it.proba }}"
            data-conf-score="{{ conf_sc }}"
            data-date="{{ it.date_match }}"
            data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
@@ -2142,7 +2037,7 @@ _HTML_PAGE = """<!doctype html>
       {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
       <div class="card {{ conf }}"
            data-conf="{{ conf }}"
-           data-proba="{{ it.proba or 0 }}"
+           data-proba="{{ it.proba }}"
            data-conf-score="{{ conf_sc }}"
            data-date="{{ it.date_match }}"
            data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
@@ -2186,7 +2081,7 @@ _HTML_PAGE = """<!doctype html>
       {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
       <div class="card {{ conf }}"
            data-conf="{{ conf }}"
-           data-proba="{{ it.proba or 0 }}"
+           data-proba="{{ it.proba }}"
            data-conf-score="{{ conf_sc }}"
            data-date="{{ it.date_match }}"
            data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
@@ -2302,23 +2197,13 @@ _HTML_PAGE = """<!doctype html>
 
 
 def _demarrer_analyse_si_besoin(delai_sec=0.0):
-    global _ANALYSE_THREAD_LANCE
-    with _STATE_LOCK:
-        if _ANALYSE_THREAD_LANCE or _ANALYSE_EN_COURS:
-            return
-        _ANALYSE_THREAD_LANCE = True
-
     def _runner():
-        global _ANALYSE_THREAD_LANCE
         if delai_sec > 0:
             time.sleep(delai_sec)
         try:
             executer_analyse()
         except Exception as e:
             logger.critical("Erreur fatale analyse background: %s", e)
-        finally:
-            with _STATE_LOCK:
-                _ANALYSE_THREAD_LANCE = False
 
     threading.Thread(target=_runner, daemon=True).start()
 
@@ -2339,22 +2224,12 @@ def _demarrer_scheduler_si_actif():
                 executer_analyse()
             except Exception as e:
                 logger.warning("Erreur scheduler auto-refresh: %s", e)
-            # Purge périodique des caches
-            try:
-                _CACHE_FOOT_SCHED.purge_expired(CFG.cache_ttl_sec)
-                _CACHE_SANTE.purge_expired(CFG.cache_ttl_sec)
-                _CACHE_COTES_MARCHE.purge_expired(CFG.odds_cache_ttl_sec)
-            except Exception:
-                pass
 
     threading.Thread(target=_loop, daemon=True).start()
 
 
 @app.route("/health")
 def health():
-    with _STATE_LOCK:
-        maj = _DERNIER_RAPPORT.get("mis_a_jour")
-    logger.debug("/health consulté (mis_a_jour=%s)", maj)
     return "ok", 200
 
 
@@ -2377,7 +2252,7 @@ def api_status():
 @app.route("/api/analyse")
 def api_analyse():
     with _STATE_LOCK:
-        rapport = copy.deepcopy(_DERNIER_RAPPORT)
+        rapport = dict(_DERNIER_RAPPORT)
     if not rapport.get("mis_a_jour"):
         rapport = executer_analyse()
     return jsonify(rapport)
@@ -2396,7 +2271,7 @@ def api_historique_statut():
         return jsonify({"ok": False, "error": "Entrée introuvable ou statut invalide"}), 404
     with _STATE_LOCK:
         _DERNIER_RAPPORT["bilan"] = bilan
-        rapport_copie = copy.deepcopy(_DERNIER_RAPPORT)
+        rapport_copie = dict(_DERNIER_RAPPORT)
     _sauvegarder_rapport_disque(rapport_copie)
     return jsonify({"ok": True, "bilan": bilan}), 200
 
@@ -2434,5 +2309,54 @@ def refresh():
 @app.route("/")
 def index():
     with _STATE_LOCK:
-        rapport = copy.deepcopy(_DERNIER_RAPPORT)
-        en_cours = _
+        rapport = dict(_DERNIER_RAPPORT)
+        en_cours = _ANALYSE_EN_COURS
+
+    if rapport.get("mis_a_jour"):
+        return redirect(url_for("app_view"))
+
+    if not en_cours:
+        _demarrer_analyse_si_besoin(0.2)
+
+    resp = make_response(render_template_string(
+        _HTML_HOME,
+        en_cours=en_cours,
+    ), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/app")
+def app_view():
+    cat = (request.args.get("cat") or "all").strip().lower()
+    if cat not in {"all", "top", "foot", "tennis", "alertes", "bilan"}:
+        cat = "all"
+
+    with _STATE_LOCK:
+        rapport = dict(_DERNIER_RAPPORT)
+        en_cours = _ANALYSE_EN_COURS
+
+    if not rapport.get("mis_a_jour"):
+        if not en_cours:
+            _demarrer_analyse_si_besoin(0.0)
+        resp = make_response(render_template_string(_HTML_LOADING), 200)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+
+    resp = make_response(render_template_string(
+        _HTML_PAGE,
+        r=rapport,
+        en_cours=en_cours,
+        cat=cat,
+        fenetre_heures=CFG.fenetre_heures,
+    ), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+_charger_rapport_disque()
+_demarrer_scheduler_si_actif()
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
