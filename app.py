@@ -379,10 +379,51 @@ def simuler_poisson_foot(lam_h, lam_a):
 
     tot = p_h + p_n + p_a
     if tot <= 0:
-        return 1 / 3, 1 / 3, 1 / 3, 0.5, 0.5, "0 - 0", 0, 0
+        return 1 / 3, 1 / 3, 1 / 3, 0.5, 0.5, "1 - 1", 1, 1
     p_h, p_n, p_a = p_h / tot, p_n / tot, p_a / tot
     p_ov25_norm = min(max(p_over_25, 0.0), 1.0)
     return p_h, p_n, p_a, p_ov25_norm, 1.0 - p_ov25_norm, f"{best_h} - {best_a}", best_h, best_a
+
+
+def _rendre_score_coherent(choix, h_nom, a_nom, best_h, best_a):
+    h_sc, a_sc = int(best_h), int(best_a)
+    c_l = str(choix or "").strip().lower()
+    h_l = str(h_nom or "").strip().lower()
+    a_l = str(a_nom or "").strip().lower()
+
+    if c_l == "match nul":
+        if h_sc != a_sc:
+            h_sc = a_sc = max(1, min(h_sc, a_sc))
+    elif c_l.startswith("victoire "):
+        cible = c_l.replace("victoire ", "", 1).strip()
+        if cible and (cible == h_l or cible in h_l or h_l in cible):
+            if h_sc <= a_sc:
+                h_sc = a_sc + 1
+        elif cible and (cible == a_l or cible in a_l or a_l in cible):
+            if a_sc <= h_sc:
+                a_sc = h_sc + 1
+    elif "+2.5" in c_l:
+        if (h_sc + a_sc) < 3:
+            if h_sc >= a_sc:
+                h_sc = max(h_sc, 2)
+                a_sc = max(a_sc, 1)
+                if h_sc + a_sc < 3:
+                    h_sc += 1
+            else:
+                a_sc = max(a_sc, 2)
+                h_sc = max(h_sc, 1)
+                if h_sc + a_sc < 3:
+                    a_sc += 1
+    elif "-2.5" in c_l:
+        while (h_sc + a_sc) > 2:
+            if h_sc >= a_sc and h_sc > 0:
+                h_sc -= 1
+            elif a_sc > 0:
+                a_sc -= 1
+            else:
+                break
+
+    return f"{h_sc} - {a_sc}"
 
 
 def moyenne_ponderee_shrinkage(valeurs, prior_moyenne, prior_poids=3.0):
@@ -402,11 +443,11 @@ def _calculer_indice_confiance(proba_pct, fiable, gravite_alerte=0.0, est_nul=Fa
     if gravite_alerte > 0.0:
         score -= min(gravite_alerte * 10.0, 22.0)
     if est_nul:
-        score -= 6.0
+        score -= 8.0
     score = round(max(10.0, min(95.0, score)), 1)
-    if fiable and gravite_alerte == 0.0 and not est_nul and score >= 60.0:
+    if fiable and gravite_alerte == 0.0 and not est_nul and score >= 68.0 and proba_pct >= 65.0:
         niveau = "HAUTE"
-    elif score >= 49.0:
+    elif score >= 52.0:
         niveau = "MOYENNE"
     else:
         niveau = "FAIBLE"
@@ -414,12 +455,10 @@ def _calculer_indice_confiance(proba_pct, fiable, gravite_alerte=0.0, est_nul=Fa
 
 
 def _calculer_cote(proba_pct, marge=0.04):
-    p = proba_pct / 100.0
-    if p <= 0 or p >= 1:
-        return 0.0
+    p = max(0.05, min(0.95, float(proba_pct or 50.0) / 100.0))
     fair_odds = 1.0 / p
-    cote_broker = fair_odds * (1 - marge)
-    return max(1.01, round(cote_broker, 2))
+    cote_broker = fair_odds * (1.0 - marge)
+    return max(1.05, round(cote_broker, 2))
 
 
 def _calculer_cote_min_et_mise(proba_pct, conf_score, fiable, est_nul=False):
@@ -721,7 +760,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
 
     lam_h = max(((h_att * 1.12) + a_def) / 2.0, 0.35)
     lam_a = max(((a_att * 0.90) + h_def) / 2.0, 0.35)
-    p_h, p_n, p_a, p_ov25, p_un25, score_exact, best_h, best_a = simuler_poisson_foot(lam_h, lam_a)
+    p_h, p_n, p_a, p_ov25, p_un25, _, best_h, best_a = simuler_poisson_foot(lam_h, lam_a)
 
     meilleure_victoire, prob_victoire = max(
         [(f"Victoire {h_nom}", p_h), (f"Victoire {a_nom}", p_a)],
@@ -743,6 +782,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     plafond = 0.80 if (fiable and not est_nul) else (0.55 if est_nul else 0.68)
     prob_cal = min(max(prob, 0.05), plafond)
     proba_pct = round(prob_cal * 100, 1)
+    score_exact = _rendre_score_coherent(choix, h_nom, a_nom, best_h, best_a)
 
     dt_match = _parse_date_utc(start_str)
     est_imminent = False
@@ -770,7 +810,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "choix": choix,
         "est_nul": est_nul,
         "proba": proba_pct,
-        "cote": 0.0,
+        "cote": _calculer_cote(proba_pct),
         "cote_source": "Estimée",
         "cote_min": cote_min,
         "score_exact": score_exact,
@@ -976,7 +1016,7 @@ def analyser_tennis(heures_max=48):
                     "choix": f"Victoire {favori}",
                     "est_nul": False,
                     "proba": proba_pct,
-                    "cote": 0.0,
+                    "cote": _calculer_cote(proba_pct),
                     "cote_source": "Estimée",
                     "cote_min": cote_min,
                     "score_exact": None,
@@ -1046,6 +1086,8 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
         it["mise_u"] = mise_u
         it["confiance"] = conf_niveau
         it["confiance_score"] = conf_score
+        if it.get("cote_source") == "Estimée":
+            it["cote"] = _calculer_cote(it["proba"])
 
     return alertes_globales
 
@@ -1338,7 +1380,8 @@ def executer_analyse():
                 bilan = dict(_DERNIER_RAPPORT.get("bilan") or {})
 
         synthese = "\n".join(
-            f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')} | Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')})] "
+            f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')} | "
+            f"Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')})] "
             f"{x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
             for x in top_sur[:8]
         ) or f"Aucun match à venir dans les prochaines {CFG.fenetre_heures}h."
@@ -1810,6 +1853,7 @@ _HTML_PAGE = """<!doctype html>
       {% for it in r.top_sur %}
       {% set conf = it.get('confiance', 'MOYENNE') %}
       {% set conf_sc = it.get('confiance_score', it.proba) %}
+      {% set est_est = (it.get('cote_source', 'Estimée') == 'Estimée') %}
       <div class="card {{ conf }}"
            data-conf="{{ conf }}"
            data-proba="{{ it.proba }}"
@@ -1825,7 +1869,7 @@ _HTML_PAGE = """<!doctype html>
             <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
             {% endif %}
             {% if it.get('cote') %}
-            <span class="badge cote" title="{{ it.get('cote_source', 'Estimée') }}">Cote {{ it.cote }}</span>
+            <span class="badge cote" title="{{ it.get('cote_source', 'Estimée') }}">Cote {{ '~' if est_est else '' }}{{ it.cote }}</span>
             {% endif %}
             <span class="badge proba">{{ it.proba }}%</span>
             <span class="badge {{ conf }}">{{ conf }}</span>
@@ -1835,7 +1879,7 @@ _HTML_PAGE = """<!doctype html>
           <strong>{{ it.match }}</strong><br>
           {{ it.date_match }} — {{ it.competition }}
           {% if it.get('score_exact') %}
-          <br><span style="color: var(--accent); font-weight: 600;">Score exact prédit : {{ it.score_exact }}</span>
+          <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
           {% endif %}
         </div>
         <div class="conf-meter">
@@ -1863,6 +1907,7 @@ _HTML_PAGE = """<!doctype html>
       {% for it in r.foot %}
       {% set conf = it.get('confiance', 'MOYENNE') %}
       {% set conf_sc = it.get('confiance_score', it.proba) %}
+      {% set est_est = (it.get('cote_source', 'Estimée') == 'Estimée') %}
       <div class="card {{ conf }}"
            data-conf="{{ conf }}"
            data-proba="{{ it.proba }}"
@@ -1876,7 +1921,7 @@ _HTML_PAGE = """<!doctype html>
             <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
             {% endif %}
             {% if it.get('cote') %}
-            <span class="badge cote" title="{{ it.get('cote_source', 'Estimée') }}">Cote {{ it.cote }}</span>
+            <span class="badge cote" title="{{ it.get('cote_source', 'Estimée') }}">Cote {{ '~' if est_est else '' }}{{ it.cote }}</span>
             {% endif %}
             <span class="badge proba">{{ it.proba }}%</span>
             <span class="badge {{ conf }}">{{ conf }}</span>
@@ -1886,7 +1931,7 @@ _HTML_PAGE = """<!doctype html>
           <strong>{{ it.match }}</strong><br>
           {{ it.date_match }}
           {% if it.get('score_exact') %}
-          <br><span style="color: var(--accent); font-weight: 600;">Score exact prédit : {{ it.score_exact }}</span>
+          <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
           {% endif %}
         </div>
         <div class="conf-meter">
@@ -1907,6 +1952,7 @@ _HTML_PAGE = """<!doctype html>
       {% for it in r.tennis %}
       {% set conf = it.get('confiance', 'MOYENNE') %}
       {% set conf_sc = it.get('confiance_score', it.proba) %}
+      {% set est_est = (it.get('cote_source', 'Estimée') == 'Estimée') %}
       <div class="card {{ conf }}"
            data-conf="{{ conf }}"
            data-proba="{{ it.proba }}"
@@ -1920,7 +1966,7 @@ _HTML_PAGE = """<!doctype html>
             <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
             {% endif %}
             {% if it.get('cote') %}
-            <span class="badge cote" title="{{ it.get('cote_source', 'Estimée') }}">Cote {{ it.cote }}</span>
+            <span class="badge cote" title="{{ it.get('cote_source', 'Estimée') }}">Cote {{ '~' if est_est else '' }}{{ it.cote }}</span>
             {% endif %}
             <span class="badge proba">{{ it.proba }}%</span>
             <span class="badge {{ conf }}">{{ conf }}</span>
