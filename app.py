@@ -308,12 +308,15 @@ def simuler_poisson_foot(lam_h, lam_a):
     return p_h, p_n, p_a, p_ov25_norm, 1.0 - p_ov25_norm
 
 
-def moyenne_ponderee(valeurs, defaut):
+def moyenne_ponderee_shrinkage(valeurs, prior_moyenne, prior_poids=3.0):
+    """Moyenne récente pondérée avec régression vers une moyenne de référence (shrinkage)."""
     if not valeurs:
-        return defaut
+        return prior_moyenne
     n = len(valeurs)
     poids = [1.0 + (i * 0.25) for i in range(n)]
-    return sum(v * p for v, p in zip(valeurs, poids)) / sum(poids)
+    somme_poids = sum(poids)
+    moy_obs = sum(v * p for v, p in zip(valeurs, poids)) / somme_poids
+    return ((moy_obs * somme_poids) + (prior_moyenne * prior_poids)) / (somme_poids + prior_poids)
 
 
 def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8):
@@ -322,6 +325,8 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8)
     joues.sort(key=lambda ev: str(ev.get("start_time") or ev.get("date") or ""))
 
     bp_all, bc_all = [], []
+    bp_home, bc_home = [], []
+    bp_away, bc_away = [], []
     v = n = d = 0
     nom_l = (team_name or "").strip().lower()
 
@@ -339,12 +344,16 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8)
 
         scores_par_role = []
         moi = None
-        for c in comps_liste:
+        mon_role = ""
+        for idx_c, c in enumerate(comps_liste):
             if not isinstance(c, dict):
                 continue
             t_obj = c.get("team") if isinstance(c.get("team"), dict) else c
-            tid = str(t_obj.get("id") or "")
-            tnm = str(t_obj.get("name") or t_obj.get("short_name") or "").strip().lower()
+            tid = str(t_obj.get("id") or c.get("id") or "")
+            tnm = str(t_obj.get("name") or t_obj.get("short_name") or c.get("name") or "").strip().lower()
+            qual = str(c.get("qualifier") or c.get("homeAway") or "").strip().lower()
+            if not qual:
+                qual = "home" if idx_c == 0 else "away"
             sc = c.get("score")
             if sc is None:
                 continue
@@ -352,21 +361,22 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8)
                 sc_int = int(float(sc))
             except Exception:
                 continue
-            scores_par_role.append((tid, tnm, sc_int))
-            if (team_id and tid and tid == str(team_id)) or (
+            scores_par_role.append((tid, tnm, qual, sc_int))
+            est_moi = (team_id and tid and tid == str(team_id)) or (
                 nom_l and tnm and (tnm == nom_l or nom_l in tnm or tnm in nom_l)
-            ):
-                if moi is None:
-                    moi = sc_int
+            )
+            if est_moi and moi is None:
+                moi = sc_int
+                mon_role = qual
 
         adv = None
         if moi is not None and len(scores_par_role) >= 2:
-            for tid, tnm, sc_int in scores_par_role:
+            for tid, tnm, _, sc_int in scores_par_role:
                 if not ((team_id and tid and tid == str(team_id)) or (nom_l and tnm and tnm == nom_l)):
                     adv = sc_int
                     break
             if adv is None:
-                for _, _, sc_int in scores_par_role:
+                for _, _, _, sc_int in scores_par_role:
                     if sc_int != moi:
                         adv = sc_int
                         break
@@ -376,6 +386,13 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8)
         if moi is not None and adv is not None:
             bp_all.append(moi)
             bc_all.append(adv)
+            if mon_role == "home":
+                bp_home.append(moi)
+                bc_home.append(adv)
+            elif mon_role == "away":
+                bp_away.append(moi)
+                bc_away.append(adv)
+
             if moi > adv:
                 v += 1
             elif moi == adv:
@@ -387,13 +404,23 @@ def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8)
 
     bp_all.reverse()
     bc_all.reverse()
-    a_historique = (v + n + d) > 0
+    bp_home.reverse()
+    bc_home.reverse()
+    bp_away.reverse()
+    bc_away.reverse()
+    nb_matchs = v + n + d
+    a_historique = nb_matchs > 0
 
     return {
         "forme": f"{v}V-{n}N-{d}D" if a_historique else "Forme récente",
         "a_historique": a_historique,
-        "bp": moyenne_ponderee(bp_all, 1.25),
-        "bc": moyenne_ponderee(bc_all, 1.20),
+        "nb_matchs": nb_matchs,
+        "bp": moyenne_ponderee_shrinkage(bp_all, 1.30, prior_poids=3.0),
+        "bc": moyenne_ponderee_shrinkage(bc_all, 1.25, prior_poids=3.0),
+        "bp_home": moyenne_ponderee_shrinkage(bp_home, 1.40, prior_poids=2.5),
+        "bc_home": moyenne_ponderee_shrinkage(bc_home, 1.15, prior_poids=2.5),
+        "bp_away": moyenne_ponderee_shrinkage(bp_away, 1.15, prior_poids=2.5),
+        "bc_away": moyenne_ponderee_shrinkage(bc_away, 1.35, prior_poids=2.5),
     }
 
 
@@ -434,10 +461,16 @@ def _construire_entree_foot(ev, label_comp, events_comp):
 
     st_h = stats_foot_detail(h_info.get("id", ""), h_nom, events_comp, CFG.n_derniers_matchs)
     st_a = stats_foot_detail(a_info.get("id", ""), a_nom, events_comp, CFG.n_derniers_matchs)
-    fiable = st_h["a_historique"] or st_a["a_historique"]
+    fiable = st_h["a_historique"] and st_a["a_historique"]
 
-    lam_h = max(((st_h["bp"] * 1.10) + st_a["bc"]) / 2, 0.35)
-    lam_a = max(((st_a["bp"] * 0.90) + st_h["bc"]) / 2, 0.35)
+    # Mélange stats globales et stats domicile/extérieur pour plus de fiabilité
+    h_att = (0.60 * st_h["bp"]) + (0.40 * st_h["bp_home"])
+    h_def = (0.60 * st_h["bc"]) + (0.40 * st_h["bc_home"])
+    a_att = (0.60 * st_a["bp"]) + (0.40 * st_a["bp_away"])
+    a_def = (0.60 * st_a["bc"]) + (0.40 * st_a["bc_away"])
+
+    lam_h = max(((h_att * 1.08) + a_def) / 2.0, 0.35)
+    lam_a = max(((a_att * 0.92) + h_def) / 2.0, 0.35)
     p_h, p_n, p_a, p_ov25, p_un25 = simuler_poisson_foot(lam_h, lam_a)
 
     choix, prob = max(
@@ -445,9 +478,15 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         key=lambda x: x[1],
     )
 
-    proba_pct = round(max(0.05, prob) * 100, 1)
+    # Calibration prudente : plafond à 82% si peu de données ou modèle Poisson pur
+    plafond = 0.82 if fiable else 0.65
+    prob_cal = min(max(prob, 0.05), plafond)
+    proba_pct = round(prob_cal * 100, 1)
+
     buts_label = "+2.5 buts" if p_ov25 >= p_un25 else "-2.5 buts"
-    buts_proba = round(max(p_ov25, p_un25) * 100, 1)
+    buts_proba = round(min(max(p_ov25, p_un25), 0.85) * 100, 1)
+
+    prudence = "ELEVE" if (proba_pct >= 72 and fiable) else ("MODERE" if proba_pct >= 56 else "PRUDENT")
 
     return {
         "sport": "FOOT",
@@ -462,7 +501,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         ),
         "choix": choix,
         "proba": proba_pct,
-        "prudence": "ELEVE" if proba_pct >= 72 else ("MODERE" if proba_pct >= 56 else "PRUDENT"),
+        "prudence": prudence,
         "mise_u": CFG.mise_unite_defaut,
         "equipes": [h_nom, a_nom],
     }
@@ -621,11 +660,11 @@ def analyser_tennis(heures_max=48):
                     continue
                 r1, r2 = trouver_rang(j1, rk_map), trouver_rang(j2, rk_map)
                 complet = r1 is not None and r2 is not None
-                diff = (math.log((r2 or 150) + 1) - math.log((r1 or 150) + 1)) * (0.85 if complet else 0.35)
+                diff = (math.log((r2 or 150) + 1) - math.log((r1 or 150) + 1)) * (0.75 if complet else 0.30)
                 p1 = 1 / (1 + math.exp(-diff))
                 favori, prob = (j1, p1) if p1 >= 0.5 else (j2, 1 - p1)
-                if complet:
-                    prob = min(max(prob, 0.50), 0.82)
+                plafond = 0.80 if complet else 0.62
+                prob = min(max(prob, 0.50), plafond)
 
                 proba_pct = round(max(0.05, prob) * 100, 1)
                 simples.append({
@@ -638,7 +677,7 @@ def analyser_tennis(heures_max=48):
                     "detail": f"{t_name}",
                     "choix": f"Victoire {favori}",
                     "proba": proba_pct,
-                    "prudence": "MODERE" if proba_pct >= 56 else "PRUDENT",
+                    "prudence": "MODERE" if (proba_pct >= 58 and complet) else "PRUDENT",
                     "mise_u": CFG.mise_unite_defaut,
                     "equipes": [favori],
                 })
@@ -650,7 +689,7 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
         return {}
 
     equipes_a_scanner = set()
-    for it in items_cibles[:8]:
+    for it in items_cibles[:10]:
         for nom in it.get("equipes", []):
             if nom:
                 equipes_a_scanner.add(nom)
@@ -681,10 +720,9 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
     for it in liste_a_maj:
         nb = sum(penalites.get(n, 0) for n in it.get("equipes", []))
         if nb:
-            it["proba"] = round(max(0.05, it["proba"] / 100 - min(nb * 0.02, 0.08)) * 100, 1)
+            it["proba"] = round(max(0.05, it["proba"] / 100 - min(nb * 0.03, 0.10)) * 100, 1)
             it["prudence"] = (
-                "ELEVE" if it["proba"] >= 72
-                else ("MODERE" if it["proba"] >= 56 else "PRUDENT (alerte)")
+                "MODERE" if it["proba"] >= 62 else "PRUDENT (alerte)"
             )
 
     return alertes_globales
