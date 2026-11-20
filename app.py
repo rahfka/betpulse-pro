@@ -363,11 +363,13 @@ def simuler_poisson_foot(lam_h, lam_a):
     p_h = p_n = p_a = p_over_25 = 0.0
     best_h = best_a = 0
     max_pr = -1.0
+    matrice_scores = {}
 
     for h in range(max_buts):
         pr_h = poisson_prob(h, lam_h)
         for a in range(max_buts):
             pr = pr_h * poisson_prob(a, lam_a)
+            matrice_scores[(h, a)] = pr
             if pr > max_pr:
                 max_pr = pr
                 best_h, best_a = h, a
@@ -383,10 +385,10 @@ def simuler_poisson_foot(lam_h, lam_a):
 
     tot = p_h + p_n + p_a
     if tot <= 0:
-        return 1 / 3, 1 / 3, 1 / 3, 0.5, 0.5, "1 - 1", 1, 1
+        return 1 / 3, 1 / 3, 1 / 3, 0.5, 0.5, "1 - 1", 1, 1, {(1, 1): 0.12}
     p_h, p_n, p_a = p_h / tot, p_n / tot, p_a / tot
     p_ov25_norm = min(max(p_over_25, 0.0), 1.0)
-    return p_h, p_n, p_a, p_ov25_norm, 1.0 - p_ov25_norm, f"{best_h} - {best_a}", best_h, best_a
+    return p_h, p_n, p_a, p_ov25_norm, 1.0 - p_ov25_norm, f"{best_h} - {best_a}", best_h, best_a, matrice_scores
 
 
 def _rendre_score_coherent(choix, h_nom, a_nom, best_h, best_a):
@@ -427,7 +429,24 @@ def _rendre_score_coherent(choix, h_nom, a_nom, best_h, best_a):
             else:
                 break
 
-    return f"{h_sc} - {a_sc}"
+    return f"{h_sc} - {a_sc}", h_sc, a_sc
+
+
+def _calculer_proba_score_exact(score_str, matrice_scores, lam_h, lam_a):
+    if not score_str or "-" not in str(score_str):
+        return None
+    try:
+        parts = [int(x.strip()) for x in str(score_str).split("-", 1)]
+        h_sc, a_sc = parts[0], parts[1]
+    except Exception:
+        return None
+
+    if matrice_scores and (h_sc, a_sc) in matrice_scores:
+        pr = float(matrice_scores[(h_sc, a_sc)])
+    else:
+        pr = poisson_prob(h_sc, lam_h) * poisson_prob(a_sc, lam_a)
+
+    return round(max(0.5, min(95.0, pr * 100.0)), 1)
 
 
 def moyenne_ponderee_shrinkage(valeurs, prior_moyenne, prior_poids=1.5):
@@ -803,7 +822,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
 
     lam_h = max(((h_att * a_def) / 1.30) * 1.12, 0.35)
     lam_a = max(((a_att * h_def) / 1.30) * 0.90, 0.35)
-    p_h, p_n, p_a, p_ov25, p_un25, _, best_h, best_a = simuler_poisson_foot(lam_h, lam_a)
+    p_h, p_n, p_a, p_ov25, p_un25, _, best_h, best_a, matrice_scores = simuler_poisson_foot(lam_h, lam_a)
 
     meilleure_victoire, prob_victoire = max(
         [(f"Victoire {h_nom}", p_h), (f"Victoire {a_nom}", p_a)],
@@ -825,7 +844,8 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     plafond = 0.86 if (fiable and not est_nul) else (0.55 if est_nul else 0.72)
     prob_cal = min(max(prob, 0.05), plafond)
     proba_pct = round(prob_cal * 100, 1)
-    score_exact = _rendre_score_coherent(choix, h_nom, a_nom, best_h, best_a)
+    score_exact, _, _ = _rendre_score_coherent(choix, h_nom, a_nom, best_h, best_a)
+    score_exact_proba = _calculer_proba_score_exact(score_exact, matrice_scores, lam_h, lam_a)
 
     dt_match = _parse_date_utc(start_str)
     est_imminent = False
@@ -857,6 +877,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "cote_source": "Estimée",
         "cote_min": cote_min,
         "score_exact": score_exact,
+        "score_exact_proba": score_exact_proba,
         "est_imminent": est_imminent,
         "prudence": prudence,
         "confiance": conf_niveau,
@@ -1072,6 +1093,7 @@ def analyser_tennis(heures_max=48):
                     "cote_source": "Estimée",
                     "cote_min": cote_min,
                     "score_exact": None,
+                    "score_exact_proba": None,
                     "est_imminent": est_imminent,
                     "prudence": "MODERE" if (proba_pct >= 58 and complet) else "PRUDENT",
                     "confiance": conf_niveau,
@@ -1131,7 +1153,6 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
                 ids_vus.add(id(x))
 
     for it in liste_a_maj:
-        # N'appliquer la gravité qu'aux cibles réellement liées au pronostic/choix de l'item
         grav = 0.0
         for n in it.get("equipes", []):
             g_cible = gravites_par_cible.get(n, 0.0)
@@ -1431,7 +1452,7 @@ def executer_analyse():
                             elif _memes_equipes(cible, eq_a):
                                 cote_trouvee, nb_books = pack["away"]
                         break
-            if cote_trouvee:
+            if cote_trouvee and nb_books > 0:
                 it["cote"] = cote_trouvee
                 it["cote_source"] = f"Moy. {nb_books} bookmakers"
             else:
@@ -1862,12 +1883,12 @@ _HTML_PAGE = """<!doctype html>
     .card.HAUTE { border-left-color: var(--green); }
     .card.MOYENNE { border-left-color: var(--orange); }
     .card.FAIBLE { border-left-color: var(--red); }
-    .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 8px; }
-    .card-title { font-size: 1.06em; font-weight: 700; line-height: 1.3; display: flex; align-items: center; gap: 6px; }
-    .badges-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
-    .badge { font-size: 0.74em; padding: 3px 8px; border-radius: 999px; font-weight: 800; white-space: nowrap; }
+    .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
+    .card-title { font-size: 1.02em; font-weight: 700; line-height: 1.3; display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .badges-right { display: flex; align-items: center; gap: 5px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+    .badge { font-size: 0.73em; padding: 3px 7px; border-radius: 999px; font-weight: 800; white-space: nowrap; }
     .badge.proba { background: rgba(56, 189, 248, 0.16); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35); }
-    .badge.cote { background: rgba(255, 255, 255, 0.1); color: #e2e8f0; border: 1px solid rgba(255, 255, 255, 0.2); }
+    .badge.cote { background: rgba(148, 163, 184, 0.18); color: #e2e8f0; border: 1px solid rgba(148, 163, 184, 0.32); }
     .badge.HAUTE { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }
     .badge.MOYENNE { background: rgba(245, 158, 11, 0.2); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.4); }
     .badge.FAIBLE { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
@@ -1950,7 +1971,7 @@ _HTML_PAGE = """<!doctype html>
       {% for it in r.top_sur %}
       {% set conf = it.get('confiance', 'MOYENNE') %}
       {% set conf_sc = it.get('confiance_score', it.proba) %}
-      {% set est_est = (it.get('cote_source', 'Estimée') == 'Estimée') %}
+      {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
       <div class="card {{ conf }}"
            data-conf="{{ conf }}"
            data-proba="{{ it.proba }}"
@@ -1962,14 +1983,13 @@ _HTML_PAGE = """<!doctype html>
             {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.choix }}
           </div>
           <div class="badges-right">
+            {% if it.get('cote') %}
+            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
+            {% endif %}
+            <span class="badge proba" title="Probabilité du score exact cohérent">{{ pct_score }}%</span>
             {% if it.get('est_imminent') %}
             <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
             {% endif %}
-            {% if it.get('cote') %}
-            <span class="badge cote" title="{{ it.get('cote_source', 'Estimée') }}">Cote {{ '~' if est_est else '' }}{{ it.cote }}</span>
-            {% endif %}
-            <span class="badge proba">{{ it.proba }}%</span>
-            <span class="badge {{ conf }}">{{ conf }}</span>
           </div>
         </div>
         <div class="card-meta">
@@ -1980,7 +2000,7 @@ _HTML_PAGE = """<!doctype html>
           {% endif %}
         </div>
         <div class="conf-meter">
-          <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
+          <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
           <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
         </div>
         {% if it.detail %}
@@ -2004,7 +2024,7 @@ _HTML_PAGE = """<!doctype html>
       {% for it in r.foot %}
       {% set conf = it.get('confiance', 'MOYENNE') %}
       {% set conf_sc = it.get('confiance_score', it.proba) %}
-      {% set est_est = (it.get('cote_source', 'Estimée') == 'Estimée') %}
+      {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
       <div class="card {{ conf }}"
            data-conf="{{ conf }}"
            data-proba="{{ it.proba }}"
@@ -2014,14 +2034,13 @@ _HTML_PAGE = """<!doctype html>
         <div class="card-top">
           <div class="card-title">⚽ {{ it.choix }}</div>
           <div class="badges-right">
+            {% if it.get('cote') %}
+            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
+            {% endif %}
+            <span class="badge proba" title="Probabilité du score exact cohérent">{{ pct_score }}%</span>
             {% if it.get('est_imminent') %}
             <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
             {% endif %}
-            {% if it.get('cote') %}
-            <span class="badge cote" title="{{ it.get('cote_source', 'Estimée') }}">Cote {{ '~' if est_est else '' }}{{ it.cote }}</span>
-            {% endif %}
-            <span class="badge proba">{{ it.proba }}%</span>
-            <span class="badge {{ conf }}">{{ conf }}</span>
           </div>
         </div>
         <div class="card-meta">
@@ -2032,7 +2051,7 @@ _HTML_PAGE = """<!doctype html>
           {% endif %}
         </div>
         <div class="conf-meter">
-          <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
+          <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
           <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
         </div>
         <div class="card-detail">{{ it.detail }}</div>
@@ -2049,7 +2068,7 @@ _HTML_PAGE = """<!doctype html>
       {% for it in r.tennis %}
       {% set conf = it.get('confiance', 'MOYENNE') %}
       {% set conf_sc = it.get('confiance_score', it.proba) %}
-      {% set est_est = (it.get('cote_source', 'Estimée') == 'Estimée') %}
+      {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
       <div class="card {{ conf }}"
            data-conf="{{ conf }}"
            data-proba="{{ it.proba }}"
@@ -2059,14 +2078,13 @@ _HTML_PAGE = """<!doctype html>
         <div class="card-top">
           <div class="card-title">🎾 {{ it.choix }}</div>
           <div class="badges-right">
+            {% if it.get('cote') %}
+            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
+            {% endif %}
+            <span class="badge proba" title="Probabilité du score exact cohérent">{{ pct_score }}%</span>
             {% if it.get('est_imminent') %}
             <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
             {% endif %}
-            {% if it.get('cote') %}
-            <span class="badge cote" title="{{ it.get('cote_source', 'Estimée') }}">Cote {{ '~' if est_est else '' }}{{ it.cote }}</span>
-            {% endif %}
-            <span class="badge proba">{{ it.proba }}%</span>
-            <span class="badge {{ conf }}">{{ conf }}</span>
           </div>
         </div>
         <div class="card-meta">
@@ -2074,7 +2092,7 @@ _HTML_PAGE = """<!doctype html>
           {{ it.date_match }} — {{ it.competition }}
         </div>
         <div class="conf-meter">
-          <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
+          <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
           <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
         </div>
       </div>
