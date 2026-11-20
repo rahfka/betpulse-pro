@@ -806,7 +806,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "date_match": _formater_date_locale(start_str),
         "detail": (
             f"[{label_comp}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] "
-            f"| Buts: {buts_label} ({buts_proba:.0f}%) | Min @{cote_min}{nul_note}"
+            f"| Buts: {buts_label} ({buts_proba:.0f}%) | Min @{cote_min} | Mise {mise_u}u{nul_note}"
         ),
         "choix": choix,
         "est_nul": est_nul,
@@ -949,6 +949,15 @@ def trouver_rang(nom, rk_map):
     return None
 
 
+def _selectionner_classement_tennis(tournoi_nom, draw_nom, atp_rk, wta_rk):
+    texte = f"{tournoi_nom or ''} {draw_nom or ''}".lower()
+    if any(tok in texte for tok in ("wta", "women", "ladies", "femmes", "dames")):
+        return wta_rk
+    if any(tok in texte for tok in ("atp", "men", "hommes", "messieurs")):
+        return atp_rk
+    return atp_rk
+
+
 def analyser_tennis(heures_max=48):
     try:
         atp_rk = {
@@ -973,7 +982,7 @@ def analyser_tennis(heures_max=48):
         for d in t.get("draws", []):
             if "Doubles" in d.get("name", ""):
                 continue
-            rk_map = atp_rk if "Men" in d.get("name", "") else wta_rk
+            rk_map = _selectionner_classement_tennis(t_name, d.get("name", ""), atp_rk, wta_rk)
             for m in d.get("matches", []):
                 mid = str(m.get("id") or "").strip()
                 statut = str(m.get("status") or "").strip().lower()
@@ -1013,7 +1022,7 @@ def analyser_tennis(heures_max=48):
                     "event_id": mid,
                     "match": f"{j1} (#{r1 or 'NC'}) vs {j2} (#{r2 or 'NC'})",
                     "date_match": _formater_date_locale(str(m.get("date", ""))),
-                    "detail": f"{t_name} | Min @{cote_min}",
+                    "detail": f"{t_name} | Min @{cote_min} | Mise {mise_u}u",
                     "choix": f"Victoire {favori}",
                     "est_nul": False,
                     "proba": proba_pct,
@@ -1146,6 +1155,10 @@ def _resoudre_statut_depuis_evenement(row, ev):
             a_nm = _normaliser_nom_equipe(scores[1]["name"])
         if h_sc is None or a_sc is None:
             return None
+        if "+2.5" in choix_l:
+            return "GAGNE" if (h_sc + a_sc) > 2 else "PERDU"
+        if "-2.5" in choix_l:
+            return "GAGNE" if (h_sc + a_sc) < 3 else "PERDU"
         if choix_l == "match nul":
             return "GAGNE" if h_sc == a_sc else "PERDU"
         if choix_l.startswith("victoire "):
@@ -1382,7 +1395,8 @@ def executer_analyse():
 
         synthese = "\n".join(
             f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')} | "
-            f"Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')})] "
+            f"Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')}) | "
+            f"Min @{x.get('cote_min', '-')} | Mise {x.get('mise_u', '-')}u] "
             f"{x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
             for x in top_sur[:8]
         ) or f"Aucun match à venir dans les prochaines {CFG.fenetre_heures}h."
@@ -1879,6 +1893,9 @@ _HTML_PAGE = """<!doctype html>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
           {{ it.date_match }} — {{ it.competition }}
+          {% if it.get('cote_min') is not none or it.get('mise_u') is not none %}
+          <br><span style="color: #cbd5e1;">Min @{{ it.get('cote_min', '-') }} • Mise {{ it.get('mise_u', '-') }}u</span>
+          {% endif %}
           {% if it.get('score_exact') %}
           <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
           {% endif %}
@@ -1931,6 +1948,9 @@ _HTML_PAGE = """<!doctype html>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
           {{ it.date_match }}
+          {% if it.get('cote_min') is not none or it.get('mise_u') is not none %}
+          <br><span style="color: #cbd5e1;">Min @{{ it.get('cote_min', '-') }} • Mise {{ it.get('mise_u', '-') }}u</span>
+          {% endif %}
           {% if it.get('score_exact') %}
           <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
           {% endif %}
@@ -1976,6 +1996,9 @@ _HTML_PAGE = """<!doctype html>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
           {{ it.date_match }} — {{ it.competition }}
+          {% if it.get('cote_min') is not none or it.get('mise_u') is not none %}
+          <br><span style="color: #cbd5e1;">Min @{{ it.get('cote_min', '-') }} • Mise {{ it.get('mise_u', '-') }}u</span>
+          {% endif %}
         </div>
         <div class="conf-meter">
           <div class="conf-label"><span>Indice de confiance</span><span>{{ conf_sc }}/100</span></div>
