@@ -1,4 +1,5 @@
 import csv
+import hmac
 import importlib
 import json
 import logging
@@ -100,9 +101,85 @@ class Config:
     )
     odds_api_key: str = field(default_factory=lambda: os.getenv("ODDS_API_KEY", "").strip())
     odds_cache_ttl_sec: int = field(default_factory=lambda: max(300, int(os.getenv("ODDS_CACHE_TTL_SEC", "7200"))))
+    admin_token: str = field(default_factory=lambda: (os.getenv("ADMIN_TOKEN") or os.getenv("BETPULSE_ADMIN_TOKEN") or "").strip())
+    refresh_rate_limit_sec: float = field(default_factory=lambda: max(0.0, float(os.getenv("REFRESH_RATE_LIMIT_SEC", "15"))))
+    statut_rate_limit_sec: float = field(default_factory=lambda: max(0.0, float(os.getenv("STATUT_RATE_LIMIT_SEC", "2"))))
 
 
 CFG = Config()
+
+
+class _LimiteDebit:
+    def __init__(self, max_cles=2048):
+        self._max_cles = max(64, int(max_cles))
+        self._dernier_appel = OrderedDict()
+        self._lock = threading.Lock()
+
+    def verifier_et_enregistrer(self, cle, min_interval_sec):
+        """Retourne (autorise, retry_after_sec)."""
+        if min_interval_sec <= 0:
+            return True, 0.0
+        now = time.monotonic()
+        with self._lock:
+            prev = self._dernier_appel.get(cle)
+            if prev is not None:
+                ecoule = now - prev
+                if ecoule < min_interval_sec:
+                    return False, round(min_interval_sec - ecoule, 1)
+            self._dernier_appel[cle] = now
+            self._dernier_appel.move_to_end(cle)
+            while len(self._dernier_appel) > self._max_cles:
+                self._dernier_appel.popitem(last=False)
+        return True, 0.0
+
+
+_RATE_LIMITER = _LimiteDebit(max_cles=2048)
+
+
+def _identifiant_client():
+    xff = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    return xff or (request.remote_addr or "local").strip()
+
+
+def _extraire_token_requete(payload=None):
+    token_hdr = (request.headers.get("X-Admin-Token") or "").strip()
+    if token_hdr:
+        return token_hdr
+    auth_hdr = (request.headers.get("Authorization") or "").strip()
+    if auth_hdr.lower().startswith("bearer "):
+        return auth_hdr[7:].strip()
+    if isinstance(payload, dict) and payload.get("admin_token"):
+        return str(payload.get("admin_token")).strip()
+    form_tok = (request.form.get("admin_token") or "").strip()
+    if form_tok:
+        return form_tok
+    return (request.args.get("admin_token") or "").strip()
+
+
+def _verifier_acces_admin(route_tag, min_interval_sec, payload=None, json_mode=False):
+    if CFG.admin_token:
+        fourni = _extraire_token_requete(payload)
+        if not fourni or not hmac.compare_digest(fourni, CFG.admin_token):
+            logger.warning("Accès refusé (token invalide ou manquant) sur %s depuis %s", route_tag, _identifiant_client())
+            if json_mode:
+                return make_response(jsonify({"ok": False, "error": "Token d'administration requis ou invalide"}), 403)
+            return make_response("Accès refusé : token d'administration invalide.", 403)
+
+    cle_rl = f"{route_tag}:{_identifiant_client()}"
+    autorise, retry_sec = _RATE_LIMITER.verifier_et_enregistrer(cle_rl, min_interval_sec)
+    if not autorise:
+        logger.warning("Rate-limit atteint sur %s (%s) — réessayer dans %.1fs", route_tag, _identifiant_client(), retry_sec)
+        if json_mode:
+            resp = make_response(
+                jsonify({"ok": False, "error": f"Trop de requêtes. Réessayez dans {retry_sec}s.", "retry_after": retry_sec}),
+                429,
+            )
+        else:
+            resp = make_response(f"Trop de requêtes sur {route_tag}. Réessayez dans {retry_sec}s.", 429)
+        resp.headers["Retry-After"] = str(max(1, int(math.ceil(retry_sec))))
+        return resp
+    return None
+
 
 MAP_COMP_ODDS_API = {
     "ligue-1": "soccer_france_ligue_one",
@@ -316,21 +393,7 @@ def _obtenir_cles_favoris():
         return set(_FAVORIS_ACTIFS.keys())
 
 
-def _est_favori_item(item, cles_fav=None):
-    cles = cles_fav if cles_fav is not None else _obtenir_cles_favoris()
-    if not cles:
-        return False
-    cle = item.get("cle_favori") or _construire_cle_favori(
-        item.get("sport"),
-        item.get("event_id"),
-        item.get("match"),
-        item.get("date_match"),
-    )
-    return cle in cles
-
-
 def basculer_favori(item_data, force_etat=None):
-    """Ajoute ou retire un match des favoris. Retourne (est_favori, liste_cles)."""
     cle = str(item_data.get("cle_favori") or "").strip() or _construire_cle_favori(
         item_data.get("sport"),
         item_data.get("event_id"),
@@ -1641,7 +1704,6 @@ def _enrichir_matchs_live_avec_pronostics(live_items, candidats_precalcul):
 
 
 def _construire_favoris_suivis(tous_items_a_venir, live_enrichis, clos_globaux, ancien_rapport=None):
-    """Construit la liste des matchs favoris (à venir, en cours et terminés). Si un favori est décoché, il disparaît."""
     with _FAV_LOCK:
         fav_map = {k: dict(v) for k, v in _FAVORIS_ACTIFS.items()}
 
@@ -1725,7 +1787,6 @@ def _construire_favoris_suivis(tous_items_a_venir, live_enrichis, clos_globaux, 
             })
             continue
 
-        # Repli si déjà suivi précédemment et pas encore re-vu dans les flux actuels
         if cle in anciens_suivis_map:
             prev_item = dict(anciens_suivis_map[cle])
             prev_item["cle_favori"] = cle
@@ -2680,6 +2741,7 @@ _HTML_PAGE = """<!doctype html>
     .stat-item { background: var(--card); border: 1px solid var(--border); padding: 8px 13px; border-radius: 999px; font-size: 0.84em; }
     pre { white-space: pre-wrap; background: #0b1220; border: 1px solid var(--border); padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 0.85em; margin: 0; line-height: 1.5; }
     .notice { background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #bae6fd; padding: 10px 14px; border-radius: 10px; margin-bottom: 18px; font-size: 0.9em; }
+    .notice.warn { background: rgba(245, 158, 11, 0.14); border-color: rgba(245, 158, 11, 0.45); color: #fde68a; }
   </style>
 </head>
 <body>
@@ -2698,11 +2760,14 @@ _HTML_PAGE = """<!doctype html>
         {% else %}
         <a href="{{ url_for('favoris_view') }}" class="btn btn-fav-page">★ Page Favoris (<span id="fav-count-header">{{ r.favoris_suivis|length }}</span>)</a>
         {% endif %}
-        <form method="post" action="/refresh" style="margin: 0;" onsubmit="document.getElementById('btn-refresh').disabled=true; document.getElementById('btn-refresh').innerText='Actualisation…';">
+        <form id="refresh-form" method="post" action="/refresh" style="margin: 0;" onsubmit="return soumettreRefresh(event);">
+          <input type="hidden" name="admin_token" id="refresh-admin-token" value="">
           <button id="btn-refresh" type="submit">↻ Actualiser</button>
         </form>
       </div>
     </div>
+
+    <div id="action-banner" class="notice warn" style="display: none;"></div>
 
     <div class="cat-bar">
       <a href="{{ url_for('app_view', cat='all') }}" class="btn btn-cat {% if not page_favoris and cat == 'all' %}active{% endif %}">Tout</a>
@@ -3135,6 +3200,71 @@ _HTML_PAGE = """<!doctype html>
   <script>
     let confActif = "ALL";
     const PAGE_FAVORIS = {{ "true" if (page_favoris or cat == "favoris") else "false" }};
+    const TOKEN_REQUIS = {{ "true" if token_requis else "false" }};
+
+    function afficherBanniere(msg) {
+      const b = document.getElementById("action-banner");
+      if (!b) return;
+      b.textContent = msg;
+      b.style.display = msg ? "" : "none";
+    }
+
+    function obtenirTokenAdmin() {
+      let tok = "";
+      try { tok = localStorage.getItem("betpulse_admin_token") || ""; } catch (e) {}
+      if (!tok && TOKEN_REQUIS) {
+        tok = (window.prompt("Token d'administration requis pour cette action :") || "").trim();
+        if (tok) {
+          try { localStorage.setItem("betpulse_admin_token", tok); } catch (e) {}
+        }
+      }
+      return tok;
+    }
+
+    async function soumettreRefresh(ev) {
+      if (ev) ev.preventDefault();
+      const btn = document.getElementById("btn-refresh");
+      const tok = obtenirTokenAdmin();
+      const hiddenTok = document.getElementById("refresh-admin-token");
+      if (hiddenTok) hiddenTok.value = tok;
+
+      if (btn) {
+        btn.disabled = true;
+        btn.innerText = "Actualisation…";
+      }
+      afficherBanniere("");
+
+      try {
+        const headers = { "Accept": "application/json" };
+        if (tok) headers["X-Admin-Token"] = tok;
+        const body = new URLSearchParams();
+        if (tok) body.set("admin_token", tok);
+
+        const res = await fetch("/refresh", {
+          method: "POST",
+          headers: headers,
+          body: body
+        });
+
+        if (res.status === 429) {
+          const retryAfter = res.headers.get("Retry-After") || "quelques secondes";
+          afficherBanniere(`Actualisation limitée (rate-limit) : réessayez dans ${retryAfter}s.`);
+          if (btn) { btn.disabled = false; btn.innerText = "↻ Actualiser"; }
+          return false;
+        }
+        if (res.status === 401 || res.status === 403) {
+          try { localStorage.removeItem("betpulse_admin_token"); } catch (e) {}
+          afficherBanniere("Accès refusé : token d'administration invalide.");
+          if (btn) { btn.disabled = false; btn.innerText = "↻ Actualiser"; }
+          return false;
+        }
+        window.location.replace(window.location.href);
+      } catch (e) {
+        if (btn) { btn.disabled = false; btn.innerText = "↻ Actualiser"; }
+        afficherBanniere("Erreur réseau lors de l'actualisation.");
+      }
+      return false;
+    }
 
     function setConf(val, btn) {
       confActif = val;
@@ -3379,6 +3509,10 @@ def api_favoris_toggle():
 @app.route("/api/historique/statut", methods=["POST"])
 def api_historique_statut():
     payload = request.get_json(silent=True) or request.form or {}
+    refus = _verifier_acces_admin("/api/historique/statut", CFG.statut_rate_limit_sec, payload=payload, json_mode=True)
+    if refus is not None:
+        return refus
+
     bilan = definir_statut_historique(
         payload.get("sport"),
         payload.get("event_id"),
@@ -3420,7 +3554,15 @@ if CFG.activer_debug_routes:
 
 @app.route("/refresh", methods=["POST"])
 def refresh():
+    payload = request.get_json(silent=True) or request.form or {}
+    wants_json = request.is_json or ("application/json" in (request.headers.get("Accept") or ""))
+    refus = _verifier_acces_admin("/refresh", CFG.refresh_rate_limit_sec, payload=payload, json_mode=wants_json)
+    if refus is not None:
+        return refus
+
     _demarrer_analyse_si_besoin(0.0)
+    if wants_json:
+        return jsonify({"ok": True, "message": "Analyse lancée"}), 202
     return redirect(url_for("app_view"))
 
 
@@ -3464,6 +3606,7 @@ def favoris_view():
         cat="favoris",
         page_favoris=True,
         fenetre_heures=CFG.fenetre_heures,
+        token_requis=bool(CFG.admin_token),
     ), 200)
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -3493,6 +3636,7 @@ def app_view():
         cat=cat,
         page_favoris=False,
         fenetre_heures=CFG.fenetre_heures,
+        token_requis=bool(CFG.admin_token),
     ), 200)
     resp.headers["Cache-Control"] = "no-store"
     return resp
