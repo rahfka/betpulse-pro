@@ -161,6 +161,38 @@ def _resoudre_chemin_historique():
 FICHIER_HISTORIQUE = _resoudre_chemin_historique()
 FICHIER_RAPPORT = os.getenv("FICHIER_RAPPORT", "/tmp/rapport.json").strip() or "/tmp/rapport.json"
 
+
+def _nettoyer_fichiers_tmp_orphelins():
+    """Supprime les fichiers .tmp orphelins associés aux fichiers persistants du bot."""
+    cibles = []
+    for chemin in (FICHIER_RAPPORT, FICHIER_HISTORIQUE):
+        if chemin:
+            dossier = os.path.dirname(os.path.abspath(chemin))
+            base = os.path.basename(chemin)
+            cibles.append((dossier, f"{base}.tmp"))
+
+    # Ajoute aussi les .tmp éventuels de rapport.json / historique_paris.csv dans /tmp
+    cibles.append(("/tmp", "rapport.json.tmp"))
+    cibles.append(("/tmp", "historique_paris.csv.tmp"))
+
+    vus = set()
+    supprimes = 0
+    for dossier, nom_tmp in cibles:
+        chemin_tmp = os.path.join(dossier, nom_tmp)
+        if chemin_tmp in vus:
+            continue
+        vus.add(chemin_tmp)
+        try:
+            if os.path.isfile(chemin_tmp):
+                os.remove(chemin_tmp)
+                supprimes += 1
+        except Exception as e:
+            logger.debug("Impossible de supprimer le fichier tmp %s : %s", chemin_tmp, e)
+
+    if supprimes:
+        logger.info("Nettoyage au démarrage : %d fichier(s) .tmp orphelin(s) supprimé(s).", supprimes)
+
+
 COMPETITIONS_CIBLES = [
     {"slug": "ligue-1", "label": "Ligue 1", "equipes": ["160", "174", "176"]},
     {"slug": "la-liga", "label": "Liga Espagnole", "equipes": ["86", "83", "81"]},
@@ -320,6 +352,13 @@ def _parse_date_utc(date_str):
         return None
 
 
+def _timestamp_match(date_str):
+    dt = _parse_date_utc(date_str)
+    if dt is not None:
+        return dt.timestamp()
+    return 9_999_999_999.0
+
+
 def _formater_date_locale(date_str):
     dt = _parse_date_utc(date_str)
     if dt is None:
@@ -329,7 +368,7 @@ def _formater_date_locale(date_str):
 
 def _cle_cle_chronologique(item):
     return (
-        str(item.get("date_match") or "9999-99-99 99:99"),
+        float(item.get("ts_match") if item.get("ts_match") is not None else _timestamp_match(item.get("date_match"))),
         -(float(item.get("confiance_score") or item.get("proba") or 0.0)),
         -(float(item.get("proba") or 0.0)),
     )
@@ -350,6 +389,35 @@ def _cle_dedup_evenement(ev, fallback_idx=0):
     return f"fallback:{fallback_idx}"
 
 
+def _priorite_statut_evenement(ev):
+    """Plus la priorité est haute, plus l'événement est frais / actif (évite d'écraser un match à venir ou live)."""
+    statut = str(ev.get("status") or "").strip().lower()
+    if statut in STATUTS_EN_COURS or "live" in statut or "progress" in statut:
+        return 3
+    if statut not in STATUTS_EXCLUS_AVENIR:
+        return 2
+    if statut in STATUTS_TERMINES:
+        return 1
+    return 0
+
+
+def _fusionner_evenements(existant, nouveau):
+    """Fusionne deux dicts représentant le même match sans laisser une ancienne entrée écraser un statut plus frais."""
+    p_ex = _priorite_statut_evenement(existant)
+    p_nv = _priorite_statut_evenement(nouveau)
+
+    if p_nv > p_ex:
+        base, complement = dict(nouveau), existant
+    else:
+        base, complement = dict(existant), nouveau
+
+    for k, v in complement.items():
+        if k not in base or base[k] in (None, "", [], {}):
+            if v not in (None, "", [], {}):
+                base[k] = v
+    return base
+
+
 def _est_match_en_cours(ev):
     statut = str(ev.get("status") or "").strip().lower()
     if statut in STATUTS_TERMINES or statut in {"postponed", "cancelled", "canceled", "suspended", "scheduled", "pre"}:
@@ -357,7 +425,6 @@ def _est_match_en_cours(ev):
     if statut in STATUTS_EN_COURS or "live" in statut or "progress" in statut:
         return True
 
-    # Secours si le statut est générique mais qu'une horloge/période est active et que le match a commencé
     clock = str(ev.get("clock") or ev.get("minute") or ev.get("display_clock") or "").strip()
     dt = _parse_date_utc(ev.get("start_time") or ev.get("date"))
     if clock and dt:
@@ -517,24 +584,32 @@ def _calculer_cote(proba_pct, marge=0.04):
     return max(1.05, round(cote_broker, 2))
 
 
-def _calculer_cote_min_et_mise(proba_pct, conf_score, fiable, est_nul=False):
+def _calculer_cote_min_et_mise(proba_pct, conf_score, fiable, est_nul=False, cote_reelle=None, est_cote_reelle=False):
     p = max(0.05, min(0.95, proba_pct / 100.0))
     marge_facteur = 1.0 + (CFG.marge_value_pct / 100.0)
     cote_min = round((1.0 / p) * marge_facteur, 2)
 
+    est_value_bet = False
+    ecart_value_pct = 0.0
+    if est_cote_reelle and isinstance(cote_reelle, (int, float)) and cote_reelle > 1.0:
+        ecart_value_pct = round(((float(cote_reelle) - cote_min) / cote_min) * 100.0, 1)
+        est_value_bet = float(cote_reelle) >= cote_min
+
     if CFG.mise_unite_defaut <= 0:
-        return cote_min, 0.0
+        return cote_min, 0.0, est_value_bet, ecart_value_pct
 
     if not fiable or proba_pct < 50.0:
         mise = round(CFG.mise_unite_defaut * 0.25, 2)
     else:
         facteur_conf = max(0.35, min(1.35, conf_score / 60.0))
         facteur_nul = 0.65 if est_nul else 1.0
+        # Légère majoration (plafonnée par mise_max_unites) quand une vraie value est détectée sur cote réelle
+        facteur_value = 1.15 if est_value_bet else (0.75 if (est_cote_reelle and ecart_value_pct < -8.0) else 1.0)
         mise = round(
-            min(CFG.mise_max_unites, max(0.25, CFG.mise_unite_defaut * facteur_conf * facteur_nul)),
+            min(CFG.mise_max_unites, max(0.25, CFG.mise_unite_defaut * facteur_conf * facteur_nul * facteur_value)),
             2,
         )
-    return cote_min, mise
+    return cote_min, mise, est_value_bet, ecart_value_pct
 
 
 def _normaliser_nom_equipe(nom):
@@ -695,7 +770,7 @@ def _formater_chrono_live(ev):
 def stats_foot_detail(team_id, team_name="", events_override=None, n_derniers=8):
     events = list(events_override or [])
     joues = [ev for ev in events if str(ev.get("status", "")).lower() in STATUTS_TERMINES]
-    joues.sort(key=lambda ev: str(ev.get("start_time") or ev.get("date") or ""))
+    joues.sort(key=lambda ev: _timestamp_match(ev.get("start_time") or ev.get("date")))
 
     bp_all, bc_all = [], []
     bp_home, bc_home = [], []
@@ -859,6 +934,7 @@ def scanner_sante_cible(cible, max_titres=2):
 def _construire_entree_foot(ev, label_comp, events_comp):
     ev_id = str(ev.get("id") or "")
     start_str = str(ev.get("start_time") or ev.get("date") or "")
+    ts_match = _timestamp_match(start_str)
     h_info, a_info = _normaliser_home_away(ev)
     h_nom = h_info.get("short_name") or h_info.get("name") or "Home"
     a_nom = a_info.get("short_name") or a_info.get("name") or "Away"
@@ -906,9 +982,12 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         if 0 <= delta_sec <= 7200:
             est_imminent = True
 
+    cote_estimee = _calculer_cote(proba_pct)
     prudence = "ELEVE" if (proba_pct >= 70 and fiable and not est_nul) else ("MODERE" if proba_pct >= 55 else "PRUDENT")
     conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, fiable, 0.0, est_nul=est_nul)
-    cote_min, mise_u = _calculer_cote_min_et_mise(proba_pct, conf_score, fiable, est_nul=est_nul)
+    cote_min, mise_u, est_value_bet, ecart_value_pct = _calculer_cote_min_et_mise(
+        proba_pct, conf_score, fiable, est_nul=est_nul, cote_reelle=cote_estimee, est_cote_reelle=False
+    )
     nul_note = " | Nul probable" if est_nul else ""
 
     return {
@@ -918,6 +997,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "event_id": ev_id,
         "match": f"{h_nom} vs {a_nom}",
         "date_match": _formater_date_locale(start_str),
+        "ts_match": ts_match,
         "detail": (
             f"[{label_comp}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] "
             f"| Buts: {buts_label} ({buts_proba:.0f}%){nul_note}"
@@ -925,9 +1005,11 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "choix": choix,
         "est_nul": est_nul,
         "proba": proba_pct,
-        "cote": _calculer_cote(proba_pct),
+        "cote": cote_estimee,
         "cote_source": "Estimée",
         "cote_min": cote_min,
+        "est_value_bet": est_value_bet,
+        "ecart_value_pct": ecart_value_pct,
         "score_exact": score_exact,
         "score_exact_proba": score_exact_proba,
         "est_imminent": est_imminent,
@@ -1005,16 +1087,33 @@ def analyser_foot_competitions(competitions, heures_max=48):
         slug = comp["slug"]
         label_comp = comp["label"]
 
-        raw_comp_events = events_hist_par_slug[slug] + events_upcoming_par_slug[slug]
-        dedup_comp = {}
+        # Ordre : upcoming d'abord, puis historique, avec fusion priorisant les statuts live/à venir
+        raw_comp_events = events_upcoming_par_slug[slug] + events_hist_par_slug[slug]
+        dedup_par_id = {}
+        sans_id = []
+
         for idx, ev in enumerate(raw_comp_events):
-            cle = _cle_dedup_evenement(ev, idx)
-            if cle not in dedup_comp:
-                dedup_comp[cle] = ev
+            eid = str(ev.get("id") or "").strip()
+            if eid:
+                if eid in dedup_par_id:
+                    dedup_par_id[eid] = _fusionner_evenements(dedup_par_id[eid], ev)
+                else:
+                    dedup_par_id[eid] = ev
+            else:
+                sans_id.append((idx, ev))
+
+        dedup_comp = dict(dedup_par_id)
+        for idx, ev in sans_id:
+            cle_sec = _cle_dedup_evenement(ev, idx)
+            # Ne pas écraser une entrée déjà indexée par event_id
+            if cle_sec not in dedup_comp:
+                dedup_comp[cle_sec] = ev
+            else:
+                dedup_comp[cle_sec] = _fusionner_evenements(dedup_comp[cle_sec], ev)
 
         events_comp = list(dedup_comp.values())
         a_venir_48h = [ev for ev in events_comp if _est_match_a_venir_dans_fenetre(ev, heures_max)]
-        a_venir_48h.sort(key=lambda e: str(e.get("start_time") or e.get("date") or ""))
+        a_venir_48h.sort(key=lambda e: _timestamp_match(e.get("start_time") or e.get("date")))
 
         en_cours_evs = [ev for ev in events_comp if _est_match_en_cours(ev)]
         live_comp = []
@@ -1027,7 +1126,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
 
         clos_comp = {}
         for ev in events_comp:
-            if str(ev.get("status") or "").strip().lower() in STATUTS_TERMINES:
+            if str(ev.get("status") or "").strip().lower() in STATUTS_TERMINES and not _est_match_en_cours(ev):
                 eid = str(ev.get("id") or "").strip()
                 if eid:
                     clos_comp[eid] = ev
@@ -1138,29 +1237,37 @@ def analyser_tennis(heures_max=48):
 
                 proba_pct = round(max(0.05, prob) * 100, 1)
 
-                dt_match = _parse_date_utc(str(m.get("date", "")))
+                date_raw = str(m.get("date") or m.get("start_time") or "")
+                ts_match = _timestamp_match(date_raw)
+                dt_match = _parse_date_utc(date_raw)
                 est_imminent = False
                 if dt_match:
                     delta_sec = (dt_match - datetime.now(timezone.utc)).total_seconds()
                     if 0 <= delta_sec <= 7200:
                         est_imminent = True
 
+                cote_estimee = _calculer_cote(proba_pct)
                 conf_score, conf_niveau = _calculer_indice_confiance(proba_pct, complet, 0.0)
-                cote_min, mise_u = _calculer_cote_min_et_mise(proba_pct, conf_score, complet, est_nul=False)
+                cote_min, mise_u, est_value_bet, ecart_value_pct = _calculer_cote_min_et_mise(
+                    proba_pct, conf_score, complet, est_nul=False, cote_reelle=cote_estimee, est_cote_reelle=False
+                )
                 entree = {
                     "sport": "TENNIS",
                     "competition": t_name or "Tennis",
                     "fiable": complet,
                     "event_id": mid,
                     "match": f"{j1} (#{r1 or 'NC'}) vs {j2} (#{r2 or 'NC'})",
-                    "date_match": _formater_date_locale(str(m.get("date", ""))),
+                    "date_match": _formater_date_locale(date_raw),
+                    "ts_match": ts_match,
                     "detail": f"{t_name}",
                     "choix": f"Victoire {favori}",
                     "est_nul": False,
                     "proba": proba_pct,
-                    "cote": _calculer_cote(proba_pct),
+                    "cote": cote_estimee,
                     "cote_source": "Estimée",
                     "cote_min": cote_min,
+                    "est_value_bet": est_value_bet,
+                    "ecart_value_pct": ecart_value_pct,
                     "score_exact": None,
                     "score_exact_proba": None,
                     "est_imminent": est_imminent,
@@ -1309,24 +1416,30 @@ def _enrichir_sante_items(items_cibles, tous_les_items=None):
             it["proba"] = round(max(0.05, it["proba"] / 100 - penalite_proba) * 100, 1)
             it["prudence"] = "MODERE" if it["proba"] >= 62 else "PRUDENT (alerte)"
         est_nul = bool(it.get("est_nul")) or str(it.get("choix") or "").strip().lower() == "match nul"
+        est_cote_reelle = str(it.get("cote_source") or "Estimée") != "Estimée"
+        if not est_cote_reelle:
+            it["cote"] = _calculer_cote(it["proba"])
+
         conf_score, conf_niveau = _calculer_indice_confiance(
             it.get("proba", 50.0),
             bool(it.get("fiable", True)),
             grav,
             est_nul=est_nul,
         )
-        cote_min, mise_u = _calculer_cote_min_et_mise(
+        cote_min, mise_u, est_value_bet, ecart_value_pct = _calculer_cote_min_et_mise(
             it.get("proba", 50.0),
             conf_score,
             bool(it.get("fiable", True)),
             est_nul=est_nul,
+            cote_reelle=it.get("cote"),
+            est_cote_reelle=est_cote_reelle,
         )
         it["cote_min"] = cote_min
         it["mise_u"] = mise_u
+        it["est_value_bet"] = est_value_bet
+        it["ecart_value_pct"] = ecart_value_pct
         it["confiance"] = conf_niveau
         it["confiance_score"] = conf_score
-        if it.get("cote_source") == "Estimée":
-            it["cote"] = _calculer_cote(it["proba"])
 
     return alertes_globales
 
@@ -1498,6 +1611,11 @@ def mettre_a_jour_historique(items, evenements_termines=None):
             os.replace(tmp_csv, FICHIER_HISTORIQUE)
         except Exception as e:
             logger.warning("Erreur écriture historique CSV: %s", e)
+            try:
+                if os.path.exists(tmp_csv):
+                    os.remove(tmp_csv)
+            except Exception:
+                pass
 
         return _calculer_bilan(lignes)
 
@@ -1531,8 +1649,8 @@ def definir_statut_historique(sport, event_id, choix, statut):
         if not modifie:
             return None
 
+        tmp_csv = f"{FICHIER_HISTORIQUE}.tmp"
         try:
-            tmp_csv = f"{FICHIER_HISTORIQUE}.tmp"
             with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=champs)
                 writer.writeheader()
@@ -1541,6 +1659,11 @@ def definir_statut_historique(sport, event_id, choix, statut):
             os.replace(tmp_csv, FICHIER_HISTORIQUE)
         except Exception as e:
             logger.warning("Erreur sauvegarde statut historique: %s", e)
+            try:
+                if os.path.exists(tmp_csv):
+                    os.remove(tmp_csv)
+            except Exception:
+                pass
             return None
 
         return _calculer_bilan(lignes)
@@ -1599,16 +1722,44 @@ def executer_analyse():
                             elif _memes_equipes(cible, eq_a):
                                 cote_trouvee, nb_books = pack["away"]
                         break
-            if cote_trouvee and nb_books > 0:
+
+            est_cote_reelle = bool(cote_trouvee and nb_books > 0)
+            if est_cote_reelle:
                 it["cote"] = cote_trouvee
                 it["cote_source"] = f"Moy. {nb_books} bookmakers"
             else:
                 it["cote"] = _calculer_cote(it["proba"])
                 it["cote_source"] = "Estimée"
 
+            est_nul = bool(it.get("est_nul")) or str(it.get("choix") or "").strip().lower() == "match nul"
+            cote_min, mise_u, est_value_bet, ecart_value_pct = _calculer_cote_min_et_mise(
+                it.get("proba", 50.0),
+                it.get("confiance_score", it.get("proba", 50.0)),
+                bool(it.get("fiable", True)),
+                est_nul=est_nul,
+                cote_reelle=it.get("cote"),
+                est_cote_reelle=est_cote_reelle,
+            )
+            it["cote_min"] = cote_min
+            it["mise_u"] = mise_u
+            it["est_value_bet"] = est_value_bet
+            it["ecart_value_pct"] = ecart_value_pct
+
         for it in tennis_res:
             it["cote"] = _calculer_cote(it["proba"])
             it["cote_source"] = "Estimée"
+            cote_min, mise_u, est_value_bet, ecart_value_pct = _calculer_cote_min_et_mise(
+                it.get("proba", 50.0),
+                it.get("confiance_score", it.get("proba", 50.0)),
+                bool(it.get("fiable", True)),
+                est_nul=False,
+                cote_reelle=it.get("cote"),
+                est_cote_reelle=False,
+            )
+            it["cote_min"] = cote_min
+            it["mise_u"] = mise_u
+            it["est_value_bet"] = est_value_bet
+            it["ecart_value_pct"] = ecart_value_pct
 
         tous_items = sorted(foot_res + tennis_res, key=_cle_cle_chronologique)
 
@@ -1629,7 +1780,11 @@ def executer_analyse():
 
         top_candidats = sorted(
             foot_sorted + tennis_sorted,
-            key=lambda x: (x.get("confiance_score", x["proba"]), x["proba"]),
+            key=lambda x: (
+                1 if x.get("est_value_bet") else 0,
+                x.get("confiance_score", x["proba"]),
+                x["proba"],
+            ),
             reverse=True,
         )[:10]
         top_sur = sorted(top_candidats, key=_cle_cle_chronologique)
@@ -1651,7 +1806,9 @@ def executer_analyse():
 
         synthese = "\n".join(
             f"• [{x['sport']} | Confiance {x.get('confiance', 'MOYENNE')} | "
-            f"Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')})] "
+            f"Cote {x.get('cote', '-')} ({x.get('cote_source', 'Estimée')}) / Min {x.get('cote_min', '-')}"
+            f"{' | VALUE +' + str(x.get('ecart_value_pct')) + '%' if x.get('est_value_bet') else ''} | "
+            f"Mise {x.get('mise_u', 0)}u] "
             f"{x['match']} ({x['date_match']}) -> {x['choix']} ({x['proba']}%)"
             for x in top_sur[:8]
         ) or f"Aucun match à venir dans les prochaines {CFG.fenetre_heures}h."
@@ -2043,6 +2200,7 @@ _HTML_PAGE = """<!doctype html>
     .badge { font-size: 0.73em; padding: 3px 7px; border-radius: 999px; font-weight: 800; white-space: nowrap; }
     .badge.proba { background: rgba(56, 189, 248, 0.16); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35); }
     .badge.cote { background: rgba(148, 163, 184, 0.18); color: #e2e8f0; border: 1px solid rgba(148, 163, 184, 0.32); }
+    .badge.value { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.45); }
     .badge.live { background: rgba(239, 68, 68, 0.18); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.45); display: inline-flex; align-items: center; gap: 5px; }
     .badge.HAUTE { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }
     .badge.MOYENNE { background: rgba(245, 158, 11, 0.2); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.4); }
@@ -2140,11 +2298,12 @@ _HTML_PAGE = """<!doctype html>
       {% for it in r.en_cours_matchs %}
       {% set conf = it.get('confiance', 'MOYENNE') %}
       {% set conf_sc = it.get('confiance_score', it.proba) %}
+      {% set ts_m = it.get('ts_match', 9999999999.0) %}
       <div class="card live-card {{ conf }}"
            data-conf="{{ conf }}"
            data-proba="{{ it.pronostic_proba or it.proba }}"
            data-conf-score="{{ conf_sc }}"
-           data-date="{{ it.date_match }}"
+           data-ts="{{ ts_m }}"
            data-search="{{ ((it.pronostic_predi or it.choix) ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.score_actuel or ''))|lower }}">
         <div class="card-top">
           <div class="card-title">
@@ -2184,19 +2343,23 @@ _HTML_PAGE = """<!doctype html>
       {% set conf = it.get('confiance', 'MOYENNE') %}
       {% set conf_sc = it.get('confiance_score', it.proba) %}
       {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
+      {% set ts_m = it.get('ts_match', 9999999999.0) %}
       <div class="card {{ conf }}"
            data-conf="{{ conf }}"
            data-proba="{{ it.proba }}"
            data-conf-score="{{ conf_sc }}"
-           data-date="{{ it.date_match }}"
+           data-ts="{{ ts_m }}"
            data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
         <div class="card-top">
           <div class="card-title">
             {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.choix }}
           </div>
           <div class="badges-right">
+            {% if it.get('est_value_bet') %}
+            <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
+            {% endif %}
             {% if it.get('cote') %}
-            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
+            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
             {% endif %}
             <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
             {% if it.get('est_imminent') %}
@@ -2206,7 +2369,7 @@ _HTML_PAGE = """<!doctype html>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} — {{ it.competition }}
+          {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
           {% if it.get('score_exact') %}
           <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
           {% endif %}
@@ -2237,17 +2400,21 @@ _HTML_PAGE = """<!doctype html>
       {% set conf = it.get('confiance', 'MOYENNE') %}
       {% set conf_sc = it.get('confiance_score', it.proba) %}
       {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
+      {% set ts_m = it.get('ts_match', 9999999999.0) %}
       <div class="card {{ conf }}"
            data-conf="{{ conf }}"
            data-proba="{{ it.proba }}"
            data-conf-score="{{ conf_sc }}"
-           data-date="{{ it.date_match }}"
+           data-ts="{{ ts_m }}"
            data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
         <div class="card-top">
           <div class="card-title">⚽ {{ it.choix }}</div>
           <div class="badges-right">
+            {% if it.get('est_value_bet') %}
+            <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
+            {% endif %}
             {% if it.get('cote') %}
-            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
+            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
             {% endif %}
             <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
             {% if it.get('est_imminent') %}
@@ -2257,7 +2424,7 @@ _HTML_PAGE = """<!doctype html>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }}
+          {{ it.date_match }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
           {% if it.get('score_exact') %}
           <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
           {% endif %}
@@ -2281,17 +2448,21 @@ _HTML_PAGE = """<!doctype html>
       {% set conf = it.get('confiance', 'MOYENNE') %}
       {% set conf_sc = it.get('confiance_score', it.proba) %}
       {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
+      {% set ts_m = it.get('ts_match', 9999999999.0) %}
       <div class="card {{ conf }}"
            data-conf="{{ conf }}"
            data-proba="{{ it.proba }}"
            data-conf-score="{{ conf_sc }}"
-           data-date="{{ it.date_match }}"
+           data-ts="{{ ts_m }}"
            data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
         <div class="card-top">
           <div class="card-title">🎾 {{ it.choix }}</div>
           <div class="badges-right">
+            {% if it.get('est_value_bet') %}
+            <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
+            {% endif %}
             {% if it.get('cote') %}
-            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
+            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
             {% endif %}
             <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
             {% if it.get('est_imminent') %}
@@ -2301,7 +2472,7 @@ _HTML_PAGE = """<!doctype html>
         </div>
         <div class="card-meta">
           <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} — {{ it.competition }}
+          {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
         </div>
         <div class="conf-meter">
           <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
@@ -2385,7 +2556,11 @@ _HTML_PAGE = """<!doctype html>
           if (mode === "conf") {
             return (parseFloat(b.dataset.confScore) || 0) - (parseFloat(a.dataset.confScore) || 0);
           }
-          return (a.dataset.date || "").localeCompare(b.dataset.date || "");
+          const tsA = parseFloat(a.dataset.ts);
+          const tsB = parseFloat(b.dataset.ts);
+          const numA = Number.isFinite(tsA) ? tsA : Number.MAX_SAFE_INTEGER;
+          const numB = Number.isFinite(tsB) ? tsB : Number.MAX_SAFE_INTEGER;
+          return numA - numB;
         });
         cards.forEach(c => grid.appendChild(c));
       });
@@ -2556,6 +2731,7 @@ def app_view():
     return resp
 
 
+_nettoyer_fichiers_tmp_orphelins()
 _charger_rapport_disque()
 _demarrer_scheduler_si_actif()
 
