@@ -70,7 +70,6 @@ MOTS_BRUIT_RSS = (
     "pronostic", "pronostics", "cote", "cotes", "direct live", "résumé",
 )
 
-# Coefficients calibrés par compétition (moyenne de buts attendue + avantage domicile/extérieur)
 COEFFS_COMP_FOOT = {
     "Ligue 1": {"base_buts": 1.28, "mult_home": 1.12, "mult_away": 0.90},
     "Liga Espagnole": {"base_buts": 1.26, "mult_home": 1.13, "mult_away": 0.89},
@@ -157,8 +156,8 @@ class _CacheBorne:
             self._data.clear()
 
 
-def _resoudre_chemin_historique():
-    env_path = os.getenv("FICHIER_HISTORIQUE", "").strip()
+def _resoudre_chemin_persistant(env_var, nom_fichier_defaut):
+    env_path = os.getenv(env_var, "").strip()
     if env_path:
         return env_path
     dossier_script = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
@@ -168,19 +167,19 @@ def _resoudre_chemin_historique():
         with open(test_file, "w", encoding="utf-8") as f:
             f.write("ok")
         os.remove(test_file)
-        return os.path.join(dossier_script, "historique_paris.csv")
+        return os.path.join(dossier_script, nom_fichier_defaut)
     except Exception:
-        return "/tmp/historique_paris.csv"
+        return os.path.join("/tmp", nom_fichier_defaut)
 
 
-FICHIER_HISTORIQUE = _resoudre_chemin_historique()
+FICHIER_HISTORIQUE = _resoudre_chemin_persistant("FICHIER_HISTORIQUE", "historique_paris.csv")
+FICHIER_FAVORIS = _resoudre_chemin_persistant("FICHIER_FAVORIS", "favoris_matchs.json")
 FICHIER_RAPPORT = os.getenv("FICHIER_RAPPORT", "/tmp/rapport.json").strip() or "/tmp/rapport.json"
 
 
 def _nettoyer_fichiers_tmp_orphelins():
-    """Supprime les fichiers .tmp orphelins associés aux fichiers persistants du bot."""
     cibles = []
-    for chemin in (FICHIER_RAPPORT, FICHIER_HISTORIQUE):
+    for chemin in (FICHIER_RAPPORT, FICHIER_HISTORIQUE, FICHIER_FAVORIS):
         if chemin:
             dossier = os.path.dirname(os.path.abspath(chemin))
             base = os.path.basename(chemin)
@@ -188,6 +187,7 @@ def _nettoyer_fichiers_tmp_orphelins():
 
     cibles.append(("/tmp", "rapport.json.tmp"))
     cibles.append(("/tmp", "historique_paris.csv.tmp"))
+    cibles.append(("/tmp", "favoris_matchs.json.tmp"))
 
     vus = set()
     supprimes = 0
@@ -231,8 +231,11 @@ _CACHE_SANTE = _CacheBorne(max_taille=400)
 _CACHE_COTES_MARCHE = _CacheBorne(max_taille=64)
 _STATE_LOCK = threading.Lock()
 _CSV_LOCK = threading.Lock()
+_FAV_LOCK = threading.Lock()
 _ANALYSE_EN_COURS = False
 _SCHEDULER_DEMARRE = False
+
+_FAVORIS_ACTIFS = {}
 
 _DERNIER_RAPPORT = {
     "mis_a_jour": None,
@@ -242,10 +245,134 @@ _DERNIER_RAPPORT = {
     "top_sur": [],
     "foot": [],
     "tennis": [],
+    "favoris_suivis": [],
     "alertes": {},
     "bilan": {},
     "synthese": "",
 }
+
+
+def _normaliser_nom_equipe(nom):
+    s = unicodedata.normalize("NFKD", str(nom or "")).encode("ascii", "ignore").decode("ascii").lower()
+    s = re.sub(r"\b(fc|sc|ac|as|rc|rcd|cf|ud|cd|afc|ssc|sl|sd)\b", " ", s)
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    return " ".join(s.split())
+
+
+def _memes_equipes(nom_a, nom_b):
+    na = _normaliser_nom_equipe(nom_a)
+    nb = _normaliser_nom_equipe(nom_b)
+    if not na or not nb:
+        return False
+    return na == nb or (len(na) >= 4 and (na in nb or nb in na))
+
+
+def _construire_cle_favori(sport, event_id="", match="", date_match=""):
+    sp = str(sport or "").strip().upper() or "SPORT"
+    eid = str(event_id or "").strip()
+    if eid:
+        return f"{sp}:{eid}"
+    m_norm = re.sub(r"\s+", " ", _normaliser_nom_equipe(match))
+    d_norm = str(date_match or "").strip()[:16]
+    return f"{sp}:{m_norm}:{d_norm}"
+
+
+def _charger_favoris_disque():
+    global _FAVORIS_ACTIFS
+    with _FAV_LOCK:
+        if not os.path.exists(FICHIER_FAVORIS):
+            _FAVORIS_ACTIFS = {}
+            return
+        try:
+            with open(FICHIER_FAVORIS, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _FAVORIS_ACTIFS = {str(k): v for k, v in data.items() if isinstance(v, dict)}
+        except Exception as e:
+            logger.warning("Impossible de charger les favoris disque : %s", e)
+            _FAVORIS_ACTIFS = {}
+
+
+def _sauvegarder_favoris_disque_locked():
+    tmp_path = f"{FICHIER_FAVORIS}.tmp"
+    try:
+        parent = os.path.dirname(FICHIER_FAVORIS)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(_FAVORIS_ACTIFS, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, FICHIER_FAVORIS)
+    except Exception as e:
+        logger.warning("Impossible de sauvegarder les favoris disque : %s", e)
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+
+def _obtenir_cles_favoris():
+    with _FAV_LOCK:
+        return set(_FAVORIS_ACTIFS.keys())
+
+
+def _est_favori_item(item, cles_fav=None):
+    cles = cles_fav if cles_fav is not None else _obtenir_cles_favoris()
+    if not cles:
+        return False
+    cle = item.get("cle_favori") or _construire_cle_favori(
+        item.get("sport"),
+        item.get("event_id"),
+        item.get("match"),
+        item.get("date_match"),
+    )
+    return cle in cles
+
+
+def basculer_favori(item_data, force_etat=None):
+    """Ajoute ou retire un match des favoris. Retourne (est_favori, liste_cles)."""
+    cle = str(item_data.get("cle_favori") or "").strip() or _construire_cle_favori(
+        item_data.get("sport"),
+        item_data.get("event_id"),
+        item_data.get("match"),
+        item_data.get("date_match"),
+    )
+
+    with _FAV_LOCK:
+        deja_present = cle in _FAVORIS_ACTIFS
+        if force_etat is True:
+            ajouter = True
+        elif force_etat is False:
+            ajouter = False
+        else:
+            ajouter = not deja_present
+
+        if ajouter:
+            existant = _FAVORIS_ACTIFS.get(cle, {})
+            _FAVORIS_ACTIFS[cle] = {
+                "cle_favori": cle,
+                "sport": str(item_data.get("sport") or existant.get("sport") or "FOOT").upper(),
+                "event_id": str(item_data.get("event_id") or existant.get("event_id") or ""),
+                "match": str(item_data.get("match") or existant.get("match") or ""),
+                "competition": str(item_data.get("competition") or existant.get("competition") or ""),
+                "date_match": str(item_data.get("date_match") or existant.get("date_match") or ""),
+                "ts_match": float(item_data.get("ts_match") or existant.get("ts_match") or 9_999_999_999.0),
+                "choix": str(item_data.get("choix") or existant.get("choix") or ""),
+                "proba": item_data.get("proba", existant.get("proba")),
+                "cote": item_data.get("cote", existant.get("cote")),
+                "mise_u": item_data.get("mise_u", existant.get("mise_u")),
+                "confiance": item_data.get("confiance", existant.get("confiance")),
+                "confiance_score": item_data.get("confiance_score", existant.get("confiance_score")),
+                "detail": str(item_data.get("detail") or existant.get("detail") or ""),
+                "ajoute_le": existant.get("ajoute_le") or datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M"),
+            }
+        else:
+            _FAVORIS_ACTIFS.pop(cle, None)
+
+        _sauvegarder_favoris_disque_locked()
+        cles_actuelles = list(_FAVORIS_ACTIFS.keys())
+
+    return ajouter, cles_actuelles
 
 
 def _charger_rapport_disque():
@@ -256,6 +383,7 @@ def _charger_rapport_disque():
                 data = json.load(f)
                 if isinstance(data, dict) and data.get("mis_a_jour"):
                     data.setdefault("en_cours_matchs", [])
+                    data.setdefault("favoris_suivis", [])
                     with _STATE_LOCK:
                         _DERNIER_RAPPORT = data
     except Exception as e:
@@ -367,7 +495,6 @@ def _parse_date_utc(date_str):
 
 
 def _parse_pubdate_utc(pubdate_str):
-    """Parse une date RSS RFC-2822 (<pubDate>) ou ISO en UTC."""
     if not pubdate_str:
         return None
     s = str(pubdate_str).strip()
@@ -633,21 +760,6 @@ def _calculer_cote_min_et_mise(proba_pct, conf_score, fiable, est_nul=False, cot
             2,
         )
     return cote_min, mise, est_value_bet, ecart_value_pct
-
-
-def _normaliser_nom_equipe(nom):
-    s = unicodedata.normalize("NFKD", str(nom or "")).encode("ascii", "ignore").decode("ascii").lower()
-    s = re.sub(r"\b(fc|sc|ac|as|rc|rcd|cf|ud|cd|afc|ssc|sl|sd)\b", " ", s)
-    s = re.sub(r"[^a-z0-9\s]", " ", s)
-    return " ".join(s.split())
-
-
-def _memes_equipes(nom_a, nom_b):
-    na = _normaliser_nom_equipe(nom_a)
-    nb = _normaliser_nom_equipe(nom_b)
-    if not na or not nb:
-        return False
-    return na == nb or (len(na) >= 4 and (na in nb or nb in na))
 
 
 def charger_cotes_moyennes_foot(competitions):
@@ -972,9 +1084,11 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     ev_id = str(ev.get("id") or "")
     start_str = str(ev.get("start_time") or ev.get("date") or "")
     ts_match = _timestamp_match(start_str)
+    date_loc = _formater_date_locale(start_str)
     h_info, a_info = _normaliser_home_away(ev)
     h_nom = h_info.get("short_name") or h_info.get("name") or "Home"
     a_nom = a_info.get("short_name") or a_info.get("name") or "Away"
+    match_lbl = f"{h_nom} vs {a_nom}"
 
     st_h = stats_foot_detail(h_info.get("id", ""), h_nom, events_comp, CFG.n_derniers_matchs)
     st_a = stats_foot_detail(a_info.get("id", ""), a_nom, events_comp, CFG.n_derniers_matchs)
@@ -1031,14 +1145,16 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         proba_pct, conf_score, fiable, est_nul=est_nul, cote_reelle=cote_estimee, est_cote_reelle=False
     )
     nul_note = " | Nul probable" if est_nul else ""
+    cle_fav = _construire_cle_favori("FOOT", ev_id, match_lbl, date_loc)
 
     return {
         "sport": "FOOT",
         "competition": label_comp,
         "fiable": fiable,
         "event_id": ev_id,
-        "match": f"{h_nom} vs {a_nom}",
-        "date_match": _formater_date_locale(start_str),
+        "cle_favori": cle_fav,
+        "match": match_lbl,
+        "date_match": date_loc,
         "ts_match": ts_match,
         "detail": (
             f"[{label_comp} | λ {lam_h:.2f}-{lam_a:.2f}] {h_nom} [{st_h['forme']}] vs {a_nom} [{st_a['forme']}] "
@@ -1160,6 +1276,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
         for ev in en_cours_evs:
             entree = _construire_entree_foot(ev, label_comp, events_comp)
             entree["en_cours"] = True
+            entree["etat_match"] = "EN_COURS"
             entree["score_actuel"] = _formater_score_live(ev, "FOOT")
             entree["chrono_live"] = _formater_chrono_live(ev)
             live_comp.append(entree)
@@ -1167,15 +1284,26 @@ def analyser_foot_competitions(competitions, heures_max=48):
         clos_comp = {}
         for ev in events_comp:
             if str(ev.get("status") or "").strip().lower() in STATUTS_TERMINES and not _est_match_en_cours(ev):
+                ev_enrichi = dict(ev)
+                ev_enrichi["_sport"] = "FOOT"
+                ev_enrichi["_competition"] = label_comp
                 eid = str(ev.get("id") or "").strip()
+                cle_ev = _construire_cle_favori(
+                    "FOOT",
+                    eid,
+                    f"{_normaliser_home_away(ev)[0].get('short_name') or _normaliser_home_away(ev)[0].get('name') or 'Home'} vs {_normaliser_home_away(ev)[1].get('short_name') or _normaliser_home_away(ev)[1].get('name') or 'Away'}",
+                    _formater_date_locale(ev.get("start_time") or ev.get("date")),
+                )
+                clos_comp[cle_ev] = ev_enrichi
                 if eid:
-                    clos_comp[eid] = ev
+                    clos_comp[eid] = ev_enrichi
 
         res_comp = []
         apercu_comp = []
 
         for ev in a_venir_48h:
             entree = _construire_entree_foot(ev, label_comp, events_comp)
+            entree["etat_match"] = "A_VENIR"
             res_comp.append(entree)
 
             if len(apercu_comp) < 2:
@@ -1226,7 +1354,6 @@ def _selectionner_classement_tennis(tournoi_nom, draw_nom, atp_rk, wta_rk):
 
 
 def _detecter_surface_tennis(tournoi_nom, draw_nom, match_obj=None):
-    """Détecte la surface du tournoi ('clay', 'grass', 'indoor', 'hard') et retourne (label, facteur_log)."""
     parties = [str(tournoi_nom or ""), str(draw_nom or "")]
     if isinstance(match_obj, dict):
         for champ in ("surface", "court", "venue_surface"):
@@ -1247,7 +1374,6 @@ def _detecter_surface_tennis(tournoi_nom, draw_nom, match_obj=None):
 
 
 def _collecter_resultats_tennis(sb_data):
-    """Extrait les résultats récents terminés depuis le scoreboard tennis pour estimer la forme récente."""
     historique_joueurs = {}
     for t in sb_data.get("tournaments", []):
         for d in t.get("draws", []):
@@ -1290,7 +1416,6 @@ def _collecter_resultats_tennis(sb_data):
 
 
 def _ratio_forme_tennis(nom_joueur, hist_map, max_matchs=6):
-    """Retourne un ratio de forme récent autour de 0.5 (None si insuffisant)."""
     if not nom_joueur or not hist_map:
         return None
     cle = " ".join(nom_joueur.lower().strip().split())
@@ -1340,20 +1465,33 @@ def analyser_tennis(heures_max=48):
             for m in d.get("matches", []):
                 mid = str(m.get("id") or "").strip()
                 statut = str(m.get("status") or "").strip().lower()
-                if statut in STATUTS_TERMINES and mid:
-                    termines_tennis[mid] = m
+                date_raw = str(m.get("date") or m.get("start_time") or "")
+                date_loc = _formater_date_locale(date_raw)
+
+                comps = m.get("competitors", [])
+                j1 = comps[0].get("name", "") if len(comps) >= 1 else ""
+                j2 = comps[1].get("name", "") if len(comps) >= 2 else ""
+                r1 = trouver_rang(j1, rk_map) if j1 else None
+                r2 = trouver_rang(j2, rk_map) if j2 else None
+                match_lbl = f"{j1} (#{r1 or 'NC'}) vs {j2} (#{r2 or 'NC'})" if (j1 and j2) else str(m.get("name") or "Match Tennis")
+
+                if statut in STATUTS_TERMINES:
+                    m_enrichi = dict(m)
+                    m_enrichi["_sport"] = "TENNIS"
+                    m_enrichi["_competition"] = t_name or "Tennis"
+                    m_enrichi["_match_label"] = match_lbl
+                    m_enrichi["_date_match"] = date_loc
+                    cle_fav = _construire_cle_favori("TENNIS", mid, match_lbl, date_loc)
+                    termines_tennis[cle_fav] = m_enrichi
+                    if mid:
+                        termines_tennis[mid] = m_enrichi
 
                 est_live = _est_match_en_cours(m)
                 if not est_live and not _est_match_a_venir_dans_fenetre(m, heures_max):
                     continue
 
-                comps = m.get("competitors", [])
-                if len(comps) != 2:
+                if len(comps) != 2 or "TBD" in (j1, j2):
                     continue
-                j1, j2 = comps[0].get("name", ""), comps[1].get("name", "")
-                if "TBD" in (j1, j2):
-                    continue
-                r1, r2 = trouver_rang(j1, rk_map), trouver_rang(j2, rk_map)
                 complet = r1 is not None and r2 is not None
 
                 surface_lbl, mult_surface = _detecter_surface_tennis(t_name, d.get("name", ""), m)
@@ -1376,7 +1514,6 @@ def analyser_tennis(heures_max=48):
 
                 proba_pct = round(max(0.05, prob) * 100, 1)
 
-                date_raw = str(m.get("date") or m.get("start_time") or "")
                 ts_match = _timestamp_match(date_raw)
                 dt_match = _parse_date_utc(date_raw)
                 est_imminent = False
@@ -1393,14 +1530,17 @@ def analyser_tennis(heures_max=48):
 
                 f1_str = f" ({round(forme1 * 100)}%)" if forme1 is not None else ""
                 f2_str = f" ({round(forme2 * 100)}%)" if forme2 is not None else ""
+                match_affiche = f"{j1} (#{r1 or 'NC'}{f1_str}) vs {j2} (#{r2 or 'NC'}{f2_str})"
+                cle_fav = _construire_cle_favori("TENNIS", mid, match_affiche, date_loc)
 
                 entree = {
                     "sport": "TENNIS",
                     "competition": t_name or "Tennis",
                     "fiable": complet,
                     "event_id": mid,
-                    "match": f"{j1} (#{r1 or 'NC'}{f1_str}) vs {j2} (#{r2 or 'NC'}{f2_str})",
-                    "date_match": _formater_date_locale(date_raw),
+                    "cle_favori": cle_fav,
+                    "match": match_affiche,
+                    "date_match": date_loc,
                     "ts_match": ts_match,
                     "detail": f"{t_name} • Surface : {surface_lbl}",
                     "choix": f"Victoire {favori}",
@@ -1422,10 +1562,12 @@ def analyser_tennis(heures_max=48):
                 }
                 if est_live:
                     entree["en_cours"] = True
+                    entree["etat_match"] = "EN_COURS"
                     entree["score_actuel"] = _formater_score_live(m, "TENNIS")
                     entree["chrono_live"] = _formater_chrono_live(m)
                     live_tennis.append(entree)
                 else:
+                    entree["etat_match"] = "A_VENIR"
                     simples.append(entree)
 
     return simples, live_tennis, alertes_tennis, termines_tennis
@@ -1496,6 +1638,134 @@ def _enrichir_matchs_live_avec_pronostics(live_items, candidats_precalcul):
         enrichis.append(copie)
 
     return enrichis
+
+
+def _construire_favoris_suivis(tous_items_a_venir, live_enrichis, clos_globaux, ancien_rapport=None):
+    """Construit la liste des matchs favoris (à venir, en cours et terminés). Si un favori est décoché, il disparaît."""
+    with _FAV_LOCK:
+        fav_map = {k: dict(v) for k, v in _FAVORIS_ACTIFS.items()}
+
+    if not fav_map:
+        return []
+
+    index_actifs = {}
+    for it in (tous_items_a_venir or []) + (live_enrichis or []):
+        cle = str(it.get("cle_favori") or "").strip() or _construire_cle_favori(
+            it.get("sport"), it.get("event_id"), it.get("match"), it.get("date_match")
+        )
+        index_actifs[cle] = it
+
+    anciens_suivis_map = {}
+    for prev in (ancien_rapport or {}).get("favoris_suivis") or []:
+        cle_p = str(prev.get("cle_favori") or "").strip() or _construire_cle_favori(
+            prev.get("sport"), prev.get("event_id"), prev.get("match"), prev.get("date_match")
+        )
+        anciens_suivis_map[cle_p] = dict(prev)
+
+    suivis = []
+    for cle, meta in fav_map.items():
+        if cle in index_actifs:
+            courant = dict(index_actifs[cle])
+            courant["cle_favori"] = cle
+            courant["est_favori"] = True
+            courant.setdefault("etat_match", "EN_COURS" if courant.get("en_cours") else "A_VENIR")
+            suivis.append(courant)
+            continue
+
+        ev_clos = clos_globaux.get(cle) or clos_globaux.get(str(meta.get("event_id") or "").strip())
+        if ev_clos:
+            sport_u = str(ev_clos.get("_sport") or meta.get("sport") or "FOOT").upper()
+            scores = _extraire_scores_evenement(ev_clos)
+            h_info, a_info = _normaliser_home_away(ev_clos)
+            h_nom = h_info.get("short_name") or h_info.get("name") or ""
+            a_nom = a_info.get("short_name") or a_info.get("name") or ""
+
+            if len(scores) >= 2:
+                s0 = scores[0]["score"] if scores[0]["score"] is not None else 0
+                s1 = scores[1]["score"] if scores[1]["score"] is not None else 0
+                if sport_u == "FOOT":
+                    score_final = f"{s0} - {s1}"
+                else:
+                    n0 = scores[0]["name"] or h_nom or "Joueur 1"
+                    n1 = scores[1]["name"] or a_nom or "Joueur 2"
+                    score_final = f"{n0} {s0} - {s1} {n1}"
+            else:
+                score_final = "Terminé"
+
+            match_nom = meta.get("match") or (f"{h_nom} vs {a_nom}" if h_nom and a_nom else str(ev_clos.get("_match_label") or "Match terminé"))
+            date_m = meta.get("date_match") or _formater_date_locale(ev_clos.get("start_time") or ev_clos.get("date"))
+            ts_m = float(meta.get("ts_match") or _timestamp_match(ev_clos.get("start_time") or ev_clos.get("date")))
+
+            ligne_eval = {
+                "sport": sport_u,
+                "choix": meta.get("choix") or "",
+            }
+            statut_prono = _resoudre_statut_depuis_evenement(ligne_eval, ev_clos) or "TERMINE"
+
+            suivis.append({
+                "cle_favori": cle,
+                "est_favori": True,
+                "sport": sport_u,
+                "event_id": str(meta.get("event_id") or ev_clos.get("id") or ""),
+                "competition": ev_clos.get("_competition") or meta.get("competition") or sport_u,
+                "match": match_nom,
+                "date_match": date_m,
+                "ts_match": ts_m,
+                "choix": meta.get("choix") or "Non défini",
+                "proba": meta.get("proba"),
+                "cote": meta.get("cote"),
+                "mise_u": meta.get("mise_u"),
+                "confiance": meta.get("confiance") or "MOYENNE",
+                "confiance_score": meta.get("confiance_score") or 50.0,
+                "etat_match": "TERMINE",
+                "en_cours": False,
+                "score_final": score_final,
+                "statut_prono": statut_prono,
+                "detail": meta.get("detail") or f"Match terminé ({sport_u})",
+            })
+            continue
+
+        # Repli si déjà suivi précédemment et pas encore re-vu dans les flux actuels
+        if cle in anciens_suivis_map:
+            prev_item = dict(anciens_suivis_map[cle])
+            prev_item["cle_favori"] = cle
+            prev_item["est_favori"] = True
+            suivis.append(prev_item)
+        else:
+            fallback_item = dict(meta)
+            fallback_item["cle_favori"] = cle
+            fallback_item["est_favori"] = True
+            fallback_item.setdefault("etat_match", "A_VENIR")
+            fallback_item.setdefault("ts_match", 9_999_999_999.0)
+            fallback_item.setdefault("confiance", "MOYENNE")
+            fallback_item.setdefault("confiance_score", 50.0)
+            suivis.append(fallback_item)
+
+    suivis.sort(key=_cle_cle_chronologique)
+    return suivis
+
+
+def _annoter_favoris_dans_rapport(rapport):
+    cles_fav = _obtenir_cles_favoris()
+    r = dict(rapport)
+    for liste_key in ("top_sur", "foot", "tennis", "en_cours_matchs"):
+        nouvelle_liste = []
+        for it in r.get(liste_key) or []:
+            copie = dict(it)
+            cle = str(copie.get("cle_favori") or "").strip() or _construire_cle_favori(
+                copie.get("sport"), copie.get("event_id"), copie.get("match"), copie.get("date_match")
+            )
+            copie["cle_favori"] = cle
+            copie["est_favori"] = cle in cles_fav
+            nouvelle_liste.append(copie)
+        r[liste_key] = nouvelle_liste
+
+    r["favoris_suivis"] = [
+        dict(it, est_favori=True)
+        for it in (r.get("favoris_suivis") or [])
+        if (it.get("cle_favori") or _construire_cle_favori(it.get("sport"), it.get("event_id"), it.get("match"), it.get("date_match"))) in cles_fav
+    ]
+    return r
 
 
 def _cible_concernee_par_choix(it, cible):
@@ -1718,7 +1988,9 @@ def mettre_a_jour_historique(items, evenements_termines=None):
 
         for r in lignes:
             if r.get("statut") == "EN_ATTENTE":
-                ev_clos = clos_map.get(str(r.get("event_id") or "").strip())
+                eid = str(r.get("event_id") or "").strip()
+                cle_fav = _construire_cle_favori(r.get("sport"), eid, r.get("match"), r.get("date_match"))
+                ev_clos = clos_map.get(cle_fav) or clos_map.get(eid)
                 nouveau_statut = _resoudre_statut_depuis_evenement(r, ev_clos)
                 if nouveau_statut in ("GAGNE", "PERDU"):
                     r["statut"] = nouveau_statut
@@ -1818,6 +2090,7 @@ def executer_analyse():
         if _ANALYSE_EN_COURS:
             return _DERNIER_RAPPORT
         _ANALYSE_EN_COURS = True
+        ancien_rapport = dict(_DERNIER_RAPPORT)
 
     try:
         logger.info("Analyse en cours (fenetre: %sh)...", CFG.fenetre_heures)
@@ -1939,12 +2212,15 @@ def executer_analyse():
             )
         except Exception as e:
             logger.error("Erreur Historique: %s", e)
-            with _STATE_LOCK:
-                bilan = dict(_DERNIER_RAPPORT.get("bilan") or {})
+            bilan = dict(ancien_rapport.get("bilan") or {})
 
         live_enrichis = sorted(
             _enrichir_matchs_live_avec_pronostics(live_globaux, tous_items),
             key=_cle_cle_chronologique,
+        )
+
+        favoris_suivis = _construire_favoris_suivis(
+            tous_items, live_enrichis, clos_globaux, ancien_rapport=ancien_rapport
         )
 
         synthese = "\n".join(
@@ -1956,7 +2232,7 @@ def executer_analyse():
             for x in top_sur[:8]
         ) or f"Aucun match à venir dans les prochaines {CFG.fenetre_heures}h."
 
-        nouveau_rapport = {
+        nouveau_rapport = _annoter_favoris_dans_rapport({
             "mis_a_jour": datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M %Z"),
             "stats_comp": stats_comp,
             "apercu_bruts": apercu_bruts,
@@ -1964,10 +2240,11 @@ def executer_analyse():
             "top_sur": top_sur,
             "foot": foot_sorted,
             "tennis": tennis_sorted,
+            "favoris_suivis": favoris_suivis,
             "alertes": alertes_combines,
             "bilan": bilan,
             "synthese": synthese,
-        }
+        })
 
         with _STATE_LOCK:
             _DERNIER_RAPPORT = nouveau_rapport
@@ -2259,7 +2536,7 @@ _HTML_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BetPulse Pro — Matchs &amp; Pronostics</title>
+  <title>BetPulse Pro — {% if page_favoris %}Matchs Favoris{% else %}Matchs &amp; Pronostics{% endif %}</title>
   <style>
     :root {
       --bg: #0b1220;
@@ -2271,6 +2548,7 @@ _HTML_PAGE = """<!doctype html>
       --green: #10b981;
       --orange: #f59e0b;
       --red: #ef4444;
+      --gold: #fbbf24;
       --border: #24334d;
     }
     * { box-sizing: border-box; }
@@ -2289,6 +2567,7 @@ _HTML_PAGE = """<!doctype html>
       flex-wrap: wrap; gap: 14px; margin-bottom: 18px; padding-bottom: 16px;
       border-bottom: 1px solid var(--border);
     }
+    .header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .brand-link { display: inline-flex; align-items: center; gap: 12px; text-decoration: none; color: var(--text); }
     .brand-badge {
       width: 40px; height: 40px; border-radius: 12px;
@@ -2306,6 +2585,8 @@ _HTML_PAGE = """<!doctype html>
     select { background: #0b1220; color: var(--text); border: 1px solid var(--border); font-weight: 600; }
     .btn-cat { background: var(--card); color: var(--text); border: 1px solid var(--border); font-weight: 600; }
     .btn-cat.active { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 700; }
+    .btn-fav-page { background: rgba(251, 191, 36, 0.14); color: var(--gold); border: 1px solid rgba(251, 191, 36, 0.45); }
+    .btn-fav-page.active { background: var(--gold); color: #0b1220; border-color: var(--gold); }
     button:hover, .btn:hover { opacity: 0.92; transform: translateY(-1px); }
     button:disabled { opacity: 0.65; cursor: wait; transform: none; }
     .cat-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
@@ -2337,14 +2618,25 @@ _HTML_PAGE = """<!doctype html>
     .card.MOYENNE { border-left-color: var(--orange); }
     .card.FAIBLE { border-left-color: var(--red); }
     .card.live-card { border-left-color: var(--red); border-color: rgba(239, 68, 68, 0.35); }
+    .card.termine-card { border-left-color: #64748b; opacity: 0.94; }
     .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
     .card-title { font-size: 1.02em; font-weight: 700; line-height: 1.3; display: flex; align-items: center; gap: 6px; min-width: 0; }
     .badges-right { display: flex; align-items: center; gap: 5px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+    .star-btn {
+      background: rgba(15, 23, 42, 0.85); color: #94a3b8; border: 1px solid var(--border);
+      padding: 4px 8px; border-radius: 8px; font-size: 0.95em; line-height: 1;
+    }
+    .star-btn:hover { color: var(--gold); border-color: rgba(251, 191, 36, 0.5); }
+    .star-btn.active { background: rgba(251, 191, 36, 0.18); color: var(--gold); border-color: rgba(251, 191, 36, 0.55); }
     .badge { font-size: 0.73em; padding: 3px 7px; border-radius: 999px; font-weight: 800; white-space: nowrap; }
     .badge.proba { background: rgba(56, 189, 248, 0.16); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35); }
     .badge.cote { background: rgba(148, 163, 184, 0.18); color: #e2e8f0; border: 1px solid rgba(148, 163, 184, 0.32); }
     .badge.value { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.45); }
     .badge.live { background: rgba(239, 68, 68, 0.18); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.45); display: inline-flex; align-items: center; gap: 5px; }
+    .badge.termine { background: rgba(148, 163, 184, 0.18); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.35); }
+    .badge.a-venir { background: rgba(56, 189, 248, 0.15); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35); }
+    .badge.gagne { background: rgba(16, 185, 129, 0.22); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.45); }
+    .badge.perdu { background: rgba(239, 68, 68, 0.22); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.45); }
     .badge.HAUTE { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }
     .badge.MOYENNE { background: rgba(245, 158, 11, 0.2); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.4); }
     .badge.FAIBLE { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
@@ -2356,6 +2648,11 @@ _HTML_PAGE = """<!doctype html>
     .live-score-box {
       display: flex; justify-content: space-between; align-items: center;
       background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3);
+      border-radius: 8px; padding: 8px 11px; margin-bottom: 10px;
+    }
+    .final-score-box {
+      display: flex; justify-content: space-between; align-items: center;
+      background: rgba(148, 163, 184, 0.12); border: 1px solid rgba(148, 163, 184, 0.32);
       border-radius: 8px; padding: 8px 11px; margin-bottom: 10px;
     }
     .live-score-val { font-size: 1.08em; font-weight: 800; color: #f8fafc; }
@@ -2391,23 +2688,31 @@ _HTML_PAGE = """<!doctype html>
       <div>
         <a href="/" class="brand-link" title="Retour à l'accueil">
           <span class="brand-badge">BP</span>
-          <h1 style="margin: 0;">BetPulse Pro</h1>
+          <h1 style="margin: 0;">BetPulse Pro{% if page_favoris %} — Favoris{% endif %}</h1>
         </a><br>
         <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }} • Fenêtre : {{ fenetre_heures }}h • <span id="compteur-cartes">Filtre actif</span></span>
       </div>
-      <form method="post" action="/refresh" style="margin: 0;" onsubmit="document.getElementById('btn-refresh').disabled=true; document.getElementById('btn-refresh').innerText='Actualisation…';">
-        <button id="btn-refresh" type="submit">↻ Actualiser</button>
-      </form>
+      <div class="header-actions">
+        {% if page_favoris %}
+        <a href="{{ url_for('app_view', cat='all') }}" class="btn btn-cat">← Tous les matchs</a>
+        {% else %}
+        <a href="{{ url_for('favoris_view') }}" class="btn btn-fav-page">★ Page Favoris (<span id="fav-count-header">{{ r.favoris_suivis|length }}</span>)</a>
+        {% endif %}
+        <form method="post" action="/refresh" style="margin: 0;" onsubmit="document.getElementById('btn-refresh').disabled=true; document.getElementById('btn-refresh').innerText='Actualisation…';">
+          <button id="btn-refresh" type="submit">↻ Actualiser</button>
+        </form>
+      </div>
     </div>
 
     <div class="cat-bar">
-      <a href="{{ url_for('app_view', cat='all') }}" class="btn btn-cat {% if cat == 'all' %}active{% endif %}">Tout</a>
-      <a href="{{ url_for('app_view', cat='live') }}" class="btn btn-cat {% if cat == 'live' %}active{% endif %}">En cours ({{ r.en_cours_matchs|length }})</a>
-      <a href="{{ url_for('app_view', cat='top') }}" class="btn btn-cat {% if cat == 'top' %}active{% endif %}">Top Pronostics ({{ r.top_sur|length }})</a>
-      <a href="{{ url_for('app_view', cat='foot') }}" class="btn btn-cat {% if cat == 'foot' %}active{% endif %}">Football ({{ r.foot|length }})</a>
-      <a href="{{ url_for('app_view', cat='tennis') }}" class="btn btn-cat {% if cat == 'tennis' %}active{% endif %}">Tennis ({{ r.tennis|length }})</a>
-      <a href="{{ url_for('app_view', cat='alertes') }}" class="btn btn-cat {% if cat == 'alertes' %}active{% endif %}">Alertes ({{ r.get('alertes', {})|length }})</a>
-      <a href="{{ url_for('app_view', cat='bilan') }}" class="btn btn-cat {% if cat == 'bilan' %}active{% endif %}">Bilan &amp; Synthèse</a>
+      <a href="{{ url_for('app_view', cat='all') }}" class="btn btn-cat {% if not page_favoris and cat == 'all' %}active{% endif %}">Tout</a>
+      <a href="{{ url_for('app_view', cat='favoris') }}" class="btn btn-cat {% if page_favoris or cat == 'favoris' %}active{% endif %}">★ Favoris (<span id="fav-count-tab">{{ r.favoris_suivis|length }}</span>)</a>
+      <a href="{{ url_for('app_view', cat='live') }}" class="btn btn-cat {% if not page_favoris and cat == 'live' %}active{% endif %}">En cours ({{ r.en_cours_matchs|length }})</a>
+      <a href="{{ url_for('app_view', cat='top') }}" class="btn btn-cat {% if not page_favoris and cat == 'top' %}active{% endif %}">Top Pronostics ({{ r.top_sur|length }})</a>
+      <a href="{{ url_for('app_view', cat='foot') }}" class="btn btn-cat {% if not page_favoris and cat == 'foot' %}active{% endif %}">Football ({{ r.foot|length }})</a>
+      <a href="{{ url_for('app_view', cat='tennis') }}" class="btn btn-cat {% if not page_favoris and cat == 'tennis' %}active{% endif %}">Tennis ({{ r.tennis|length }})</a>
+      <a href="{{ url_for('app_view', cat='alertes') }}" class="btn btn-cat {% if not page_favoris and cat == 'alertes' %}active{% endif %}">Alertes ({{ r.get('alertes', {})|length }})</a>
+      <a href="{{ url_for('app_view', cat='bilan') }}" class="btn btn-cat {% if not page_favoris and cat == 'bilan' %}active{% endif %}">Bilan &amp; Synthèse</a>
     </div>
 
     <div class="toolbar">
@@ -2435,239 +2740,409 @@ _HTML_PAGE = """<!doctype html>
     <div class="notice">Mise à jour en arrière-plan en cours — les données affichées restent accessibles.</div>
     {% endif %}
 
-    {% if cat in ('all', 'live') %}
-    <h2><span class="dot-red"></span> Matchs en cours ({{ r.en_cours_matchs|length }})</h2>
-    <div class="grid">
-      {% for it in r.en_cours_matchs %}
+    {% if page_favoris or cat == 'favoris' %}
+    <h2>★ Matchs Favoris suivis ({{ r.favoris_suivis|length }})</h2>
+    <p class="meta" style="margin-top: -8px; margin-bottom: 14px;">
+      Les matchs cochés restent affichés même une fois terminés. Décocher l'étoile d'un match terminé le retire immédiatement de cette liste.
+    </p>
+    <div class="grid" id="favoris-grid">
+      {% for it in r.favoris_suivis %}
       {% set conf = it.get('confiance', 'MOYENNE') %}
-      {% set conf_sc = it.get('confiance_score', it.proba) %}
+      {% set conf_sc = it.get('confiance_score', 50.0) %}
       {% set ts_m = it.get('ts_match', 9999999999.0) %}
-      <div class="card live-card {{ conf }}"
+      {% set etat = it.get('etat_match', 'A_VENIR') %}
+      <div class="card {% if etat == 'TERMINE' %}termine-card{% elif etat == 'EN_COURS' %}live-card{% endif %} {{ conf }}"
+           data-fav-card="1"
+           data-cle-favori="{{ it.get('cle_favori', '') }}"
            data-conf="{{ conf }}"
-           data-proba="{{ it.pronostic_proba or it.proba }}"
+           data-proba="{{ it.proba or 0 }}"
            data-conf-score="{{ conf_sc }}"
            data-ts="{{ ts_m }}"
-           data-search="{{ ((it.pronostic_predi or it.choix) ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.score_actuel or ''))|lower }}">
+           data-search="{{ ((it.choix or '') ~ ' ' ~ (it.match or '') ~ ' ' ~ (it.competition or '') ~ ' ' ~ (it.score_final or '') ~ ' ' ~ (it.detail or ''))|lower }}">
         <div class="card-top">
           <div class="card-title">
             {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}
           </div>
           <div class="badges-right">
-            <span class="badge live"><span class="dot-red"></span> {{ it.chrono_live or 'LIVE' }}</span>
+            {% if etat == 'TERMINE' %}
+              <span class="badge termine">TERMINÉ</span>
+              {% if it.get('statut_prono') == 'GAGNE' %}
+                <span class="badge gagne">GAGNÉ</span>
+              {% elif it.get('statut_prono') == 'PERDU' %}
+                <span class="badge perdu">PERDU</span>
+              {% endif %}
+            {% elif etat == 'EN_COURS' %}
+              <span class="badge live"><span class="dot-red"></span> EN COURS</span>
+            {% else %}
+              <span class="badge a-venir">À VENIR</span>
+            {% endif %}
+            <button type="button"
+                    class="star-btn active"
+                    title="Retirer des favoris"
+                    onclick="toggleFavori(this)"
+                    data-cle-favori="{{ it.get('cle_favori', '') }}"
+                    data-sport="{{ it.sport or 'FOOT' }}"
+                    data-event-id="{{ it.event_id or '' }}"
+                    data-match="{{ it.match or '' }}"
+                    data-competition="{{ it.competition or '' }}"
+                    data-date-match="{{ it.date_match or '' }}"
+                    data-ts-match="{{ ts_m }}"
+                    data-choix="{{ it.choix or '' }}"
+                    data-proba="{{ it.proba if it.proba is not none else '' }}"
+                    data-cote="{{ it.cote if it.cote is not none else '' }}"
+                    data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
+                    data-confiance="{{ conf }}"
+                    data-confiance-score="{{ conf_sc }}"
+                    data-detail="{{ it.detail or '' }}">★</button>
           </div>
         </div>
         <div class="card-meta">
-          {{ it.competition }} • Début : {{ it.date_match }}
+          {{ it.competition or it.sport }} • {{ it.date_match }}
         </div>
+        {% if etat == 'TERMINE' %}
+        <div class="final-score-box">
+          <span class="meta">Score final</span>
+          <span class="live-score-val">{{ it.score_final or 'Terminé' }}</span>
+        </div>
+        {% elif etat == 'EN_COURS' %}
         <div class="live-score-box">
           <span class="meta">Score actuel</span>
           <span class="live-score-val">{{ it.score_actuel or 'En cours' }}</span>
         </div>
+        {% endif %}
         <div class="pred-box">
-          <div class="pred-label">Pronostic prédit ({{ it.pronostic_source or 'Bot' }})</div>
-          <div class="pred-choice">{{ it.pronostic_predi or it.choix }}</div>
+          <div class="pred-label">Pronostic</div>
+          <div class="pred-choice">{{ it.choix or 'Non défini' }}</div>
           <div class="pred-sub">
-            Proba : <strong>{{ it.pronostic_proba or it.proba }}%</strong>
-            {% if it.pronostic_cote or it.cote %} • Cote : <strong>{{ it.pronostic_cote or it.cote }}</strong>{% endif %}
-            • Statut : <strong>{{ it.pronostic_statut or 'EN_ATTENTE' }}</strong>
+            {% if it.proba is not none %}Proba : <strong>{{ it.proba }}%</strong>{% endif %}
+            {% if it.cote %} • Cote : <strong>{{ it.cote }}</strong>{% endif %}
+            {% if it.mise_u is not none %} • Mise : <strong>{{ it.mise_u }}u</strong>{% endif %}
           </div>
-        </div>
-      </div>
-      {% else %}
-      <div class="card">Aucun match en cours pour le moment.</div>
-      {% endfor %}
-    </div>
-    {% endif %}
-
-    {% if cat in ('all', 'top') %}
-    <h2>★ Top pronostics (Foot &amp; Tennis)</h2>
-    <div class="grid">
-      {% for it in r.top_sur %}
-      {% set conf = it.get('confiance', 'MOYENNE') %}
-      {% set conf_sc = it.get('confiance_score', it.proba) %}
-      {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
-      {% set ts_m = it.get('ts_match', 9999999999.0) %}
-      <div class="card {{ conf }}"
-           data-conf="{{ conf }}"
-           data-proba="{{ it.proba }}"
-           data-conf-score="{{ conf_sc }}"
-           data-ts="{{ ts_m }}"
-           data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
-        <div class="card-top">
-          <div class="card-title">
-            {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.choix }}
-          </div>
-          <div class="badges-right">
-            {% if it.get('est_value_bet') %}
-            <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
-            {% endif %}
-            {% if it.get('cote') %}
-            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
-            {% endif %}
-            <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
-            {% if it.get('est_imminent') %}
-            <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
-            {% endif %}
-          </div>
-        </div>
-        <div class="card-meta">
-          <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
-          {% if it.get('score_exact') %}
-          <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
-          {% endif %}
-        </div>
-        <div class="conf-meter">
-          <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
-          <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
         </div>
         {% if it.detail %}
         <div class="card-detail">{{ it.detail }}</div>
         {% endif %}
       </div>
       {% else %}
-      <div class="card">Aucun pronostic disponible.</div>
+      <div class="card" id="fav-empty-msg">Aucun match favori pour le moment. Cliquez sur ☆ sur n'importe quel match pour le suivre ici (y compris après la fin du match).</div>
       {% endfor %}
     </div>
     {% endif %}
 
-    {% if cat in ('all', 'foot') %}
-    <h2>⚽ Matchs de Foot à venir — {{ fenetre_heures }}h ({{ r.foot|length }})</h2>
-    <div class="stats-bar">
-      {% for k, v in r.get("stats_comp", {}).items() %}
-        <span class="stat-item"><strong>{{ k }}</strong> : {{ v }}</span>
-      {% endfor %}
-    </div>
-    <div class="grid">
-      {% for it in r.foot %}
-      {% set conf = it.get('confiance', 'MOYENNE') %}
-      {% set conf_sc = it.get('confiance_score', it.proba) %}
-      {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
-      {% set ts_m = it.get('ts_match', 9999999999.0) %}
-      <div class="card {{ conf }}"
-           data-conf="{{ conf }}"
-           data-proba="{{ it.proba }}"
-           data-conf-score="{{ conf_sc }}"
-           data-ts="{{ ts_m }}"
-           data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
-        <div class="card-top">
-          <div class="card-title">⚽ {{ it.choix }}</div>
-          <div class="badges-right">
-            {% if it.get('est_value_bet') %}
-            <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
-            {% endif %}
-            {% if it.get('cote') %}
-            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
-            {% endif %}
-            <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
-            {% if it.get('est_imminent') %}
-            <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
-            {% endif %}
+    {% if not page_favoris %}
+      {% if cat in ('all', 'live') %}
+      <h2><span class="dot-red"></span> Matchs en cours ({{ r.en_cours_matchs|length }})</h2>
+      <div class="grid">
+        {% for it in r.en_cours_matchs %}
+        {% set conf = it.get('confiance', 'MOYENNE') %}
+        {% set conf_sc = it.get('confiance_score', it.proba) %}
+        {% set ts_m = it.get('ts_match', 9999999999.0) %}
+        {% set is_fav = it.get('est_favori', False) %}
+        <div class="card live-card {{ conf }}"
+             data-conf="{{ conf }}"
+             data-proba="{{ it.pronostic_proba or it.proba }}"
+             data-conf-score="{{ conf_sc }}"
+             data-ts="{{ ts_m }}"
+             data-search="{{ ((it.pronostic_predi or it.choix) ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.score_actuel or ''))|lower }}">
+          <div class="card-top">
+            <div class="card-title">
+              {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}
+            </div>
+            <div class="badges-right">
+              <span class="badge live"><span class="dot-red"></span> {{ it.chrono_live or 'LIVE' }}</span>
+              <button type="button"
+                      class="star-btn {% if is_fav %}active{% endif %}"
+                      title="{% if is_fav %}Retirer des favoris{% else %}Ajouter aux favoris{% endif %}"
+                      onclick="toggleFavori(this)"
+                      data-cle-favori="{{ it.get('cle_favori', '') }}"
+                      data-sport="{{ it.sport or 'FOOT' }}"
+                      data-event-id="{{ it.event_id or '' }}"
+                      data-match="{{ it.match or '' }}"
+                      data-competition="{{ it.competition or '' }}"
+                      data-date-match="{{ it.date_match or '' }}"
+                      data-ts-match="{{ ts_m }}"
+                      data-choix="{{ it.pronostic_predi or it.choix or '' }}"
+                      data-proba="{{ it.pronostic_proba or it.proba or '' }}"
+                      data-cote="{{ it.pronostic_cote or it.cote or '' }}"
+                      data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
+                      data-confiance="{{ conf }}"
+                      data-confiance-score="{{ conf_sc }}"
+                      data-detail="{{ it.detail or '' }}">{% if is_fav %}★{% else %}☆{% endif %}</button>
+            </div>
+          </div>
+          <div class="card-meta">
+            {{ it.competition }} • Début : {{ it.date_match }}
+          </div>
+          <div class="live-score-box">
+            <span class="meta">Score actuel</span>
+            <span class="live-score-val">{{ it.score_actuel or 'En cours' }}</span>
+          </div>
+          <div class="pred-box">
+            <div class="pred-label">Pronostic prédit ({{ it.pronostic_source or 'Bot' }})</div>
+            <div class="pred-choice">{{ it.pronostic_predi or it.choix }}</div>
+            <div class="pred-sub">
+              Proba : <strong>{{ it.pronostic_proba or it.proba }}%</strong>
+              {% if it.pronostic_cote or it.cote %} • Cote : <strong>{{ it.pronostic_cote or it.cote }}</strong>{% endif %}
+              • Statut : <strong>{{ it.pronostic_statut or 'EN_ATTENTE' }}</strong>
+            </div>
           </div>
         </div>
-        <div class="card-meta">
-          <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
-          {% if it.get('score_exact') %}
-          <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
+        {% else %}
+        <div class="card">Aucun match en cours pour le moment.</div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% if cat in ('all', 'top') %}
+      <h2>★ Top pronostics (Foot &amp; Tennis)</h2>
+      <div class="grid">
+        {% for it in r.top_sur %}
+        {% set conf = it.get('confiance', 'MOYENNE') %}
+        {% set conf_sc = it.get('confiance_score', it.proba) %}
+        {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
+        {% set ts_m = it.get('ts_match', 9999999999.0) %}
+        {% set is_fav = it.get('est_favori', False) %}
+        <div class="card {{ conf }}"
+             data-conf="{{ conf }}"
+             data-proba="{{ it.proba }}"
+             data-conf-score="{{ conf_sc }}"
+             data-ts="{{ ts_m }}"
+             data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
+          <div class="card-top">
+            <div class="card-title">
+              {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.choix }}
+            </div>
+            <div class="badges-right">
+              {% if it.get('est_value_bet') %}
+              <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
+              {% endif %}
+              {% if it.get('cote') %}
+              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
+              {% endif %}
+              <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
+              {% if it.get('est_imminent') %}
+              <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
+              {% endif %}
+              <button type="button"
+                      class="star-btn {% if is_fav %}active{% endif %}"
+                      title="{% if is_fav %}Retirer des favoris{% else %}Ajouter aux favoris{% endif %}"
+                      onclick="toggleFavori(this)"
+                      data-cle-favori="{{ it.get('cle_favori', '') }}"
+                      data-sport="{{ it.sport or 'FOOT' }}"
+                      data-event-id="{{ it.event_id or '' }}"
+                      data-match="{{ it.match or '' }}"
+                      data-competition="{{ it.competition or '' }}"
+                      data-date-match="{{ it.date_match or '' }}"
+                      data-ts-match="{{ ts_m }}"
+                      data-choix="{{ it.choix or '' }}"
+                      data-proba="{{ it.proba if it.proba is not none else '' }}"
+                      data-cote="{{ it.cote if it.cote is not none else '' }}"
+                      data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
+                      data-confiance="{{ conf }}"
+                      data-confiance-score="{{ conf_sc }}"
+                      data-detail="{{ it.detail or '' }}">{% if is_fav %}★{% else %}☆{% endif %}</button>
+            </div>
+          </div>
+          <div class="card-meta">
+            <strong>{{ it.match }}</strong><br>
+            {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
+            {% if it.get('score_exact') %}
+            <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
+            {% endif %}
+          </div>
+          <div class="conf-meter">
+            <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
+            <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
+          </div>
+          {% if it.detail %}
+          <div class="card-detail">{{ it.detail }}</div>
           {% endif %}
         </div>
-        <div class="conf-meter">
-          <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
-          <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
-        </div>
-        <div class="card-detail">{{ it.detail }}</div>
+        {% else %}
+        <div class="card">Aucun pronostic disponible.</div>
+        {% endfor %}
       </div>
-      {% else %}
-      <div class="card">Aucun match de foot à venir dans cette fenêtre.</div>
-      {% endfor %}
-    </div>
-    {% endif %}
+      {% endif %}
 
-    {% if cat in ('all', 'tennis') %}
-    <h2>🎾 Matchs de Tennis à venir — {{ fenetre_heures }}h ({{ r.tennis|length }})</h2>
-    <div class="grid">
-      {% for it in r.tennis %}
-      {% set conf = it.get('confiance', 'MOYENNE') %}
-      {% set conf_sc = it.get('confiance_score', it.proba) %}
-      {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
-      {% set ts_m = it.get('ts_match', 9999999999.0) %}
-      <div class="card {{ conf }}"
-           data-conf="{{ conf }}"
-           data-proba="{{ it.proba }}"
-           data-conf-score="{{ conf_sc }}"
-           data-ts="{{ ts_m }}"
-           data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
-        <div class="card-top">
-          <div class="card-title">🎾 {{ it.choix }}</div>
-          <div class="badges-right">
-            {% if it.get('est_value_bet') %}
-            <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
-            {% endif %}
-            {% if it.get('cote') %}
-            <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
-            {% endif %}
-            <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
-            {% if it.get('est_imminent') %}
-            <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
+      {% if cat in ('all', 'foot') %}
+      <h2>⚽ Matchs de Foot à venir — {{ fenetre_heures }}h ({{ r.foot|length }})</h2>
+      <div class="stats-bar">
+        {% for k, v in r.get("stats_comp", {}).items() %}
+          <span class="stat-item"><strong>{{ k }}</strong> : {{ v }}</span>
+        {% endfor %}
+      </div>
+      <div class="grid">
+        {% for it in r.foot %}
+        {% set conf = it.get('confiance', 'MOYENNE') %}
+        {% set conf_sc = it.get('confiance_score', it.proba) %}
+        {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
+        {% set ts_m = it.get('ts_match', 9999999999.0) %}
+        {% set is_fav = it.get('est_favori', False) %}
+        <div class="card {{ conf }}"
+             data-conf="{{ conf }}"
+             data-proba="{{ it.proba }}"
+             data-conf-score="{{ conf_sc }}"
+             data-ts="{{ ts_m }}"
+             data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
+          <div class="card-top">
+            <div class="card-title">⚽ {{ it.choix }}</div>
+            <div class="badges-right">
+              {% if it.get('est_value_bet') %}
+              <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
+              {% endif %}
+              {% if it.get('cote') %}
+              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
+              {% endif %}
+              <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
+              {% if it.get('est_imminent') %}
+              <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
+              {% endif %}
+              <button type="button"
+                      class="star-btn {% if is_fav %}active{% endif %}"
+                      title="{% if is_fav %}Retirer des favoris{% else %}Ajouter aux favoris{% endif %}"
+                      onclick="toggleFavori(this)"
+                      data-cle-favori="{{ it.get('cle_favori', '') }}"
+                      data-sport="{{ it.sport or 'FOOT' }}"
+                      data-event-id="{{ it.event_id or '' }}"
+                      data-match="{{ it.match or '' }}"
+                      data-competition="{{ it.competition or '' }}"
+                      data-date-match="{{ it.date_match or '' }}"
+                      data-ts-match="{{ ts_m }}"
+                      data-choix="{{ it.choix or '' }}"
+                      data-proba="{{ it.proba if it.proba is not none else '' }}"
+                      data-cote="{{ it.cote if it.cote is not none else '' }}"
+                      data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
+                      data-confiance="{{ conf }}"
+                      data-confiance-score="{{ conf_sc }}"
+                      data-detail="{{ it.detail or '' }}">{% if is_fav %}★{% else %}☆{% endif %}</button>
+            </div>
+          </div>
+          <div class="card-meta">
+            <strong>{{ it.match }}</strong><br>
+            {{ it.date_match }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
+            {% if it.get('score_exact') %}
+            <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
             {% endif %}
           </div>
+          <div class="conf-meter">
+            <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
+            <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
+          </div>
+          <div class="card-detail">{{ it.detail }}</div>
         </div>
-        <div class="card-meta">
-          <strong>{{ it.match }}</strong><br>
-          {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
-        </div>
-        <div class="conf-meter">
-          <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
-          <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
-        </div>
-        {% if it.detail %}
-        <div class="card-detail">{{ it.detail }}</div>
-        {% endif %}
+        {% else %}
+        <div class="card">Aucun match de foot à venir dans cette fenêtre.</div>
+        {% endfor %}
       </div>
-      {% else %}
-      <div class="card">Aucun match de tennis à venir dans cette fenêtre.</div>
-      {% endfor %}
-    </div>
-    {% endif %}
+      {% endif %}
 
-    {% if cat in ('all', 'alertes') %}
-    <h2>🩺 Alertes blessures / forfaits (2j)</h2>
-    <div class="panel">
-      {% for cible, titres in r.get("alertes", {}).items() %}
-        <p style="margin-bottom: 10px;">
-          <strong style="color: #fca5a5;">{{ cible }}</strong> :<br>
-          <span style="font-size: 0.9em; color: #cbd5e1;">{{ titres | join(" | ") }}</span>
-        </p>
-      {% else %}
-        <span class="meta">Aucune alerte récente.</span>
-      {% endfor %}
-    </div>
-    {% endif %}
+      {% if cat in ('all', 'tennis') %}
+      <h2>🎾 Matchs de Tennis à venir — {{ fenetre_heures }}h ({{ r.tennis|length }})</h2>
+      <div class="grid">
+        {% for it in r.tennis %}
+        {% set conf = it.get('confiance', 'MOYENNE') %}
+        {% set conf_sc = it.get('confiance_score', it.proba) %}
+        {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
+        {% set ts_m = it.get('ts_match', 9999999999.0) %}
+        {% set is_fav = it.get('est_favori', False) %}
+        <div class="card {{ conf }}"
+             data-conf="{{ conf }}"
+             data-proba="{{ it.proba }}"
+             data-conf-score="{{ conf_sc }}"
+             data-ts="{{ ts_m }}"
+             data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
+          <div class="card-top">
+            <div class="card-title">🎾 {{ it.choix }}</div>
+            <div class="badges-right">
+              {% if it.get('est_value_bet') %}
+              <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
+              {% endif %}
+              {% if it.get('cote') %}
+              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
+              {% endif %}
+              <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
+              {% if it.get('est_imminent') %}
+              <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
+              {% endif %}
+              <button type="button"
+                      class="star-btn {% if is_fav %}active{% endif %}"
+                      title="{% if is_fav %}Retirer des favoris{% else %}Ajouter aux favoris{% endif %}"
+                      onclick="toggleFavori(this)"
+                      data-cle-favori="{{ it.get('cle_favori', '') }}"
+                      data-sport="{{ it.sport or 'TENNIS' }}"
+                      data-event-id="{{ it.event_id or '' }}"
+                      data-match="{{ it.match or '' }}"
+                      data-competition="{{ it.competition or '' }}"
+                      data-date-match="{{ it.date_match or '' }}"
+                      data-ts-match="{{ ts_m }}"
+                      data-choix="{{ it.choix or '' }}"
+                      data-proba="{{ it.proba if it.proba is not none else '' }}"
+                      data-cote="{{ it.cote if it.cote is not none else '' }}"
+                      data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
+                      data-confiance="{{ conf }}"
+                      data-confiance-score="{{ conf_sc }}"
+                      data-detail="{{ it.detail or '' }}">{% if is_fav %}★{% else %}☆{% endif %}</button>
+            </div>
+          </div>
+          <div class="card-meta">
+            <strong>{{ it.match }}</strong><br>
+            {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
+          </div>
+          <div class="conf-meter">
+            <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
+            <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
+          </div>
+          {% if it.detail %}
+          <div class="card-detail">{{ it.detail }}</div>
+          {% endif %}
+        </div>
+        {% else %}
+        <div class="card">Aucun match de tennis à venir dans cette fenêtre.</div>
+        {% endfor %}
+      </div>
+      {% endif %}
 
-    {% if cat in ('all', 'bilan') %}
-    <h2>📊 Bilan historique &amp; Synthèse</h2>
-    <div class="stats-bar">
-      <span class="stat-item">Total : <strong>{{ r.get("bilan", {}).get("total", 0) }}</strong></span>
-      <span class="stat-item">En attente : <strong>{{ r.get("bilan", {}).get("en_attente", 0) }}</strong></span>
-      <span class="stat-item">Vérifiés : <strong>{{ r.get("bilan", {}).get("verifies", 0) }}</strong></span>
-      <span class="stat-item">Réussite : <strong>{{ r.get("bilan", {}).get("taux", 0.0) }}%</strong></span>
-      <span class="stat-item">PnL : <strong>{{ r.get("bilan", {}).get("pnl_total", 0.0) }}u</strong></span>
-    </div>
-    <div class="panel">
-      <pre>{{ r.synthese or "Aucune synthèse disponible pour le moment." }}</pre>
-    </div>
+      {% if cat in ('all', 'alertes') %}
+      <h2>🩺 Alertes blessures / forfaits (2j)</h2>
+      <div class="panel">
+        {% for cible, titres in r.get("alertes", {}).items() %}
+          <p style="margin-bottom: 10px;">
+            <strong style="color: #fca5a5;">{{ cible }}</strong> :<br>
+            <span style="font-size: 0.9em; color: #cbd5e1;">{{ titres | join(" | ") }}</span>
+          </p>
+        {% else %}
+          <span class="meta">Aucune alerte récente.</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% if cat in ('all', 'bilan') %}
+      <h2>📊 Bilan historique &amp; Synthèse</h2>
+      <div class="stats-bar">
+        <span class="stat-item">Total : <strong>{{ r.get("bilan", {}).get("total", 0) }}</strong></span>
+        <span class="stat-item">En attente : <strong>{{ r.get("bilan", {}).get("en_attente", 0) }}</strong></span>
+        <span class="stat-item">Vérifiés : <strong>{{ r.get("bilan", {}).get("verifies", 0) }}</strong></span>
+        <span class="stat-item">Réussite : <strong>{{ r.get("bilan", {}).get("taux", 0.0) }}%</strong></span>
+        <span class="stat-item">PnL : <strong>{{ r.get("bilan", {}).get("pnl_total", 0.0) }}u</strong></span>
+      </div>
+      <div class="panel">
+        <pre>{{ r.synthese or "Aucune synthèse disponible pour le moment." }}</pre>
+      </div>
+      {% endif %}
     {% endif %}
   </div>
 
   <script>
     let confActif = "ALL";
+    const PAGE_FAVORIS = {{ "true" if (page_favoris or cat == "favoris") else "false" }};
+
     function setConf(val, btn) {
       confActif = val;
       document.querySelectorAll(".pill-btn").forEach(b => b.classList.remove("active"));
       if (btn) btn.classList.add("active");
       appliquerFiltres();
     }
+
     function appliquerFiltres() {
       const q = (document.getElementById("search-input")?.value || "").trim().toLowerCase();
       const probaMin = parseFloat(document.getElementById("proba-min")?.value || "0") || 0;
@@ -2690,6 +3165,7 @@ _HTML_PAGE = """<!doctype html>
         cpt.textContent = `${visibles}/${totalCartes} affichés`;
       }
     }
+
     function trierCartes() {
       const mode = document.getElementById("sort-mode")?.value || "date";
       document.querySelectorAll(".grid").forEach(grid => {
@@ -2711,6 +3187,76 @@ _HTML_PAGE = """<!doctype html>
         cards.forEach(c => grid.appendChild(c));
       });
     }
+
+    async function toggleFavori(btn) {
+      if (!btn) return;
+      const d = btn.dataset;
+      const payload = {
+        cle_favori: d.cleFavori || "",
+        sport: d.sport || "FOOT",
+        event_id: d.eventId || "",
+        match: d.match || "",
+        competition: d.competition || "",
+        date_match: d.dateMatch || "",
+        ts_match: d.tsMatch || "",
+        choix: d.choix || "",
+        proba: d.proba || null,
+        cote: d.cote || null,
+        mise_u: d.miseU || null,
+        confiance: d.confiance || "MOYENNE",
+        confiance_score: d.confianceScore || 50,
+        detail: d.detail || ""
+      };
+      btn.disabled = true;
+      try {
+        const res = await fetch("/api/favoris/toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const estFav = Boolean(data.est_favori);
+          const cle = data.cle_favori || payload.cle_favori;
+
+          document.querySelectorAll(".star-btn").forEach(other => {
+            if ((other.dataset.cleFavori || "") === cle) {
+              other.classList.toggle("active", estFav);
+              other.textContent = estFav ? "★" : "☆";
+              other.title = estFav ? "Retirer des favoris" : "Ajouter aux favoris";
+            }
+          });
+
+          if (typeof data.total_favoris === "number") {
+            const hCpt = document.getElementById("fav-count-header");
+            const tCpt = document.getElementById("fav-count-tab");
+            if (hCpt) hCpt.textContent = data.total_favoris;
+            if (tCpt) tCpt.textContent = data.total_favoris;
+          }
+
+          if (PAGE_FAVORIS && !estFav) {
+            const favCard = btn.closest(".card[data-fav-card]");
+            if (favCard) favCard.remove();
+            const remaining = document.querySelectorAll("#favoris-grid .card[data-fav-card]").length;
+            if (remaining === 0) {
+              const grid = document.getElementById("favoris-grid");
+              if (grid && !document.getElementById("fav-empty-msg")) {
+                const emptyDiv = document.createElement("div");
+                emptyDiv.className = "card";
+                emptyDiv.id = "fav-empty-msg";
+                emptyDiv.textContent = "Aucun match favori pour le moment.";
+                grid.appendChild(emptyDiv);
+              }
+            }
+          }
+          appliquerFiltres();
+        }
+      } catch (e) {
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
     trierCartes();
     appliquerFiltres();
   </script>
@@ -2775,10 +3321,59 @@ def api_status():
 @app.route("/api/analyse")
 def api_analyse():
     with _STATE_LOCK:
-        rapport = dict(_DERNIER_RAPPORT)
+        rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
     if not rapport.get("mis_a_jour"):
         rapport = executer_analyse()
     return jsonify(rapport)
+
+
+@app.route("/api/favoris/toggle", methods=["POST"])
+def api_favoris_toggle():
+    payload = request.get_json(silent=True) or request.form or {}
+    force_raw = payload.get("favori")
+    force_etat = None
+    if isinstance(force_raw, bool):
+        force_etat = force_raw
+    elif isinstance(force_raw, str) and force_raw.strip().lower() in ("1", "true", "yes", "on"):
+        force_etat = True
+    elif isinstance(force_raw, str) and force_raw.strip().lower() in ("0", "false", "no", "off"):
+        force_etat = False
+
+    est_fav, cles_actuelles = basculer_favori(payload, force_etat=force_etat)
+    cle = str(payload.get("cle_favori") or "").strip() or _construire_cle_favori(
+        payload.get("sport"), payload.get("event_id"), payload.get("match"), payload.get("date_match")
+    )
+
+    with _STATE_LOCK:
+        if _DERNIER_RAPPORT.get("mis_a_jour"):
+            if est_fav:
+                suivis_actuels = list(_DERNIER_RAPPORT.get("favoris_suivis") or [])
+                deja_dans_suivis = any(
+                    (x.get("cle_favori") or _construire_cle_favori(x.get("sport"), x.get("event_id"), x.get("match"), x.get("date_match"))) == cle
+                    for x in suivis_actuels
+                )
+                if not deja_dans_suivis:
+                    with _FAV_LOCK:
+                        meta = dict(_FAVORIS_ACTIFS.get(cle) or {})
+                    meta.setdefault("etat_match", "A_VENIR")
+                    meta["est_favori"] = True
+                    suivis_actuels.append(meta)
+                    suivis_actuels.sort(key=_cle_cle_chronologique)
+                    _DERNIER_RAPPORT["favoris_suivis"] = suivis_actuels
+            _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
+            rapport_copie = dict(_DERNIER_RAPPORT)
+        else:
+            rapport_copie = None
+
+    if rapport_copie and rapport_copie.get("mis_a_jour"):
+        _sauvegarder_rapport_disque(rapport_copie)
+
+    return jsonify({
+        "ok": True,
+        "cle_favori": cle,
+        "est_favori": est_fav,
+        "total_favoris": len(cles_actuelles),
+    }), 200
 
 
 @app.route("/api/historique/statut", methods=["POST"])
@@ -2849,14 +3444,39 @@ def index():
     return resp
 
 
+@app.route("/favoris")
+def favoris_view():
+    with _STATE_LOCK:
+        rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
+        en_cours = _ANALYSE_EN_COURS
+
+    if not rapport.get("mis_a_jour"):
+        if not en_cours:
+            _demarrer_analyse_si_besoin(0.0)
+        resp = make_response(render_template_string(_HTML_LOADING), 200)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        return resp
+
+    resp = make_response(render_template_string(
+        _HTML_PAGE,
+        r=rapport,
+        en_cours=en_cours,
+        cat="favoris",
+        page_favoris=True,
+        fenetre_heures=CFG.fenetre_heures,
+    ), 200)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.route("/app")
 def app_view():
     cat = (request.args.get("cat") or "all").strip().lower()
-    if cat not in {"all", "live", "top", "foot", "tennis", "alertes", "bilan"}:
+    if cat not in {"all", "favoris", "live", "top", "foot", "tennis", "alertes", "bilan"}:
         cat = "all"
 
     with _STATE_LOCK:
-        rapport = dict(_DERNIER_RAPPORT)
+        rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
         en_cours = _ANALYSE_EN_COURS
 
     if not rapport.get("mis_a_jour"):
@@ -2871,6 +3491,7 @@ def app_view():
         r=rapport,
         en_cours=en_cours,
         cat=cat,
+        page_favoris=False,
         fenetre_heures=CFG.fenetre_heures,
     ), 200)
     resp.headers["Cache-Control"] = "no-store"
@@ -2878,6 +3499,7 @@ def app_view():
 
 
 _nettoyer_fichiers_tmp_orphelins()
+_charger_favoris_disque()
 _charger_rapport_disque()
 _demarrer_scheduler_si_actif()
 
