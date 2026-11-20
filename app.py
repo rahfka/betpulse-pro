@@ -116,7 +116,6 @@ class _LimiteDebit:
         self._lock = threading.Lock()
 
     def verifier_et_enregistrer(self, cle, min_interval_sec):
-        """Retourne (autorise, retry_after_sec)."""
         if min_interval_sec <= 0:
             return True, 0.0
         now = time.monotonic()
@@ -421,7 +420,6 @@ def basculer_favori(item_data, force_etat=None):
                 "date_match": str(item_data.get("date_match") or existant.get("date_match") or ""),
                 "ts_match": float(item_data.get("ts_match") or existant.get("ts_match") or 9_999_999_999.0),
                 "choix": str(item_data.get("choix") or existant.get("choix") or ""),
-                "score_exact": item_data.get("score_exact", existant.get("score_exact")),
                 "proba": item_data.get("proba", existant.get("proba")),
                 "cote": item_data.get("cote", existant.get("cote")),
                 "mise_u": item_data.get("mise_u", existant.get("mise_u")),
@@ -706,62 +704,97 @@ def simuler_poisson_foot(lam_h, lam_a):
     return p_h, p_n, p_a, p_ov25_norm, 1.0 - p_ov25_norm, f"{best_h} - {best_a}", best_h, best_a, matrice_scores
 
 
-def _rendre_score_coherent(choix, h_nom, a_nom, best_h, best_a):
-    h_sc, a_sc = int(best_h), int(best_a)
+def _score_compatible_avec_choix(h_sc, a_sc, choix, h_nom, a_nom):
     c_l = str(choix or "").strip().lower()
-    h_l = str(h_nom or "").strip().lower()
-    a_l = str(a_nom or "").strip().lower()
+    h_l = _normaliser_nom_equipe(h_nom)
+    a_l = _normaliser_nom_equipe(a_nom)
 
     if c_l == "match nul":
-        if h_sc != a_sc:
-            h_sc = a_sc = max(1, min(h_sc, a_sc))
+        return h_sc == a_sc
+
+    if c_l.startswith("victoire "):
+        cible = _normaliser_nom_equipe(c_l.replace("victoire ", "", 1))
+        if not cible:
+            return h_sc != a_sc
+        if cible == h_l or (len(h_l) >= 3 and (cible in h_l or h_l in cible)):
+            return h_sc > a_sc
+        if cible == a_l or (len(a_l) >= 3 and (cible in a_l or a_l in cible)):
+            return a_sc > h_sc
+        return h_sc != a_sc
+
+    if "+2.5" in c_l:
+        return (h_sc + a_sc) >= 3
+
+    if "-2.5" in c_l:
+        return (h_sc + a_sc) <= 2
+
+    return True
+
+
+def _selectionner_score_exact_coherent(choix, h_nom, a_nom, best_h, best_a, matrice_scores, lam_h, lam_a):
+    candidats = []
+
+    if matrice_scores:
+        for (h_sc, a_sc), pr in matrice_scores.items():
+            if not _score_compatible_avec_choix(h_sc, a_sc, choix, h_nom, a_nom):
+                continue
+            penalite_volume = 0.0
+            if (h_sc + a_sc) > 5:
+                penalite_volume = 0.04 * ((h_sc + a_sc) - 5)
+            score_pondere = float(pr) * (1.0 - penalite_volume)
+            candidats.append((score_pondere, float(pr), int(h_sc), int(a_sc)))
+
+    if candidats:
+        candidats.sort(key=lambda x: (x[0], x[1], -(x[2] + x[3])), reverse=True)
+        _, pr_exact, h_sel, a_sel = candidats[0]
+        proba_exact_pct = round(max(0.5, min(95.0, pr_exact * 100.0)), 1)
+        return f"{h_sel} - {a_sel}", h_sel, a_sel, proba_exact_pct
+
+    h_sc, a_sc = int(best_h), int(best_a)
+    c_l = str(choix or "").strip().lower()
+    h_l = _normaliser_nom_equipe(h_nom)
+    a_l = _normaliser_nom_equipe(a_nom)
+
+    if c_l == "match nul":
+        h_sc = a_sc = 1 if (lam_h + lam_a) >= 2.2 else 0
     elif c_l.startswith("victoire "):
-        cible = c_l.replace("victoire ", "", 1).strip()
-        if cible and (cible == h_l or cible in h_l or h_l in cible):
-            if h_sc <= a_sc:
-                h_sc = a_sc + 1
-        elif cible and (cible == a_l or cible in a_l or a_l in cible):
-            if a_sc <= h_sc:
-                a_sc = h_sc + 1
+        cible = _normaliser_nom_equipe(c_l.replace("victoire ", "", 1))
+        if cible == a_l or (len(a_l) >= 3 and (cible in a_l or a_l in cible)):
+            a_sc = max(1, int(round(lam_a)) or 1)
+            h_sc = max(0, min(a_sc - 1, int(round(lam_h * 0.6))))
+        else:
+            h_sc = max(1, int(round(lam_h)) or 1)
+            a_sc = max(0, min(h_sc - 1, int(round(lam_a * 0.6))))
     elif "+2.5" in c_l:
-        if (h_sc + a_sc) < 3:
-            if h_sc >= a_sc:
-                h_sc = max(h_sc, 2)
-                a_sc = max(a_sc, 1)
-                if h_sc + a_sc < 3:
-                    h_sc += 1
-            else:
-                a_sc = max(a_sc, 2)
-                h_sc = max(h_sc, 1)
-                if h_sc + a_sc < 3:
-                    a_sc += 1
+        if lam_h >= lam_a:
+            h_sc, a_sc = 2, 1
+        else:
+            h_sc, a_sc = 1, 2
     elif "-2.5" in c_l:
-        while (h_sc + a_sc) > 2:
-            if h_sc >= a_sc and h_sc > 0:
-                h_sc -= 1
-            elif a_sc > 0:
-                a_sc -= 1
-            else:
-                break
+        if lam_h >= lam_a:
+            h_sc, a_sc = (1, 0) if lam_h >= 1.1 else (1, 1)
+        else:
+            h_sc, a_sc = (0, 1) if lam_a >= 1.1 else (1, 1)
 
-    return f"{h_sc} - {a_sc}", h_sc, a_sc
+    pr_secours = poisson_prob(h_sc, lam_h) * poisson_prob(a_sc, lam_a)
+    proba_secours_pct = round(max(0.5, min(95.0, pr_secours * 100.0)), 1)
+    return f"{h_sc} - {a_sc}", h_sc, a_sc, proba_secours_pct
 
 
-def _calculer_proba_score_exact(score_str, matrice_scores, lam_h, lam_a):
-    if not score_str or "-" not in str(score_str):
-        return None
-    try:
-        parts = [int(x.strip()) for x in str(score_str).split("-", 1)]
-        h_sc, a_sc = parts[0], parts[1]
-    except Exception:
-        return None
-
-    if matrice_scores and (h_sc, a_sc) in matrice_scores:
-        pr = float(matrice_scores[(h_sc, a_sc)])
-    else:
-        pr = poisson_prob(h_sc, lam_h) * poisson_prob(a_sc, lam_a)
-
-    return round(max(0.5, min(95.0, pr * 100.0)), 1)
+def _calculer_top_scores_exacts(matrice_scores, choix, h_nom, a_nom, top_n=3):
+    if not matrice_scores:
+        return []
+    tries = sorted(matrice_scores.items(), key=lambda kv: float(kv[1]), reverse=True)
+    top_liste = []
+    for (h_sc, a_sc), pr in tries[:top_n]:
+        pct = round(max(0.5, min(95.0, float(pr) * 100.0)), 1)
+        compatible = _score_compatible_avec_choix(h_sc, a_sc, choix, h_nom, a_nom)
+        top_liste.append({
+            "score": f"{int(h_sc)} - {int(a_sc)}",
+            "proba": pct,
+            "compatible": compatible,
+        })
+    return top_liste
 
 
 def moyenne_ponderee_shrinkage(valeurs, prior_moyenne, prior_poids=1.5):
@@ -1192,8 +1225,10 @@ def _construire_entree_foot(ev, label_comp, events_comp):
     plafond = 0.86 if (fiable and not est_nul) else (0.55 if est_nul else 0.72)
     prob_cal = min(max(prob, 0.05), plafond)
     proba_pct = round(prob_cal * 100, 1)
-    score_exact, _, _ = _rendre_score_coherent(choix, h_nom, a_nom, best_h, best_a)
-    score_exact_proba = _calculer_proba_score_exact(score_exact, matrice_scores, lam_h, lam_a)
+    score_exact, _, _, score_exact_proba = _selectionner_score_exact_coherent(
+        choix, h_nom, a_nom, best_h, best_a, matrice_scores, lam_h, lam_a
+    )
+    top_scores_exacts = _calculer_top_scores_exacts(matrice_scores, choix, h_nom, a_nom, top_n=3)
 
     dt_match = _parse_date_utc(start_str)
     est_imminent = False
@@ -1234,6 +1269,7 @@ def _construire_entree_foot(ev, label_comp, events_comp):
         "ecart_value_pct": ecart_value_pct,
         "score_exact": score_exact,
         "score_exact_proba": score_exact_proba,
+        "top_scores_exacts": top_scores_exacts,
         "est_imminent": est_imminent,
         "prudence": prudence,
         "confiance": conf_niveau,
@@ -1617,6 +1653,7 @@ def analyser_tennis(heures_max=48):
                     "ecart_value_pct": ecart_value_pct,
                     "score_exact": None,
                     "score_exact_proba": None,
+                    "top_scores_exacts": [],
                     "est_imminent": est_imminent,
                     "prudence": "MODERE" if (proba_pct >= 58 and complet) else "PRUDENT",
                     "confiance": conf_niveau,
@@ -1674,16 +1711,6 @@ def _enrichir_matchs_live_avec_pronostics(live_items, candidats_precalcul):
         eid = str(copie.get("event_id") or "").strip()
         cle_ev = f"{sport_u}_{eid}"
 
-        base_precalcul = precalcul_par_event.get(cle_ev)
-        if not base_precalcul and " vs " in copie.get("match", ""):
-            eq_h, eq_a = [x.strip() for x in copie["match"].split(" vs ", 1)]
-            for it in (candidats_precalcul or []):
-                if str(it.get("sport") or "").upper() == sport_u and " vs " in it.get("match", ""):
-                    rh, ra = [x.strip() for x in it["match"].split(" vs ", 1)]
-                    if _memes_equipes(eq_h, rh) and _memes_equipes(eq_a, ra):
-                        base_precalcul = it
-                        break
-
         hist_match = par_event.get(cle_ev) or []
         if not hist_match and " vs " in copie.get("match", ""):
             eq_h, eq_a = [x.strip() for x in copie["match"].split(" vs ", 1)]
@@ -1694,16 +1721,6 @@ def _enrichir_matchs_live_avec_pronostics(live_items, candidats_precalcul):
                         hist_match = [r]
                         break
 
-        score_pred = (
-            copie.get("score_exact")
-            or (base_precalcul or {}).get("score_exact")
-        )
-        if not score_pred and sport_u == "FOOT" and " vs " in copie.get("match", ""):
-            eq_h, eq_a = [x.strip() for x in copie["match"].split(" vs ", 1)]
-            pred_choix = (hist_match[-1].get("choix") if hist_match else None) or (base_precalcul or {}).get("choix") or copie.get("choix")
-            score_pred, _, _ = _rendre_score_coherent(pred_choix, eq_h, eq_a, 1, 0)
-        copie["score_exact"] = score_pred
-
         if hist_match:
             dernier = hist_match[-1]
             copie["pronostic_predi"] = dernier.get("choix") or copie.get("choix")
@@ -1712,7 +1729,7 @@ def _enrichir_matchs_live_avec_pronostics(live_items, candidats_precalcul):
             copie["pronostic_statut"] = dernier.get("statut") or "EN_ATTENTE"
             copie["pronostic_source"] = "Enregistré"
         else:
-            base = base_precalcul or copie
+            base = precalcul_par_event.get(cle_ev) or copie
             copie["pronostic_predi"] = base.get("choix")
             copie["pronostic_proba"] = base.get("proba")
             copie["pronostic_cote"] = base.get("cote")
@@ -1795,7 +1812,6 @@ def _construire_favoris_suivis(tous_items_a_venir, live_enrichis, clos_globaux, 
                 "date_match": date_m,
                 "ts_match": ts_m,
                 "choix": meta.get("choix") or "Non défini",
-                "score_exact": meta.get("score_exact"),
                 "proba": meta.get("proba"),
                 "cote": meta.get("cote"),
                 "mise_u": meta.get("mise_u"),
@@ -2619,7 +2635,7 @@ _HTML_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BetPulse Pro — {% if page_favoris or cat == 'favoris' %}Matchs Favoris{% else %}Matchs &amp; Pronostics{% endif %}</title>
+  <title>BetPulse Pro — {% if page_favoris %}Matchs Favoris{% else %}Matchs &amp; Pronostics{% endif %}</title>
   <style>
     :root {
       --bg: #0b1220;
@@ -2668,6 +2684,8 @@ _HTML_PAGE = """<!doctype html>
     select { background: #0b1220; color: var(--text); border: 1px solid var(--border); font-weight: 600; }
     .btn-cat { background: var(--card); color: var(--text); border: 1px solid var(--border); font-weight: 600; }
     .btn-cat.active { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 700; }
+    .btn-fav-page { background: rgba(251, 191, 36, 0.14); color: var(--gold); border: 1px solid rgba(251, 191, 36, 0.45); }
+    .btn-fav-page.active { background: var(--gold); color: #0b1220; border-color: var(--gold); }
     button:hover, .btn:hover { opacity: 0.92; transform: translateY(-1px); }
     button:disabled { opacity: 0.65; cursor: wait; transform: none; }
     .cat-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
@@ -2712,6 +2730,7 @@ _HTML_PAGE = """<!doctype html>
     .badge { font-size: 0.73em; padding: 3px 7px; border-radius: 999px; font-weight: 800; white-space: nowrap; }
     .badge.proba { background: rgba(56, 189, 248, 0.16); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35); }
     .badge.cote { background: rgba(148, 163, 184, 0.18); color: #e2e8f0; border: 1px solid rgba(148, 163, 184, 0.32); }
+    .badge.value { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.45); }
     .badge.live { background: rgba(239, 68, 68, 0.18); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.45); display: inline-flex; align-items: center; gap: 5px; }
     .badge.termine { background: rgba(148, 163, 184, 0.18); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.35); }
     .badge.a-venir { background: rgba(56, 189, 248, 0.15); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35); }
@@ -2725,6 +2744,17 @@ _HTML_PAGE = """<!doctype html>
     @keyframes pulse-red { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); } 70% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
     .card-meta { font-size: 0.86em; color: var(--muted); margin-bottom: 10px; line-height: 1.45; }
     .card-meta strong { color: var(--text); }
+    .score-box {
+      margin-top: 6px; padding: 7px 9px; border-radius: 8px;
+      background: rgba(15, 23, 42, 0.72); border: 1px solid rgba(56, 189, 248, 0.22);
+    }
+    .score-main { color: var(--accent); font-weight: 700; font-size: 0.92em; }
+    .top-scores-line { margin-top: 4px; font-size: 0.82em; color: #cbd5e1; display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+    .top-sc-chip {
+      background: rgba(30, 41, 59, 0.9); border: 1px solid var(--border);
+      border-radius: 6px; padding: 2px 6px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em;
+    }
+    .top-sc-chip.ok { border-color: rgba(16, 185, 129, 0.45); color: #a7f3d0; }
     .live-score-box {
       display: flex; justify-content: space-between; align-items: center;
       background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3);
@@ -2742,8 +2772,7 @@ _HTML_PAGE = """<!doctype html>
     }
     .pred-label { font-size: 0.73em; text-transform: uppercase; letter-spacing: 0.04em; color: #7dd3fc; font-weight: 800; margin-bottom: 3px; }
     .pred-choice { font-size: 0.96em; font-weight: 800; color: #f8fafc; }
-    .pred-score-exact { font-size: 0.84em; font-weight: 700; color: #bae6fd; margin-top: 4px; }
-    .pred-sub { font-size: 0.78em; color: var(--muted); margin-top: 4px; }
+    .pred-sub { font-size: 0.78em; color: var(--muted); margin-top: 2px; }
     .conf-meter { margin: 8px 0 4px 0; }
     .conf-label { display: flex; justify-content: space-between; font-size: 0.76em; color: var(--muted); margin-bottom: 4px; }
     .meter-track { height: 6px; background: #0b1220; border-radius: 999px; overflow: hidden; }
@@ -2770,11 +2799,16 @@ _HTML_PAGE = """<!doctype html>
       <div>
         <a href="/" class="brand-link" title="Retour à l'accueil">
           <span class="brand-badge">BP</span>
-          <h1 style="margin: 0;">BetPulse Pro{% if page_favoris or cat == 'favoris' %} — Favoris{% endif %}</h1>
+          <h1 style="margin: 0;">BetPulse Pro{% if page_favoris %} — Favoris{% endif %}</h1>
         </a><br>
         <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }} • Fenêtre : {{ fenetre_heures }}h • <span id="compteur-cartes">Filtre actif</span></span>
       </div>
       <div class="header-actions">
+        {% if page_favoris %}
+        <a href="{{ url_for('app_view', cat='all') }}" class="btn btn-cat">← Tous les matchs</a>
+        {% else %}
+        <a href="{{ url_for('favoris_view') }}" class="btn btn-fav-page">★ Page Favoris (<span id="fav-count-header">{{ r.favoris_suivis|length }}</span>)</a>
+        {% endif %}
         <form id="refresh-form" method="post" action="/refresh" style="margin: 0;" onsubmit="return soumettreRefresh(event);">
           <input type="hidden" name="admin_token" id="refresh-admin-token" value="">
           <button id="btn-refresh" type="submit">↻ Actualiser</button>
@@ -2838,7 +2872,7 @@ _HTML_PAGE = """<!doctype html>
            data-proba="{{ it.proba or 0 }}"
            data-conf-score="{{ conf_sc }}"
            data-ts="{{ ts_m }}"
-           data-search="{{ ((it.choix or '') ~ ' ' ~ (it.score_exact or '') ~ ' ' ~ (it.match or '') ~ ' ' ~ (it.competition or '') ~ ' ' ~ (it.score_final or '') ~ ' ' ~ (it.detail or ''))|lower }}">
+           data-search="{{ ((it.choix or '') ~ ' ' ~ (it.match or '') ~ ' ' ~ (it.competition or '') ~ ' ' ~ (it.score_final or '') ~ ' ' ~ (it.detail or ''))|lower }}">
         <div class="card-top">
           <div class="card-title">
             {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}
@@ -2868,7 +2902,6 @@ _HTML_PAGE = """<!doctype html>
                     data-date-match="{{ it.date_match or '' }}"
                     data-ts-match="{{ ts_m }}"
                     data-choix="{{ it.choix or '' }}"
-                    data-score-exact="{{ it.score_exact or '' }}"
                     data-proba="{{ it.proba if it.proba is not none else '' }}"
                     data-cote="{{ it.cote if it.cote is not none else '' }}"
                     data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
@@ -2894,12 +2927,10 @@ _HTML_PAGE = """<!doctype html>
         <div class="pred-box">
           <div class="pred-label">Pronostic</div>
           <div class="pred-choice">{{ it.choix or 'Non défini' }}</div>
-          {% if it.get('score_exact') %}
-          <div class="pred-score-exact">Score exact prédit : {{ it.score_exact }}</div>
-          {% endif %}
           <div class="pred-sub">
             {% if it.proba is not none %}Proba : <strong>{{ it.proba }}%</strong>{% endif %}
             {% if it.cote %} • Cote : <strong>{{ it.cote }}</strong>{% endif %}
+            {% if it.mise_u is not none %} • Mise : <strong>{{ it.mise_u }}u</strong>{% endif %}
           </div>
         </div>
         {% if it.detail %}
@@ -2912,7 +2943,7 @@ _HTML_PAGE = """<!doctype html>
     </div>
     {% endif %}
 
-    {% if not page_favoris and cat != 'favoris' %}
+    {% if not page_favoris %}
       {% if cat in ('all', 'live') %}
       <h2><span class="dot-red"></span> Matchs en cours ({{ r.en_cours_matchs|length }})</h2>
       <div class="grid">
@@ -2926,7 +2957,7 @@ _HTML_PAGE = """<!doctype html>
              data-proba="{{ it.pronostic_proba or it.proba }}"
              data-conf-score="{{ conf_sc }}"
              data-ts="{{ ts_m }}"
-             data-search="{{ ((it.pronostic_predi or it.choix) ~ ' ' ~ (it.score_exact or '') ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.score_actuel or ''))|lower }}">
+             data-search="{{ ((it.pronostic_predi or it.choix) ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.score_actuel or ''))|lower }}">
           <div class="card-top">
             <div class="card-title">
               {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}
@@ -2945,7 +2976,6 @@ _HTML_PAGE = """<!doctype html>
                       data-date-match="{{ it.date_match or '' }}"
                       data-ts-match="{{ ts_m }}"
                       data-choix="{{ it.pronostic_predi or it.choix or '' }}"
-                      data-score-exact="{{ it.score_exact or '' }}"
                       data-proba="{{ it.pronostic_proba or it.proba or '' }}"
                       data-cote="{{ it.pronostic_cote or it.cote or '' }}"
                       data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
@@ -2964,9 +2994,6 @@ _HTML_PAGE = """<!doctype html>
           <div class="pred-box">
             <div class="pred-label">Pronostic prédit ({{ it.pronostic_source or 'Bot' }})</div>
             <div class="pred-choice">{{ it.pronostic_predi or it.choix }}</div>
-            {% if it.get('score_exact') %}
-            <div class="pred-score-exact">Score exact prédit : {{ it.score_exact }}</div>
-            {% endif %}
             <div class="pred-sub">
               Proba : <strong>{{ it.pronostic_proba or it.proba }}%</strong>
               {% if it.pronostic_cote or it.cote %} • Cote : <strong>{{ it.pronostic_cote or it.cote }}</strong>{% endif %}
@@ -2994,14 +3021,17 @@ _HTML_PAGE = """<!doctype html>
              data-proba="{{ it.proba }}"
              data-conf-score="{{ conf_sc }}"
              data-ts="{{ ts_m }}"
-             data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
+             data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.score_exact or '') ~ ' ' ~ (it.detail or ''))|lower }}">
           <div class="card-top">
             <div class="card-title">
               {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.choix }}
             </div>
             <div class="badges-right">
+              {% if it.get('est_value_bet') %}
+              <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
+              {% endif %}
               {% if it.get('cote') %}
-              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
+              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
               {% endif %}
               <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
               {% if it.get('est_imminent') %}
@@ -3019,7 +3049,6 @@ _HTML_PAGE = """<!doctype html>
                       data-date-match="{{ it.date_match or '' }}"
                       data-ts-match="{{ ts_m }}"
                       data-choix="{{ it.choix or '' }}"
-                      data-score-exact="{{ it.score_exact or '' }}"
                       data-proba="{{ it.proba if it.proba is not none else '' }}"
                       data-cote="{{ it.cote if it.cote is not none else '' }}"
                       data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
@@ -3030,9 +3059,19 @@ _HTML_PAGE = """<!doctype html>
           </div>
           <div class="card-meta">
             <strong>{{ it.match }}</strong><br>
-            {{ it.date_match }} — {{ it.competition }}
+            {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
             {% if it.get('score_exact') %}
-            <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
+            <div class="score-box">
+              <div class="score-main">Score exact cohérent : {{ it.score_exact }} ({{ pct_score }}%)</div>
+              {% if it.get('top_scores_exacts') %}
+              <div class="top-scores-line">
+                <span>Top 3 :</span>
+                {% for sc_item in it.get('top_scores_exacts', []) %}
+                <span class="top-sc-chip {% if sc_item.compatible %}ok{% endif %}">{{ sc_item.score }} ({{ sc_item.proba }}%)</span>
+                {% endfor %}
+              </div>
+              {% endif %}
+            </div>
             {% endif %}
           </div>
           <div class="conf-meter">
@@ -3068,12 +3107,15 @@ _HTML_PAGE = """<!doctype html>
              data-proba="{{ it.proba }}"
              data-conf-score="{{ conf_sc }}"
              data-ts="{{ ts_m }}"
-             data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
+             data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.score_exact or '') ~ ' ' ~ (it.detail or ''))|lower }}">
           <div class="card-top">
             <div class="card-title">⚽ {{ it.choix }}</div>
             <div class="badges-right">
+              {% if it.get('est_value_bet') %}
+              <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
+              {% endif %}
               {% if it.get('cote') %}
-              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
+              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
               {% endif %}
               <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
               {% if it.get('est_imminent') %}
@@ -3091,7 +3133,6 @@ _HTML_PAGE = """<!doctype html>
                       data-date-match="{{ it.date_match or '' }}"
                       data-ts-match="{{ ts_m }}"
                       data-choix="{{ it.choix or '' }}"
-                      data-score-exact="{{ it.score_exact or '' }}"
                       data-proba="{{ it.proba if it.proba is not none else '' }}"
                       data-cote="{{ it.cote if it.cote is not none else '' }}"
                       data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
@@ -3102,9 +3143,19 @@ _HTML_PAGE = """<!doctype html>
           </div>
           <div class="card-meta">
             <strong>{{ it.match }}</strong><br>
-            {{ it.date_match }}
+            {{ it.date_match }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
             {% if it.get('score_exact') %}
-            <br><span style="color: var(--accent); font-weight: 600;">Score exact cohérent : {{ it.score_exact }}</span>
+            <div class="score-box">
+              <div class="score-main">Score exact cohérent : {{ it.score_exact }} ({{ pct_score }}%)</div>
+              {% if it.get('top_scores_exacts') %}
+              <div class="top-scores-line">
+                <span>Top 3 :</span>
+                {% for sc_item in it.get('top_scores_exacts', []) %}
+                <span class="top-sc-chip {% if sc_item.compatible %}ok{% endif %}">{{ sc_item.score }} ({{ sc_item.proba }}%)</span>
+                {% endfor %}
+              </div>
+              {% endif %}
+            </div>
             {% endif %}
           </div>
           <div class="conf-meter">
@@ -3137,8 +3188,11 @@ _HTML_PAGE = """<!doctype html>
           <div class="card-top">
             <div class="card-title">🎾 {{ it.choix }}</div>
             <div class="badges-right">
+              {% if it.get('est_value_bet') %}
+              <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
+              {% endif %}
               {% if it.get('cote') %}
-              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
+              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }} (Min: {{ it.get('cote_min', '-') }})">Cote {{ it.cote }}</span>
               {% endif %}
               <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
               {% if it.get('est_imminent') %}
@@ -3156,7 +3210,6 @@ _HTML_PAGE = """<!doctype html>
                       data-date-match="{{ it.date_match or '' }}"
                       data-ts-match="{{ ts_m }}"
                       data-choix="{{ it.choix or '' }}"
-                      data-score-exact="{{ it.score_exact or '' }}"
                       data-proba="{{ it.proba if it.proba is not none else '' }}"
                       data-cote="{{ it.cote if it.cote is not none else '' }}"
                       data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
@@ -3167,7 +3220,7 @@ _HTML_PAGE = """<!doctype html>
           </div>
           <div class="card-meta">
             <strong>{{ it.match }}</strong><br>
-            {{ it.date_match }} — {{ it.competition }}
+            {{ it.date_match }} — {{ it.competition }} • Mise : <strong>{{ it.get('mise_u', 0) }}u</strong> (Cote min : {{ it.get('cote_min', '-') }})
           </div>
           <div class="conf-meter">
             <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
@@ -3346,7 +3399,6 @@ _HTML_PAGE = """<!doctype html>
         date_match: d.dateMatch || "",
         ts_match: d.tsMatch || "",
         choix: d.choix || "",
-        score_exact: d.scoreExact || null,
         proba: d.proba || null,
         cote: d.cote || null,
         mise_u: d.miseU || null,
@@ -3375,7 +3427,9 @@ _HTML_PAGE = """<!doctype html>
           });
 
           if (typeof data.total_favoris === "number") {
+            const hCpt = document.getElementById("fav-count-header");
             const tCpt = document.getElementById("fav-count-tab");
+            if (hCpt) hCpt.textContent = data.total_favoris;
             if (tCpt) tCpt.textContent = data.total_favoris;
           }
 
@@ -3649,7 +3703,7 @@ def app_view():
         r=rapport,
         en_cours=en_cours,
         cat=cat,
-        page_favoris=(cat == "favoris"),
+        page_favoris=False,
         fenetre_heures=CFG.fenetre_heures,
         token_requis=bool(CFG.admin_token),
     ), 200)
