@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
-from flask import Flask, jsonify, make_response, redirect, render_template_string, url_for
+from flask import Flask, jsonify, make_response, redirect, render_template_string, request, url_for
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -800,62 +800,96 @@ _HTML_HOME = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BetPulse Pro — Accueil</title>
+  <title>BetPulse Pro</title>
   <style>
     :root { --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --muted: #94a3b8; --accent: #38bdf8; --green: #10b981; --border: #334155; }
-    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 24px; background: var(--bg); color: var(--text); }
-    .container { max-width: 980px; margin: 0 auto; }
-    .hero { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); border: 1px solid var(--border); border-radius: 14px; padding: 32px; margin-bottom: 24px; }
-    .badge-status { display: inline-block; padding: 5px 12px; border-radius: 999px; font-size: 0.8em; font-weight: bold; background: rgba(56, 189, 248, 0.15); color: var(--accent); margin-bottom: 12px; }
-    .badge-ready { background: rgba(16, 185, 129, 0.15); color: var(--green); }
-    h1 { margin: 0 0 10px 0; color: var(--accent); font-size: 2rem; }
-    p { color: var(--muted); line-height: 1.6; margin: 0 0 20px 0; }
-    .actions { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
-    .btn { background: var(--accent); color: #0f172a; border: none; padding: 11px 18px; border-radius: 8px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; font-size: 0.95rem; }
-    .btn-secondary { background: var(--card); color: var(--text); border: 1px solid var(--border); }
-    .btn:hover { opacity: 0.9; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
-    .box { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; }
-    .box h3 { margin: 0 0 8px 0; font-size: 1rem; color: var(--text); }
-    .box .val { font-size: 1.4rem; font-weight: bold; color: var(--accent); margin-bottom: 6px; }
-    .box .sub { font-size: 0.85rem; color: var(--muted); }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at top, #1e293b 0%, var(--bg) 68%);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+    .center-wrap {
+      width: 100%;
+      max-width: 520px;
+      text-align: center;
+    }
+    .logo-btn {
+      display: inline-flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      background: var(--card);
+      border: 2px solid rgba(56, 189, 248, 0.45);
+      border-radius: 24px;
+      padding: 36px 44px;
+      color: var(--text);
+      text-decoration: none;
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+      transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+      cursor: pointer;
+    }
+    .logo-btn:hover {
+      transform: translateY(-3px) scale(1.01);
+      border-color: var(--accent);
+      box-shadow: 0 22px 48px rgba(56, 189, 248, 0.18);
+    }
+    .logo-mark {
+      width: 84px;
+      height: 84px;
+      border-radius: 22px;
+      background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
+      color: #0f172a;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 2rem;
+      font-weight: 900;
+      letter-spacing: -1px;
+    }
+    .logo-title {
+      font-size: 2rem;
+      font-weight: 800;
+      color: var(--text);
+      letter-spacing: 0.3px;
+    }
+    .logo-title span {
+      color: var(--accent);
+    }
+    .logo-cta {
+      font-size: 0.92rem;
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .status-note {
+      margin-top: 18px;
+      font-size: 0.85rem;
+      color: var(--muted);
+    }
   </style>
 </head>
 <body>
-  <div class="container">
-    <div class="hero">
-      <span class="badge-status {% if r.mis_a_jour %}badge-ready{% endif %}">
-        {% if en_cours %}Analyse en cours en arrière-plan{% elif r.mis_a_jour %}Données prêtes{% else %}Initialisation{% endif %}
-      </span>
-      <h1>BetPulse Pro</h1>
-      <p>
-        Suivi des rencontres Football et Tennis sur une fenêtre de {{ fenetre_heures }}h, estimation probabiliste par modèle de Poisson et classement ATP/WTA, et contrôle des alertes blessures récentes.
-      </p>
-      <div class="actions">
-        <a href="/app" class="btn">Accéder aux matchs &amp; pronostics</a>
-        <a href="/bilan" class="btn btn-secondary">Voir le bilan &amp; la synthèse</a>
-        <form method="post" action="/refresh" style="margin: 0;">
-          <button type="submit" class="btn btn-secondary">Lancer une actualisation</button>
-        </form>
-      </div>
-    </div>
-
-    <div class="grid">
-      <div class="box">
-        <h3>Dernière mise à jour</h3>
-        <div class="val">{{ r.mis_a_jour or "En attente" }}</div>
-        <div class="sub">Cache actif : {{ cache_ttl }}s</div>
-      </div>
-      <div class="box">
-        <h3>Matchs à venir ({{ fenetre_heures }}h)</h3>
-        <div class="val">{{ (r.foot|length) + (r.tennis|length) }}</div>
-        <div class="sub">{{ r.foot|length }} Football · {{ r.tennis|length }} Tennis</div>
-      </div>
-      <div class="box">
-        <h3>Historique vérifié</h3>
-        <div class="val">{{ r.get("bilan", {}).get("taux", 0.0) }}%</div>
-        <div class="sub">{{ r.get("bilan", {}).get("gagnes", 0) }} / {{ r.get("bilan", {}).get("verifies", 0) }} validés</div>
-      </div>
+  <div class="center-wrap">
+    <a href="/app" class="logo-btn" title="Ouvrir les matchs et pronostics">
+      <div class="logo-mark">BP</div>
+      <div class="logo-title">BetPulse <span>Pro</span></div>
+      <div class="logo-cta">Appuyer pour voir les matchs &amp; pronostics →</div>
+    </a>
+    <div class="status-note">
+      {% if en_cours %}
+        Analyse en cours en arrière-plan…
+      {% elif r.mis_a_jour %}
+        Dernière analyse : {{ r.mis_a_jour }}
+      {% else %}
+        Initialisation des données…
+      {% endif %}
     </div>
   </div>
 </body>
@@ -867,7 +901,7 @@ _HTML_LOADING = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BetPulse Pro — Préparation des données…</title>
+  <title>BetPulse Pro — Chargement…</title>
   <style>
     body { background: #0f172a; color: #e2e8f0; font-family: sans-serif; text-align: center; padding: 80px 20px; }
     h1 { color: #38bdf8; }
@@ -880,8 +914,8 @@ _HTML_LOADING = """<!doctype html>
 <body>
   <h1>BetPulse Pro</h1>
   <div class="loader"></div>
-  <p id="status-msg">Récupération des matchs et calcul des probabilités en cours…</p>
-  <a href="/">← Retour à l'accueil</a>
+  <p id="status-msg">Récupération des matchs et pronostics en cours…</p>
+  <a href="/">← Retour au logo</a>
   <script>
     async function verifierEtat() {
       try {
@@ -889,7 +923,7 @@ _HTML_LOADING = """<!doctype html>
         if (res.ok) {
           const data = await res.json();
           if (data.ready) {
-            window.location.replace("/app");
+            window.location.replace(window.location.href);
             return;
           }
         }
@@ -907,36 +941,38 @@ _HTML_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BetPulse Pro — Matchs à venir (48h)</title>
+  <title>BetPulse Pro — Matchs &amp; Pronostics</title>
   <style>
-    :root { --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --accent: #38bdf8; --green: #10b981; --orange: #f59e0b; --red: #ef4444; }
+    :root { --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --accent: #38bdf8; --green: #10b981; --orange: #f59e0b; --red: #ef4444; --border: #334155; }
+    * { box-sizing: border-box; }
     body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background: var(--bg); color: var(--text); }
-    h1, h2 { color: var(--accent); margin-bottom: 15px; }
+    h1, h2 { color: var(--accent); margin-bottom: 14px; }
     .container { max-width: 1200px; margin: 0 auto; }
-    .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #334155; }
-    .header .meta { color: #94a3b8; font-size: 0.9em; }
-    button, .btn { background: var(--accent); color: var(--bg); border: none; padding: 8px 14px; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; font-size: 0.9em; }
-    .btn-ghost { background: #1e293b; color: var(--text); border: 1px solid #334155; }
+    .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+    .brand-link { display: inline-flex; align-items: center; gap: 10px; text-decoration: none; color: var(--text); }
+    .brand-badge { width: 36px; height: 36px; border-radius: 10px; background: var(--accent); color: #0f172a; font-weight: 900; display: inline-flex; align-items: center; justify-content: center; }
+    .meta { color: #94a3b8; font-size: 0.88em; }
+    button, .btn { background: var(--accent); color: #0f172a; border: none; padding: 8px 14px; border-radius: 8px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; font-size: 0.88em; }
+    .btn-cat { background: var(--card); color: var(--text); border: 1px solid var(--border); }
+    .btn-cat.active { background: var(--accent); color: #0f172a; border-color: var(--accent); }
     button:hover, .btn:hover { opacity: 0.88; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 15px; }
-    .card { background: var(--card); padding: 15px; border-radius: 8px; border-left: 4px solid var(--accent); box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+    .cat-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 22px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 15px; margin-bottom: 24px; }
+    .card { background: var(--card); padding: 15px; border-radius: 10px; border-left: 4px solid var(--accent); box-shadow: 0 4px 6px rgba(0,0,0,0.12); }
     .card.ELEVE { border-left-color: var(--green); }
     .card.MODERE { border-left-color: var(--orange); }
     .card.PRUDENT { border-left-color: var(--red); }
-    .card-title { font-size: 1.1em; font-weight: bold; margin-bottom: 8px; display: flex; justify-content: space-between; gap: 8px; }
+    .card-title { font-size: 1.08em; font-weight: bold; margin-bottom: 8px; display: flex; justify-content: space-between; gap: 8px; }
     .badge { font-size: 0.75em; padding: 3px 8px; border-radius: 12px; font-weight: bold; white-space: nowrap; }
     .badge.ELEVE { background: var(--green); color: #000; }
     .badge.MODERE { background: var(--orange); color: #000; }
     .badge.PRUDENT { background: var(--red); color: #fff; }
     .card-meta { font-size: 0.85em; color: #94a3b8; margin-bottom: 8px; line-height: 1.4; }
-    .card-detail { font-size: 0.8em; color: #cbd5e1; background: #0f172a; padding: 8px; border-radius: 4px; margin-top: 8px; font-family: monospace; }
-    details { background: var(--card); border-radius: 8px; margin-bottom: 15px; overflow: hidden; }
-    summary { padding: 15px; cursor: pointer; font-weight: bold; color: var(--accent); user-select: none; }
-    summary:hover { background: #334155; }
-    .details-content { padding: 0 15px 15px 15px; }
-    pre { white-space: pre-wrap; background: #0f172a; padding: 15px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; }
-    .stats-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 20px; }
-    .stat-item { background: var(--card); padding: 8px 12px; border-radius: 20px; font-size: 0.85em; }
+    .card-detail { font-size: 0.8em; color: #cbd5e1; background: #0f172a; padding: 8px; border-radius: 6px; margin-top: 8px; font-family: monospace; }
+    .panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 22px; }
+    .stats-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+    .stat-item { background: var(--card); border: 1px solid var(--border); padding: 8px 12px; border-radius: 20px; font-size: 0.85em; }
+    pre { white-space: pre-wrap; background: #0f172a; padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 0.85em; margin: 0; }
     .notice { background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #bae6fd; padding: 10px 14px; border-radius: 8px; margin-bottom: 18px; font-size: 0.9em; }
   </style>
 </head>
@@ -944,39 +980,31 @@ _HTML_PAGE = """<!doctype html>
   <div class="container">
     <div class="header">
       <div>
-        <h1 style="margin: 0;">Matchs &amp; Pronostics</h1>
+        <a href="/" class="brand-link" title="Retour au logo BetPulse Pro">
+          <span class="brand-badge">BP</span>
+          <h1 style="margin: 0;">BetPulse Pro</h1>
+        </a><br>
         <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }}</span>
       </div>
-      <div style="display: flex; flex-wrap: wrap; gap: 8px;">
-        <a href="/" class="btn btn-ghost">Accueil</a>
-        <a href="/bilan" class="btn btn-ghost">Bilan</a>
-        <form method="post" action="/refresh" style="margin: 0;">
-          <button type="submit">Actualiser</button>
-        </form>
-        <a href="/api/analyse" class="btn">JSON</a>
-        <a href="/api/debug-foot" class="btn">Debug</a>
-      </div>
+      <form method="post" action="/refresh" style="margin: 0;">
+        <button type="submit">Actualiser</button>
+      </form>
+    </div>
+
+    <div class="cat-bar">
+      <a href="{{ url_for('app_view', cat='all') }}" class="btn btn-cat {% if cat == 'all' %}active{% endif %}">Tout</a>
+      <a href="{{ url_for('app_view', cat='top') }}" class="btn btn-cat {% if cat == 'top' %}active{% endif %}">Top Pronostics ({{ r.top_sur|length }})</a>
+      <a href="{{ url_for('app_view', cat='foot') }}" class="btn btn-cat {% if cat == 'foot' %}active{% endif %}">Football ({{ r.foot|length }})</a>
+      <a href="{{ url_for('app_view', cat='tennis') }}" class="btn btn-cat {% if cat == 'tennis' %}active{% endif %}">Tennis ({{ r.tennis|length }})</a>
+      <a href="{{ url_for('app_view', cat='alertes') }}" class="btn btn-cat {% if cat == 'alertes' %}active{% endif %}">Alertes ({{ r.get('alertes', {})|length }})</a>
+      <a href="{{ url_for('app_view', cat='bilan') }}" class="btn btn-cat {% if cat == 'bilan' %}active{% endif %}">Bilan &amp; Synthèse</a>
     </div>
 
     {% if en_cours %}
     <div class="notice">Mise à jour en arrière-plan en cours — les données affichées restent accessibles.</div>
     {% endif %}
 
-    <h2>Bilan historique</h2>
-    <div class="stats-bar">
-      <span class="stat-item">Total : <strong>{{ r.get("bilan", {}).get("total", 0) }}</strong></span>
-      <span class="stat-item">En attente : <strong>{{ r.get("bilan", {}).get("en_attente", 0) }}</strong></span>
-      <span class="stat-item">Vérifiés : <strong>{{ r.get("bilan", {}).get("verifies", 0) }}</strong></span>
-      <span class="stat-item">Réussite : <strong>{{ r.get("bilan", {}).get("taux", 0.0) }}%</strong></span>
-    </div>
-
-    <h2>Couverture Foot</h2>
-    <div class="stats-bar">
-      {% for k, v in r.get("stats_comp", {}).items() %}
-        <span class="stat-item"><strong>{{ k }}</strong> : {{ v }}</span>
-      {% endfor %}
-    </div>
-
+    {% if cat in ('all', 'top') %}
     <h2>Top pronostics (Foot &amp; Tennis)</h2>
     <div class="grid">
       {% for it in r.top_sur %}
@@ -997,8 +1025,15 @@ _HTML_PAGE = """<!doctype html>
       <div class="card">Aucun pronostic disponible.</div>
       {% endfor %}
     </div>
+    {% endif %}
 
-    <h2>Matchs de Foot à venir — 48h ({{ r.foot|length }})</h2>
+    {% if cat in ('all', 'foot') %}
+    <h2>Matchs de Foot à venir — {{ fenetre_heures }}h ({{ r.foot|length }})</h2>
+    <div class="stats-bar">
+      {% for k, v in r.get("stats_comp", {}).items() %}
+        <span class="stat-item"><strong>{{ k }}</strong> : {{ v }}</span>
+      {% endfor %}
+    </div>
     <div class="grid">
       {% for it in r.foot %}
       <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
@@ -1013,11 +1048,13 @@ _HTML_PAGE = """<!doctype html>
         <div class="card-detail">{{ it.detail }}</div>
       </div>
       {% else %}
-      <div class="card">Aucun match de foot à venir dans les prochaines 48h.</div>
+      <div class="card">Aucun match de foot à venir dans cette fenêtre.</div>
       {% endfor %}
     </div>
+    {% endif %}
 
-    <h2>Matchs de Tennis à venir — 48h ({{ r.tennis|length }})</h2>
+    {% if cat in ('all', 'tennis') %}
+    <h2>Matchs de Tennis à venir — {{ fenetre_heures }}h ({{ r.tennis|length }})</h2>
     <div class="grid">
       {% for it in r.tennis %}
       <div class="card {{ (it.prudence or 'PRUDENT').split(' ')[0] }}">
@@ -1031,80 +1068,37 @@ _HTML_PAGE = """<!doctype html>
         </div>
       </div>
       {% else %}
-      <div class="card">Aucun match de tennis à venir dans les prochaines 48h.</div>
+      <div class="card">Aucun match de tennis à venir dans cette fenêtre.</div>
       {% endfor %}
     </div>
+    {% endif %}
 
-    <details>
-      <summary>🚑 Alertes blessures / forfaits (3j)</summary>
-      <div class="details-content">
-        {% for cible, titres in r.get("alertes", {}).items() %}
-          <p style="margin-bottom: 10px;">
-            <strong style="color: #fca5a5;">{{ cible }}</strong> :<br>
-            <span style="font-size: 0.9em; color: #cbd5e1;">{{ titres | join(" | ") }}</span>
-          </p>
-        {% else %}
-          <span class="meta">Aucune alerte récente.</span>
-        {% endfor %}
-      </div>
-    </details>
-
-    <details>
-      <summary>🔍 Aperçu données brutes Foot</summary>
-      <div class="details-content">
-        <pre>{{ r.apercu_bruts or "Aucun événement brut." }}</pre>
-      </div>
-    </details>
-
-    <details>
-      <summary>📋 Synthèse Textuelle</summary>
-      <div class="details-content">
-        <pre>{{ r.synthese }}</pre>
-      </div>
-    </details>
-  </div>
-</body>
-</html>
-"""
-
-_HTML_BILAN = """<!doctype html>
-<html lang="fr">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BetPulse Pro — Bilan &amp; Synthèse</title>
-  <style>
-    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 24px; background: #0f172a; color: #e2e8f0; }
-    .container { max-width: 960px; margin: 0 auto; }
-    h1, h2 { color: #38bdf8; }
-    .top-bar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; border-bottom: 1px solid #334155; padding-bottom: 14px; }
-    .btn { background: #38bdf8; color: #0f172a; padding: 8px 14px; border-radius: 6px; text-decoration: none; font-weight: bold; font-size: 0.9rem; }
-    .btn-ghost { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; }
-    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 20px; }
-    .card { background: #1e293b; padding: 16px; border-radius: 8px; border: 1px solid #334155; }
-    .num { font-size: 1.4rem; font-weight: bold; color: #38bdf8; margin-top: 6px; }
-    pre { white-space: pre-wrap; background: #1e293b; padding: 16px; border-radius: 8px; border: 1px solid #334155; line-height: 1.5; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="top-bar">
-      <h1 style="margin: 0;">Bilan &amp; Synthèse</h1>
-      <div style="display: flex; gap: 8px;">
-        <a href="/" class="btn btn-ghost">Accueil</a>
-        <a href="/app" class="btn">Matchs &amp; Pronostics</a>
-      </div>
+    {% if cat in ('all', 'alertes') %}
+    <h2>Alertes blessures / forfaits (3j)</h2>
+    <div class="panel">
+      {% for cible, titres in r.get("alertes", {}).items() %}
+        <p style="margin-bottom: 10px;">
+          <strong style="color: #fca5a5;">{{ cible }}</strong> :<br>
+          <span style="font-size: 0.9em; color: #cbd5e1;">{{ titres | join(" | ") }}</span>
+        </p>
+      {% else %}
+        <span class="meta">Aucune alerte récente.</span>
+      {% endfor %}
     </div>
+    {% endif %}
 
-    <div class="stats">
-      <div class="card"><div>Total enregistrés</div><div class="num">{{ r.get("bilan", {}).get("total", 0) }}</div></div>
-      <div class="card"><div>En attente</div><div class="num">{{ r.get("bilan", {}).get("en_attente", 0) }}</div></div>
-      <div class="card"><div>Vérifiés</div><div class="num">{{ r.get("bilan", {}).get("verifies", 0) }}</div></div>
-      <div class="card"><div>Taux réussite</div><div class="num">{{ r.get("bilan", {}).get("taux", 0.0) }}%</div></div>
+    {% if cat in ('all', 'bilan') %}
+    <h2>Bilan historique &amp; Synthèse</h2>
+    <div class="stats-bar">
+      <span class="stat-item">Total : <strong>{{ r.get("bilan", {}).get("total", 0) }}</strong></span>
+      <span class="stat-item">En attente : <strong>{{ r.get("bilan", {}).get("en_attente", 0) }}</strong></span>
+      <span class="stat-item">Vérifiés : <strong>{{ r.get("bilan", {}).get("verifies", 0) }}</strong></span>
+      <span class="stat-item">Réussite : <strong>{{ r.get("bilan", {}).get("taux", 0.0) }}%</strong></span>
     </div>
-
-    <h2>Synthèse textuelle</h2>
-    <pre>{{ r.synthese or "Aucune synthèse disponible pour le moment." }}</pre>
+    <div class="panel">
+      <pre>{{ r.synthese or "Aucune synthèse disponible pour le moment." }}</pre>
+    </div>
+    {% endif %}
   </div>
 </body>
 </html>
@@ -1201,8 +1195,6 @@ def index():
         _HTML_HOME,
         r=rapport,
         en_cours=en_cours,
-        fenetre_heures=CFG.fenetre_heures,
-        cache_ttl=CFG.cache_ttl_sec,
     ), 200)
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -1210,6 +1202,10 @@ def index():
 
 @app.route("/app")
 def app_view():
+    cat = (request.args.get("cat") or "all").strip().lower()
+    if cat not in {"all", "top", "foot", "tennis", "alertes", "bilan"}:
+        cat = "all"
+
     with _STATE_LOCK:
         rapport = dict(_DERNIER_RAPPORT)
         en_cours = _ANALYSE_EN_COURS
@@ -1221,21 +1217,13 @@ def app_view():
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
 
-    resp = make_response(render_template_string(_HTML_PAGE, r=rapport, en_cours=en_cours), 200)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-@app.route("/bilan")
-def bilan_view():
-    with _STATE_LOCK:
-        rapport = dict(_DERNIER_RAPPORT)
-        en_cours = _ANALYSE_EN_COURS
-
-    if not rapport.get("mis_a_jour") and not en_cours:
-        _demarrer_analyse_si_besoin(0.0)
-
-    resp = make_response(render_template_string(_HTML_BILAN, r=rapport), 200)
+    resp = make_response(render_template_string(
+        _HTML_PAGE,
+        r=rapport,
+        en_cours=en_cours,
+        cat=cat,
+        fenetre_heures=CFG.fenetre_heures,
+    ), 200)
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
