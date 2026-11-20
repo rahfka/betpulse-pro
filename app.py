@@ -2415,13 +2415,13 @@ _HTML_HOME = """<!doctype html>
   }
   * { box-sizing: border-box; }
   html, body {
-    margin: 0; padding: 0; height: 100vh; overflow: hidden;
+    margin: 0; padding: 0; min-height: 100vh; overflow-x: hidden;
     font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
     background: radial-gradient(circle at 50% 30%, #1e293b 0%, var(--bg) 70%);
     color: var(--text);
   }
   .field {
-    position: fixed; inset: 0; overflow: hidden;
+    position: fixed; inset: 0; overflow: hidden; pointer-events: none;
     background-image:
       linear-gradient(rgba(56,189,248,.04) 1px, transparent 1px),
       linear-gradient(90deg, rgba(56,189,248,.04) 1px, transparent 1px);
@@ -2451,29 +2451,33 @@ _HTML_HOME = """<!doctype html>
   .tennis svg {
     width: 100%; height: 100%;
   }
+  .page-wrap {
+    position: relative; z-index: 10;
+    min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    padding: 20px;
+  }
   .center-card {
-    position: absolute; top: 50%; left: 50%;
-    transform: translate(-50%, -50%);
-    z-index: 10; text-align: center;
-    padding: 32px 40px; border-radius: 20px;
-    background: rgba(30, 41, 59, 0.82);
+    text-align: center;
+    padding: 28px 32px; border-radius: 20px;
+    background: rgba(30, 41, 59, 0.86);
     border: 1px solid rgba(56,189,248,.25);
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
     box-shadow: 0 20px 50px rgba(0,0,0,.5);
-    max-width: 440px;
+    max-width: 520px; width: 100%;
     animation: fadeIn .5s ease-out;
   }
   @keyframes fadeIn {
-    from { opacity: 0; transform: translate(-50%, -45%); }
-    to   { opacity: 1; transform: translate(-50%, -50%); }
+    from { opacity: 0; transform: translateY(10px); }
+    to   { opacity: 1; transform: translateY(0); }
   }
   .logo-badge {
     display: inline-flex; align-items: center; justify-content: center;
-    width: 74px; height: 74px; border-radius: 20px;
+    width: 68px; height: 68px; border-radius: 20px;
     background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
-    color: #0f172a; font-weight: 900; font-size: 1.7rem;
-    margin-bottom: 18px;
+    color: #0f172a; font-weight: 900; font-size: 1.6rem;
+    margin-bottom: 14px;
     animation: pulse 2.2s cubic-bezier(.4,0,.6,1) infinite;
   }
   @keyframes pulse {
@@ -2481,9 +2485,46 @@ _HTML_HOME = """<!doctype html>
     70%  { box-shadow: 0 0 0 22px rgba(56,189,248,0); }
     100% { box-shadow: 0 0 0 0 rgba(56,189,248,0); }
   }
-  .title { font-size: 1.9rem; font-weight: 800; margin: 0 0 6px; }
+  .title { font-size: 1.85rem; font-weight: 800; margin: 0 0 6px; }
   .title span { color: var(--accent); }
-  .tagline { color: var(--muted); font-size: .9rem; margin-bottom: 22px; }
+  .tagline { color: var(--muted); font-size: .9rem; margin-bottom: 16px; }
+  .explain-box {
+    text-align: left;
+    background: rgba(15, 23, 42, 0.72);
+    border: 1px solid rgba(148, 163, 184, 0.2);
+    border-radius: 12px;
+    padding: 13px 15px;
+    margin-bottom: 18px;
+    font-size: .84rem;
+    line-height: 1.48;
+    color: #cbd5e1;
+  }
+  .explain-title {
+    font-weight: 700;
+    color: var(--accent);
+    margin-bottom: 6px;
+    font-size: .86rem;
+  }
+  .comp-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  .comp-chip {
+    background: rgba(56, 189, 248, 0.12);
+    border: 1px solid rgba(56, 189, 248, 0.28);
+    color: #e2e8f0;
+    padding: 3px 9px;
+    border-radius: 999px;
+    font-size: .76rem;
+    font-weight: 600;
+  }
+  .comp-chip.tennis-chip {
+    background: rgba(16, 185, 129, 0.14);
+    border-color: rgba(16, 185, 129, 0.35);
+    color: #a7f3d0;
+  }
   .progress {
     height: 6px; border-radius: 999px; overflow: hidden;
     background: rgba(148,163,184,.2); margin-bottom: 14px;
@@ -2553,7 +2594,7 @@ _HTML_HOME = """<!doctype html>
   @media (max-width: 480px) {
     .football { width: 48px; height: 48px; }
     .tennis { width: 42px; height: 42px; }
-    .center-card { padding: 26px 22px; max-width: 92vw; }
+    .center-card { padding: 22px 18px; }
     .title { font-size: 1.6rem; }
   }
 </style>
@@ -2592,15 +2633,38 @@ _HTML_HOME = """<!doctype html>
   </div>
 </div>
 
-<div class="center-card">
-  <div class="logo-badge">BP</div>
-  <h1 class="title">BetPulse <span>Pro</span></h1>
-  <div class="tagline">Préparation des pronostics</div>
-  <div class="progress"><div class="progress-fill"></div></div>
-  <div class="status" id="status">
-    {% if en_cours %}Analyse en cours{% else %}Initialisation des données{% endif %}
+<div class="page-wrap">
+  <div class="center-card">
+    <div class="logo-badge">BP</div>
+    <h1 class="title">BetPulse <span>Pro</span></h1>
+    <div class="tagline">Préparation des pronostics &amp; suivi en direct</div>
+
+    <div class="explain-box">
+      <div class="explain-title">Comment fonctionne BetPulse Pro ?</div>
+      <div>
+        L'outil analyse automatiquement les matchs en cours et à venir sur une fenêtre de {{ fenetre_heures }}h :
+        forme récente, modèle de Poisson pour les buts et scores exacts en football, classements/surfaces en tennis,
+        ainsi que les alertes blessures ou forfaits récents.
+      </div>
+      <div class="comp-list">
+        <span class="comp-chip">⚽ Ligue 1</span>
+        <span class="comp-chip">⚽ Liga</span>
+        <span class="comp-chip">⚽ Liga Portugaise</span>
+        <span class="comp-chip">⚽ Bundesliga</span>
+        <span class="comp-chip">⚽ Serie A</span>
+        <span class="comp-chip">⚽ Premier League</span>
+        <span class="comp-chip">⚽ Ligue des Champions</span>
+        <span class="comp-chip">⚽ Europa League</span>
+        <span class="comp-chip tennis-chip">🎾 ATP / WTA</span>
+      </div>
+    </div>
+
+    <div class="progress"><div class="progress-fill"></div></div>
+    <div class="status" id="status">
+      {% if en_cours %}Analyse en cours{% else %}Initialisation des données{% endif %}
+    </div>
+    <div class="meta" id="meta"></div>
   </div>
-  <div class="meta" id="meta"></div>
 </div>
 
 <script>
@@ -2788,1230 +2852,4 @@ _HTML_PAGE = """<!doctype html>
       font-size: 0.8em; color: var(--muted);
     }
     .odds-chip {
-      background: rgba(251, 191, 36, 0.14); color: #fde68a; border: 1px solid rgba(251, 191, 36, 0.38);
-      padding: 4px 9px; border-radius: 7px; font-weight: 800; font-size: 0.85em;
-    }
-    .fav-empty-box {
-      background: var(--card); border: 1px dashed var(--border); border-radius: 14px;
-      padding: 28px 20px; text-align: center; color: var(--muted); margin-bottom: 24px;
-    }
-    .fav-empty-box strong { color: var(--text); display: block; font-size: 1.05em; margin-bottom: 6px; }
-
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 16px; margin-bottom: 24px; }
-    .card {
-      background: var(--card); padding: 16px; border-radius: 12px;
-      border: 1px solid var(--border); border-left: 4px solid var(--accent);
-      box-shadow: 0 6px 14px rgba(0,0,0,0.18);
-      transition: transform 0.14s ease, background 0.14s ease, border-color 0.14s ease, opacity 0.18s ease;
-    }
-    .card:hover { background: var(--card-hover); transform: translateY(-2px); }
-    .card.HAUTE { border-left-color: var(--green); }
-    .card.MOYENNE { border-left-color: var(--orange); }
-    .card.FAIBLE { border-left-color: var(--red); }
-    .card.live-card { border-left-color: var(--red); border-color: rgba(239, 68, 68, 0.35); }
-    .card.termine-card { border-left-color: #64748b; opacity: 0.92; }
-    .card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
-    .card-title { font-size: 1.02em; font-weight: 700; line-height: 1.3; display: flex; align-items: center; gap: 6px; min-width: 0; }
-    .badges-right { display: flex; align-items: center; gap: 5px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
-    .star-btn {
-      background: rgba(15, 23, 42, 0.85); color: #94a3b8; border: 1px solid var(--border);
-      padding: 4px 8px; border-radius: 8px; font-size: 0.95em; line-height: 1;
-    }
-    .star-btn:hover { color: var(--gold); border-color: rgba(251, 191, 36, 0.5); }
-    .star-btn.active { background: rgba(251, 191, 36, 0.18); color: var(--gold); border-color: rgba(251, 191, 36, 0.55); }
-    .badge { font-size: 0.73em; padding: 3px 7px; border-radius: 999px; font-weight: 800; white-space: nowrap; }
-    .badge.proba { background: rgba(56, 189, 248, 0.16); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35); }
-    .badge.cote { background: rgba(148, 163, 184, 0.18); color: #e2e8f0; border: 1px solid rgba(148, 163, 184, 0.32); }
-    .badge.value { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.45); }
-    .badge.live { background: rgba(239, 68, 68, 0.18); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.45); display: inline-flex; align-items: center; gap: 5px; }
-    .badge.termine { background: rgba(148, 163, 184, 0.18); color: #cbd5e1; border: 1px solid rgba(148, 163, 184, 0.35); }
-    .badge.a-venir { background: rgba(56, 189, 248, 0.15); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35); }
-    .badge.gagne { background: rgba(16, 185, 129, 0.22); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.45); }
-    .badge.perdu { background: rgba(239, 68, 68, 0.22); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.45); }
-    .badge.HAUTE { background: rgba(16, 185, 129, 0.2); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.4); }
-    .badge.MOYENNE { background: rgba(245, 158, 11, 0.2); color: #fcd34d; border: 1px solid rgba(245, 158, 11, 0.4); }
-    .badge.FAIBLE { background: rgba(239, 68, 68, 0.2); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); }
-    .badge.imminent { background: rgba(239, 68, 68, 0.15); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.4); display: inline-flex; align-items: center; gap: 4px; }
-    .dot-red { width: 8px; height: 8px; background-color: #ef4444; border-radius: 50%; animation: pulse-red 1.5s infinite; }
-    @keyframes pulse-red { 0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); } 70% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); } 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); } }
-    .card-meta { font-size: 0.86em; color: var(--muted); margin-bottom: 10px; line-height: 1.45; }
-    .card-meta strong { color: var(--text); }
-    .score-box {
-      margin-top: 6px; padding: 7px 9px; border-radius: 8px;
-      background: rgba(15, 23, 42, 0.72); border: 1px solid rgba(56, 189, 248, 0.22);
-    }
-    .score-main { color: var(--accent); font-weight: 700; font-size: 0.92em; }
-    .live-score-box {
-      display: flex; justify-content: space-between; align-items: center;
-      background: rgba(239, 68, 68, 0.1); border: 1px solid rgba(239, 68, 68, 0.3);
-      border-radius: 8px; padding: 8px 11px; margin-bottom: 10px;
-    }
-    .final-score-box {
-      display: flex; justify-content: space-between; align-items: center;
-      background: rgba(148, 163, 184, 0.12); border: 1px solid rgba(148, 163, 184, 0.32);
-      border-radius: 8px; padding: 8px 11px; margin-bottom: 10px;
-    }
-    .live-score-val { font-size: 1.08em; font-weight: 800; color: #f8fafc; }
-    .pred-box {
-      background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.32);
-      border-radius: 8px; padding: 9px 11px; margin-top: 8px;
-    }
-    .pred-label { font-size: 0.73em; text-transform: uppercase; letter-spacing: 0.04em; color: #7dd3fc; font-weight: 800; margin-bottom: 3px; }
-    .pred-choice { font-size: 0.96em; font-weight: 800; color: #f8fafc; }
-    .pred-sub { font-size: 0.78em; color: var(--muted); margin-top: 2px; }
-    .conf-meter { margin: 8px 0 4px 0; }
-    .conf-label { display: flex; justify-content: space-between; font-size: 0.76em; color: var(--muted); margin-bottom: 4px; }
-    .meter-track { height: 6px; background: #0b1220; border-radius: 999px; overflow: hidden; }
-    .meter-fill { height: 100%; border-radius: 999px; background: var(--accent); }
-    .card.HAUTE .meter-fill { background: var(--green); }
-    .card.MOYENNE .meter-fill { background: var(--orange); }
-    .card.FAIBLE .meter-fill { background: var(--red); }
-    .card-detail {
-      font-size: 0.8em; color: #cbd5e1; background: #0b1220; border: 1px solid rgba(36, 51, 77, 0.8);
-      padding: 8px 10px; border-radius: 8px; margin-top: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      line-height: 1.4;
-    }
-    .panel { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 24px; }
-    .stats-bar { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
-    .stat-item { background: var(--card); border: 1px solid var(--border); padding: 8px 13px; border-radius: 999px; font-size: 0.84em; }
-    pre { white-space: pre-wrap; background: #0b1220; border: 1px solid var(--border); padding: 14px; border-radius: 8px; overflow-x: auto; font-size: 0.85em; margin: 0; line-height: 1.5; }
-    .notice { background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #bae6fd; padding: 10px 14px; border-radius: 10px; margin-bottom: 18px; font-size: 0.9em; }
-    .notice.warn { background: rgba(245, 158, 11, 0.14); border-color: rgba(245, 158, 11, 0.45); color: #fde68a; }
-    .notice.ok { background: rgba(16, 185, 129, 0.14); border-color: rgba(16, 185, 129, 0.42); color: #a7f3d0; }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <div>
-        <a href="/" class="brand-link" title="Retour à l'accueil">
-          <span class="brand-badge">BP</span>
-          <h1 style="margin: 0;">BetPulse Pro{% if page_favoris %} — Favoris{% endif %}</h1>
-        </a><br>
-        <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }} • Fenêtre : {{ fenetre_heures }}h • <span id="compteur-cartes">Filtre actif</span></span>
-      </div>
-      <div class="header-actions">
-        {% if page_favoris %}
-        <a href="{{ url_for('app_view', cat='all') }}" class="btn btn-cat">← Tous les matchs</a>
-        {% endif %}
-        <form id="refresh-form" method="post" action="/refresh" style="margin: 0;" onsubmit="return soumettreRefresh(event);">
-          <input type="hidden" name="admin_token" id="refresh-admin-token" value="">
-          <button id="btn-refresh" type="submit">↻ Actualiser</button>
-        </form>
-      </div>
-    </div>
-
-    <div id="action-banner" class="notice warn" style="display: none;"></div>
-
-    <div class="cat-bar">
-      <a href="{{ url_for('app_view', cat='all') }}" class="btn btn-cat {% if not page_favoris and cat == 'all' %}active{% endif %}">Tout</a>
-      <a href="{{ url_for('app_view', cat='favoris') }}" class="btn btn-cat {% if page_favoris or cat == 'favoris' %}active{% endif %}">★ Favoris (<span id="fav-count-tab">{{ r.favoris_suivis|length }}</span>)</a>
-      <a href="{{ url_for('app_view', cat='live') }}" class="btn btn-cat {% if not page_favoris and cat == 'live' %}active{% endif %}">En cours ({{ r.en_cours_matchs|length }})</a>
-      <a href="{{ url_for('app_view', cat='top') }}" class="btn btn-cat {% if not page_favoris and cat == 'top' %}active{% endif %}">Top Pronostics ({{ r.top_sur|length }})</a>
-      <a href="{{ url_for('app_view', cat='foot') }}" class="btn btn-cat {% if not page_favoris and cat == 'foot' %}active{% endif %}">Football ({{ r.foot|length }})</a>
-      <a href="{{ url_for('app_view', cat='tennis') }}" class="btn btn-cat {% if not page_favoris and cat == 'tennis' %}active{% endif %}">Tennis ({{ r.tennis|length }})</a>
-      <a href="{{ url_for('app_view', cat='alertes') }}" class="btn btn-cat {% if not page_favoris and cat == 'alertes' %}active{% endif %}">Alertes ({{ r.get('alertes', {})|length }})</a>
-      <a href="{{ url_for('app_view', cat='bilan') }}" class="btn btn-cat {% if not page_favoris and cat == 'bilan' %}active{% endif %}">Bilan &amp; Synthèse</a>
-    </div>
-
-    <div class="toolbar">
-      <input id="search-input" class="search-input" type="search" placeholder="Rechercher une équipe, un joueur, une compétition…" oninput="appliquerFiltres()">
-      <div class="filter-pills">
-        <button type="button" class="pill-btn active" data-conf="ALL" onclick="setConf('ALL', this)">Confiance : Tous</button>
-        <button type="button" class="pill-btn" data-conf="HAUTE" onclick="setConf('HAUTE', this)">Haute</button>
-        <button type="button" class="pill-btn" data-conf="MOYENNE" onclick="setConf('MOYENNE', this)">Moyenne</button>
-        <button type="button" class="pill-btn" data-conf="FAIBLE" onclick="setConf('FAIBLE', this)">Faible</button>
-        <select id="proba-min" onchange="appliquerFiltres()" title="Probabilité minimale">
-          <option value="0">Proba min : Tous</option>
-          <option value="55">≥ 55%</option>
-          <option value="65">≥ 65%</option>
-          <option value="75">≥ 75%</option>
-        </select>
-        <select id="sort-mode" onchange="trierCartes()" title="Tri des cartes">
-          <option value="date" selected>Tri : Date match</option>
-          <option value="conf">Tri : Confiance</option>
-          <option value="proba">Tri : Probabilité</option>
-        </select>
-      </div>
-    </div>
-
-    {% if en_cours %}
-    <div class="notice">Mise à jour en arrière-plan en cours — les données affichées restent accessibles.</div>
-    {% endif %}
-
-    {% if page_favoris or cat == 'favoris' %}
-    {% set fav_live = [] %}
-    {% set fav_upcoming = [] %}
-    {% set fav_done = [] %}
-    {% for it in r.favoris_suivis %}
-      {% set st_etat = (it.get('etat_match') or 'A_VENIR')|upper %}
-      {% if st_etat == 'EN_COURS' %}
-        {% set _ = fav_live.append(it) %}
-      {% elif st_etat == 'TERMINE' %}
-        {% set _ = fav_done.append(it) %}
-      {% else %}
-        {% set _ = fav_upcoming.append(it) %}
-      {% endif %}
-    {% endfor %}
-
-    <div class="fav-summary-bar" id="fav-summary-bar">
-      <div class="fav-kpis">
-        <span class="fav-kpi gold">★ Suivis : <strong id="kpi-fav-total">{{ r.favoris_suivis|length }}</strong></span>
-        <span class="fav-kpi live">● En cours : <strong id="kpi-fav-live">{{ fav_live|length }}</strong></span>
-        <span class="fav-kpi">⏱ À venir : <strong id="kpi-fav-upcoming">{{ fav_upcoming|length }}</strong></span>
-        <span class="fav-kpi">✓ Terminés : <strong id="kpi-fav-done">{{ fav_done|length }}</strong></span>
-      </div>
-      <div class="header-actions">
-        <button type="button" class="btn-ghost" onclick="setFavGroupFilter('ALL', this)" id="fav-filter-all">Tous</button>
-        <button type="button" class="btn-ghost" onclick="setFavGroupFilter('ACTIFS', this)" id="fav-filter-actifs">Actifs (Live + À venir)</button>
-        <button type="button" class="btn-danger-ghost" id="btn-clear-done" onclick="nettoyerTermines()" {% if fav_done|length == 0 %}disabled{% endif %}>
-          🗑 Effacer terminés (<span id="kpi-fav-done-btn">{{ fav_done|length }}</span>)
-        </button>
-      </div>
-    </div>
-
-    <div id="favoris-container">
-      {% if r.favoris_suivis|length == 0 %}
-      <div class="fav-empty-box" id="fav-empty-msg">
-        <strong>Aucun match dans votre liste de favoris</strong>
-        Cliquez sur ☆ sur n'importe quel match (En cours, Top Pronostics, Foot ou Tennis) pour l'épingler ici et suivre son résultat même après la fin.
-      </div>
-      {% else %}
-
-      <div class="fav-group-section" data-fav-group="ACTIFS" id="fav-sec-live" {% if fav_live|length == 0 %}style="display:none;"{% endif %}>
-        <div class="fav-section-header">
-          <div class="fav-section-title"><span class="dot-red"></span> En direct <span class="fav-count-pill" id="cnt-fav-live">{{ fav_live|length }}</span></div>
-        </div>
-        <div class="grid" id="fav-grid-live">
-          {% for it in fav_live %}
-          {% set conf = it.get('confiance', 'MOYENNE') %}
-          {% set conf_sc = it.get('confiance_score', 50.0) %}
-          {% set ts_m = it.get('ts_match', 9999999999.0) %}
-          <div class="card live-card {{ conf }}"
-               data-fav-card="1"
-               data-fav-state="EN_COURS"
-               data-cle-favori="{{ it.get('cle_favori', '') }}"
-               data-conf="{{ conf }}"
-               data-proba="{{ it.proba or 0 }}"
-               data-conf-score="{{ conf_sc }}"
-               data-ts="{{ ts_m }}"
-               data-search="{{ ((it.choix or '') ~ ' ' ~ (it.match or '') ~ ' ' ~ (it.competition or '') ~ ' ' ~ (it.score_actuel or '') ~ ' ' ~ (it.detail or ''))|lower }}">
-            <div class="card-top">
-              <div class="card-title">{% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}</div>
-              <div class="badges-right">
-                <span class="badge live"><span class="dot-red"></span> {{ it.chrono_live or 'LIVE' }}</span>
-                <button type="button" class="star-btn active" title="Retirer des favoris" onclick="toggleFavori(this)"
-                        data-cle-favori="{{ it.get('cle_favori', '') }}" data-sport="{{ it.sport or 'FOOT' }}"
-                        data-event-id="{{ it.event_id or '' }}" data-match="{{ it.match or '' }}"
-                        data-competition="{{ it.competition or '' }}" data-date-match="{{ it.date_match or '' }}"
-                        data-ts-match="{{ ts_m }}" data-choix="{{ it.choix or '' }}"
-                        data-proba="{{ it.proba if it.proba is not none else '' }}" data-cote="{{ it.cote if it.cote is not none else '' }}"
-                        data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}" data-confiance="{{ conf }}"
-                        data-confiance-score="{{ conf_sc }}" data-detail="{{ it.detail or '' }}">★</button>
-              </div>
-            </div>
-            <div class="card-meta">{{ it.competition or it.sport }} • {{ it.date_match }}</div>
-            <div class="live-score-box">
-              <span class="meta">Score en direct</span>
-              <span class="live-score-val">{{ it.score_actuel or 'En cours' }}</span>
-            </div>
-            <div class="pred-box">
-              <div class="pred-label">Sélection suivie</div>
-              <div class="pred-choice">{{ it.choix or 'Non défini' }}</div>
-              <div class="pred-sub">
-                {% if it.proba is not none %}Proba : <strong>{{ it.proba }}%</strong>{% endif %}
-                {% if it.cote %} • Cote : <strong>{{ it.cote }}</strong>{% endif %}
-              </div>
-            </div>
-            <div class="fav-slip-footer">
-              <span>Mise suggérée : <strong>{{ it.mise_u if it.mise_u is not none else '-' }}u</strong></span>
-              {% if it.cote %}<span class="odds-chip">@ {{ it.cote }}</span>{% endif %}
-            </div>
-          </div>
-          {% endfor %}
-        </div>
-      </div>
-
-      <div class="fav-group-section" data-fav-group="ACTIFS" id="fav-sec-upcoming" {% if fav_upcoming|length == 0 %}style="display:none;"{% endif %}>
-        <div class="fav-section-header">
-          <div class="fav-section-title">⏱ À venir <span class="fav-count-pill" id="cnt-fav-upcoming">{{ fav_upcoming|length }}</span></div>
-        </div>
-        <div class="grid" id="fav-grid-upcoming">
-          {% for it in fav_upcoming %}
-          {% set conf = it.get('confiance', 'MOYENNE') %}
-          {% set conf_sc = it.get('confiance_score', 50.0) %}
-          {% set ts_m = it.get('ts_match', 9999999999.0) %}
-          <div class="card {{ conf }}"
-               data-fav-card="1"
-               data-fav-state="A_VENIR"
-               data-cle-favori="{{ it.get('cle_favori', '') }}"
-               data-conf="{{ conf }}"
-               data-proba="{{ it.proba or 0 }}"
-               data-conf-score="{{ conf_sc }}"
-               data-ts="{{ ts_m }}"
-               data-search="{{ ((it.choix or '') ~ ' ' ~ (it.match or '') ~ ' ' ~ (it.competition or '') ~ ' ' ~ (it.detail or ''))|lower }}">
-            <div class="card-top">
-              <div class="card-title">{% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}</div>
-              <div class="badges-right">
-                <span class="badge a-venir">À VENIR</span>
-                <button type="button" class="star-btn active" title="Retirer des favoris" onclick="toggleFavori(this)"
-                        data-cle-favori="{{ it.get('cle_favori', '') }}" data-sport="{{ it.sport or 'FOOT' }}"
-                        data-event-id="{{ it.event_id or '' }}" data-match="{{ it.match or '' }}"
-                        data-competition="{{ it.competition or '' }}" data-date-match="{{ it.date_match or '' }}"
-                        data-ts-match="{{ ts_m }}" data-choix="{{ it.choix or '' }}"
-                        data-proba="{{ it.proba if it.proba is not none else '' }}" data-cote="{{ it.cote if it.cote is not none else '' }}"
-                        data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}" data-confiance="{{ conf }}"
-                        data-confiance-score="{{ conf_sc }}" data-detail="{{ it.detail or '' }}">★</button>
-              </div>
-            </div>
-            <div class="card-meta">{{ it.competition or it.sport }} • {{ it.date_match }}</div>
-            <div class="pred-box">
-              <div class="pred-label">Sélection suivie</div>
-              <div class="pred-choice">{{ it.choix or 'Non défini' }}</div>
-              <div class="pred-sub">
-                {% if it.proba is not none %}Proba : <strong>{{ it.proba }}%</strong>{% endif %}
-                • Confiance : <strong>{{ conf }}</strong>
-              </div>
-            </div>
-            <div class="fav-slip-footer">
-              <span>Mise : <strong>{{ it.mise_u if it.mise_u is not none else '-' }}u</strong></span>
-              {% if it.cote %}<span class="odds-chip">@ {{ it.cote }}</span>{% endif %}
-            </div>
-          </div>
-          {% endfor %}
-        </div>
-      </div>
-
-      <div class="fav-group-section" data-fav-group="TERMINE" id="fav-sec-done" {% if fav_done|length == 0 %}style="display:none;"{% endif %}>
-        <div class="fav-section-header">
-          <div class="fav-section-title">✓ Terminés <span class="fav-count-pill" id="cnt-fav-done">{{ fav_done|length }}</span></div>
-        </div>
-        <div class="grid" id="fav-grid-done">
-          {% for it in fav_done %}
-          {% set conf = it.get('confiance', 'MOYENNE') %}
-          {% set conf_sc = it.get('confiance_score', 50.0) %}
-          {% set ts_m = it.get('ts_match', 9999999999.0) %}
-          <div class="card termine-card {{ conf }}"
-               data-fav-card="1"
-               data-fav-state="TERMINE"
-               data-cle-favori="{{ it.get('cle_favori', '') }}"
-               data-conf="{{ conf }}"
-               data-proba="{{ it.proba or 0 }}"
-               data-conf-score="{{ conf_sc }}"
-               data-ts="{{ ts_m }}"
-               data-search="{{ ((it.choix or '') ~ ' ' ~ (it.match or '') ~ ' ' ~ (it.competition or '') ~ ' ' ~ (it.score_final or '') ~ ' ' ~ (it.detail or ''))|lower }}">
-            <div class="card-top">
-              <div class="card-title">{% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}</div>
-              <div class="badges-right">
-                <span class="badge termine">TERMINÉ</span>
-                {% if it.get('statut_prono') == 'GAGNE' %}
-                  <span class="badge gagne">GAGNÉ</span>
-                {% elif it.get('statut_prono') == 'PERDU' %}
-                  <span class="badge perdu">PERDU</span>
-                {% endif %}
-                <button type="button" class="star-btn active" title="Retirer des favoris" onclick="toggleFavori(this)"
-                        data-cle-favori="{{ it.get('cle_favori', '') }}" data-sport="{{ it.sport or 'FOOT' }}"
-                        data-event-id="{{ it.event_id or '' }}" data-match="{{ it.match or '' }}"
-                        data-competition="{{ it.competition or '' }}" data-date-match="{{ it.date_match or '' }}"
-                        data-ts-match="{{ ts_m }}" data-choix="{{ it.choix or '' }}"
-                        data-proba="{{ it.proba if it.proba is not none else '' }}" data-cote="{{ it.cote if it.cote is not none else '' }}"
-                        data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}" data-confiance="{{ conf }}"
-                        data-confiance-score="{{ conf_sc }}" data-detail="{{ it.detail or '' }}">★</button>
-              </div>
-            </div>
-            <div class="card-meta">{{ it.competition or it.sport }} • {{ it.date_match }}</div>
-            <div class="final-score-box">
-              <span class="meta">Score final</span>
-              <span class="live-score-val">{{ it.score_final or 'Terminé' }}</span>
-            </div>
-            <div class="pred-box">
-              <div class="pred-label">Pronostic</div>
-              <div class="pred-choice">{{ it.choix or 'Non défini' }}</div>
-              <div class="pred-sub">
-                {% if it.proba is not none %}Proba : <strong>{{ it.proba }}%</strong>{% endif %}
-                {% if it.cote %} • Cote : <strong>{{ it.cote }}</strong>{% endif %}
-              </div>
-            </div>
-          </div>
-          {% endfor %}
-        </div>
-      </div>
-      {% endif %}
-    </div>
-    {% endif %}
-
-    {% if not page_favoris %}
-      {% if cat in ('all', 'live') %}
-      <h2><span class="dot-red"></span> Matchs en cours ({{ r.en_cours_matchs|length }})</h2>
-      <div class="grid">
-        {% for it in r.en_cours_matchs %}
-        {% set conf = it.get('confiance', 'MOYENNE') %}
-        {% set conf_sc = it.get('confiance_score', it.proba) %}
-        {% set ts_m = it.get('ts_match', 9999999999.0) %}
-        {% set is_fav = it.get('est_favori', False) %}
-        {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else (it.pronostic_proba or it.proba) %}
-        <div class="card live-card {{ conf }}"
-             data-conf="{{ conf }}"
-             data-proba="{{ it.pronostic_proba or it.proba }}"
-             data-conf-score="{{ conf_sc }}"
-             data-ts="{{ ts_m }}"
-             data-search="{{ ((it.pronostic_predi or it.choix) ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.score_actuel or '') ~ ' ' ~ (it.score_exact or ''))|lower }}">
-          <div class="card-top">
-            <div class="card-title">
-              {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.match }}
-            </div>
-            <div class="badges-right">
-              <span class="badge live"><span class="dot-red"></span> {{ it.chrono_live or 'LIVE' }}</span>
-              <button type="button"
-                      class="star-btn {% if is_fav %}active{% endif %}"
-                      title="{% if is_fav %}Retirer des favoris{% else %}Ajouter aux favoris{% endif %}"
-                      onclick="toggleFavori(this)"
-                      data-cle-favori="{{ it.get('cle_favori', '') }}"
-                      data-sport="{{ it.sport or 'FOOT' }}"
-                      data-event-id="{{ it.event_id or '' }}"
-                      data-match="{{ it.match or '' }}"
-                      data-competition="{{ it.competition or '' }}"
-                      data-date-match="{{ it.date_match or '' }}"
-                      data-ts-match="{{ ts_m }}"
-                      data-choix="{{ it.pronostic_predi or it.choix or '' }}"
-                      data-proba="{{ it.pronostic_proba or it.proba or '' }}"
-                      data-cote="{{ it.pronostic_cote or it.cote or '' }}"
-                      data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
-                      data-confiance="{{ conf }}"
-                      data-confiance-score="{{ conf_sc }}"
-                      data-detail="{{ it.detail or '' }}">{% if is_fav %}★{% else %}☆{% endif %}</button>
-            </div>
-          </div>
-          <div class="card-meta">
-            {{ it.competition }} • Début : {{ it.date_match }}
-            {% if it.get('score_exact') %}
-            <div class="score-box">
-              <div class="score-main">Score exact cohérent : {{ it.score_exact }} ({{ pct_score }}%)</div>
-            </div>
-            {% endif %}
-          </div>
-          <div class="live-score-box">
-            <span class="meta">Score actuel</span>
-            <span class="live-score-val">{{ it.score_actuel or 'En cours' }}</span>
-          </div>
-          <div class="pred-box">
-            <div class="pred-label">Pronostic prédit ({{ it.pronostic_source or 'Bot' }})</div>
-            <div class="pred-choice">{{ it.pronostic_predi or it.choix }}</div>
-            <div class="pred-sub">
-              Proba : <strong>{{ it.pronostic_proba or it.proba }}%</strong>
-              {% if it.pronostic_cote or it.cote %} • Cote : <strong>{{ it.pronostic_cote or it.cote }}</strong>{% endif %}
-              • Statut : <strong>{{ it.pronostic_statut or 'EN_ATTENTE' }}</strong>
-            </div>
-          </div>
-        </div>
-        {% else %}
-        <div class="card">Aucun match en cours pour le moment.</div>
-        {% endfor %}
-      </div>
-      {% endif %}
-
-      {% if cat in ('all', 'top') %}
-      <h2>★ Top pronostics (Foot &amp; Tennis)</h2>
-      <div class="grid">
-        {% for it in r.top_sur %}
-        {% set conf = it.get('confiance', 'MOYENNE') %}
-        {% set conf_sc = it.get('confiance_score', it.proba) %}
-        {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
-        {% set ts_m = it.get('ts_match', 9999999999.0) %}
-        {% set is_fav = it.get('est_favori', False) %}
-        <div class="card {{ conf }}"
-             data-conf="{{ conf }}"
-             data-proba="{{ it.proba }}"
-             data-conf-score="{{ conf_sc }}"
-             data-ts="{{ ts_m }}"
-             data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.score_exact or '') ~ ' ' ~ (it.detail or ''))|lower }}">
-          <div class="card-top">
-            <div class="card-title">
-              {% if it.sport == 'FOOT' %}⚽{% else %}🎾{% endif %} {{ it.choix }}
-            </div>
-            <div class="badges-right">
-              {% if it.get('est_value_bet') %}
-              <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
-              {% endif %}
-              {% if it.get('cote') %}
-              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
-              {% endif %}
-              <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
-              {% if it.get('est_imminent') %}
-              <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
-              {% endif %}
-              <button type="button"
-                      class="star-btn {% if is_fav %}active{% endif %}"
-                      title="{% if is_fav %}Retirer des favoris{% else %}Ajouter aux favoris{% endif %}"
-                      onclick="toggleFavori(this)"
-                      data-cle-favori="{{ it.get('cle_favori', '') }}"
-                      data-sport="{{ it.sport or 'FOOT' }}"
-                      data-event-id="{{ it.event_id or '' }}"
-                      data-match="{{ it.match or '' }}"
-                      data-competition="{{ it.competition or '' }}"
-                      data-date-match="{{ it.date_match or '' }}"
-                      data-ts-match="{{ ts_m }}"
-                      data-choix="{{ it.choix or '' }}"
-                      data-proba="{{ it.proba if it.proba is not none else '' }}"
-                      data-cote="{{ it.cote if it.cote is not none else '' }}"
-                      data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
-                      data-confiance="{{ conf }}"
-                      data-confiance-score="{{ conf_sc }}"
-                      data-detail="{{ it.detail or '' }}">{% if is_fav %}★{% else %}☆{% endif %}</button>
-            </div>
-          </div>
-          <div class="card-meta">
-            <strong>{{ it.match }}</strong><br>
-            {{ it.date_match }} — {{ it.competition }}
-            {% if it.get('score_exact') %}
-            <div class="score-box">
-              <div class="score-main">Score exact cohérent : {{ it.score_exact }} ({{ pct_score }}%)</div>
-            </div>
-            {% endif %}
-          </div>
-          <div class="conf-meter">
-            <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
-            <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
-          </div>
-          {% if it.detail %}
-          <div class="card-detail">{{ it.detail }}</div>
-          {% endif %}
-        </div>
-        {% else %}
-        <div class="card">Aucun pronostic disponible.</div>
-        {% endfor %}
-      </div>
-      {% endif %}
-
-      {% if cat in ('all', 'foot') %}
-      <h2>⚽ Matchs de Foot à venir — {{ fenetre_heures }}h ({{ r.foot|length }})</h2>
-      <div class="stats-bar">
-        {% for k, v in r.get("stats_comp", {}).items() %}
-          <span class="stat-item"><strong>{{ k }}</strong> : {{ v }}</span>
-        {% endfor %}
-      </div>
-      <div class="grid">
-        {% for it in r.foot %}
-        {% set conf = it.get('confiance', 'MOYENNE') %}
-        {% set conf_sc = it.get('confiance_score', it.proba) %}
-        {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
-        {% set ts_m = it.get('ts_match', 9999999999.0) %}
-        {% set is_fav = it.get('est_favori', False) %}
-        <div class="card {{ conf }}"
-             data-conf="{{ conf }}"
-             data-proba="{{ it.proba }}"
-             data-conf-score="{{ conf_sc }}"
-             data-ts="{{ ts_m }}"
-             data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.score_exact or '') ~ ' ' ~ (it.detail or ''))|lower }}">
-          <div class="card-top">
-            <div class="card-title">⚽ {{ it.choix }}</div>
-            <div class="badges-right">
-              {% if it.get('est_value_bet') %}
-              <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
-              {% endif %}
-              {% if it.get('cote') %}
-              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
-              {% endif %}
-              <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
-              {% if it.get('est_imminent') %}
-              <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
-              {% endif %}
-              <button type="button"
-                      class="star-btn {% if is_fav %}active{% endif %}"
-                      title="{% if is_fav %}Retirer des favoris{% else %}Ajouter aux favoris{% endif %}"
-                      onclick="toggleFavori(this)"
-                      data-cle-favori="{{ it.get('cle_favori', '') }}"
-                      data-sport="{{ it.sport or 'FOOT' }}"
-                      data-event-id="{{ it.event_id or '' }}"
-                      data-match="{{ it.match or '' }}"
-                      data-competition="{{ it.competition or '' }}"
-                      data-date-match="{{ it.date_match or '' }}"
-                      data-ts-match="{{ ts_m }}"
-                      data-choix="{{ it.choix or '' }}"
-                      data-proba="{{ it.proba if it.proba is not none else '' }}"
-                      data-cote="{{ it.cote if it.cote is not none else '' }}"
-                      data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
-                      data-confiance="{{ conf }}"
-                      data-confiance-score="{{ conf_sc }}"
-                      data-detail="{{ it.detail or '' }}">{% if is_fav %}★{% else %}☆{% endif %}</button>
-            </div>
-          </div>
-          <div class="card-meta">
-            <strong>{{ it.match }}</strong><br>
-            {{ it.date_match }}
-            {% if it.get('score_exact') %}
-            <div class="score-box">
-              <div class="score-main">Score exact cohérent : {{ it.score_exact }} ({{ pct_score }}%)</div>
-            </div>
-            {% endif %}
-          </div>
-          <div class="conf-meter">
-            <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
-            <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
-          </div>
-          <div class="card-detail">{{ it.detail }}</div>
-        </div>
-        {% else %}
-        <div class="card">Aucun match de foot à venir dans cette fenêtre.</div>
-        {% endfor %}
-      </div>
-      {% endif %}
-
-      {% if cat in ('all', 'tennis') %}
-      <h2>🎾 Matchs de Tennis à venir — {{ fenetre_heures }}h ({{ r.tennis|length }})</h2>
-      <div class="grid">
-        {% for it in r.tennis %}
-        {% set conf = it.get('confiance', 'MOYENNE') %}
-        {% set conf_sc = it.get('confiance_score', it.proba) %}
-        {% set pct_score = it.get('score_exact_proba') if it.get('score_exact_proba') is not none else it.proba %}
-        {% set ts_m = it.get('ts_match', 9999999999.0) %}
-        {% set is_fav = it.get('est_favori', False) %}
-        <div class="card {{ conf }}"
-             data-conf="{{ conf }}"
-             data-proba="{{ it.proba }}"
-             data-conf-score="{{ conf_sc }}"
-             data-ts="{{ ts_m }}"
-             data-search="{{ (it.choix ~ ' ' ~ it.match ~ ' ' ~ it.competition ~ ' ' ~ (it.detail or ''))|lower }}">
-          <div class="card-top">
-            <div class="card-title">🎾 {{ it.choix }}</div>
-            <div class="badges-right">
-              {% if it.get('est_value_bet') %}
-              <span class="badge value" title="Cote réelle supérieure ou égale à la cote minimale">VALUE +{{ it.get('ecart_value_pct', 0) }}%</span>
-              {% endif %}
-              {% if it.get('cote') %}
-              <span class="badge cote" title="{{ it.get('cote_source', 'Moyenne bookmakers') }}">Cote {{ it.cote }}</span>
-              {% endif %}
-              <span class="badge proba" title="Probabilité estimée">{{ pct_score }}%</span>
-              {% if it.get('est_imminent') %}
-              <span class="badge imminent"><span class="dot-red"></span> Imminent</span>
-              {% endif %}
-              <button type="button"
-                      class="star-btn {% if is_fav %}active{% endif %}"
-                      title="{% if is_fav %}Retirer des favoris{% else %}Ajouter aux favoris{% endif %}"
-                      onclick="toggleFavori(this)"
-                      data-cle-favori="{{ it.get('cle_favori', '') }}"
-                      data-sport="{{ it.sport or 'TENNIS' }}"
-                      data-event-id="{{ it.event_id or '' }}"
-                      data-match="{{ it.match or '' }}"
-                      data-competition="{{ it.competition or '' }}"
-                      data-date-match="{{ it.date_match or '' }}"
-                      data-ts-match="{{ ts_m }}"
-                      data-choix="{{ it.choix or '' }}"
-                      data-proba="{{ it.proba if it.proba is not none else '' }}"
-                      data-cote="{{ it.cote if it.cote is not none else '' }}"
-                      data-mise-u="{{ it.mise_u if it.mise_u is not none else '' }}"
-                      data-confiance="{{ conf }}"
-                      data-confiance-score="{{ conf_sc }}"
-                      data-detail="{{ it.detail or '' }}">{% if is_fav %}★{% else %}☆{% endif %}</button>
-            </div>
-          </div>
-          <div class="card-meta">
-            <strong>{{ it.match }}</strong><br>
-            {{ it.date_match }} — {{ it.competition }}
-          </div>
-          <div class="conf-meter">
-            <div class="conf-label"><span>Indice de confiance ({{ conf }})</span><span>{{ conf_sc }}/100</span></div>
-            <div class="meter-track"><div class="meter-fill" style="width: {{ conf_sc }}%;"></div></div>
-          </div>
-          {% if it.detail %}
-          <div class="card-detail">{{ it.detail }}</div>
-          {% endif %}
-        </div>
-        {% else %}
-        <div class="card">Aucun match de tennis à venir dans cette fenêtre.</div>
-        {% endfor %}
-      </div>
-      {% endif %}
-
-      {% if cat in ('all', 'alertes') %}
-      <h2>🩺 Alertes blessures / forfaits (2j)</h2>
-      <div class="panel">
-        {% for cible, titres in r.get("alertes", {}).items() %}
-          <p style="margin-bottom: 10px;">
-            <strong style="color: #fca5a5;">{{ cible }}</strong> :<br>
-            <span style="font-size: 0.9em; color: #cbd5e1;">{{ titres | join(" | ") }}</span>
-          </p>
-        {% else %}
-          <span class="meta">Aucune alerte récente.</span>
-        {% endfor %}
-      </div>
-      {% endif %}
-
-      {% if cat in ('all', 'bilan') %}
-      <h2>📊 Bilan historique &amp; Synthèse</h2>
-      <div class="stats-bar">
-        <span class="stat-item">Total : <strong>{{ r.get("bilan", {}).get("total", 0) }}</strong></span>
-        <span class="stat-item">En attente : <strong>{{ r.get("bilan", {}).get("en_attente", 0) }}</strong></span>
-        <span class="stat-item">Vérifiés : <strong>{{ r.get("bilan", {}).get("verifies", 0) }}</strong></span>
-        <span class="stat-item">Réussite : <strong>{{ r.get("bilan", {}).get("taux", 0.0) }}%</strong></span>
-        <span class="stat-item">PnL : <strong>{{ r.get("bilan", {}).get("pnl_total", 0.0) }}u</strong></span>
-      </div>
-      <div class="panel">
-        <pre>{{ r.synthese or "Aucune synthèse disponible pour le moment." }}</pre>
-      </div>
-      {% endif %}
-    {% endif %}
-  </div>
-
-  <script>
-    let confActif = "ALL";
-    let favGroupFilter = "ALL";
-    const PAGE_FAVORIS = {{ "true" if (page_favoris or cat == "favoris") else "false" }};
-    const TOKEN_REQUIS = {{ "true" if token_requis else "false" }};
-
-    function afficherBanniere(msg, type = "warn") {
-      const b = document.getElementById("action-banner");
-      if (!b) return;
-      b.className = "notice " + type;
-      b.textContent = msg;
-      b.style.display = msg ? "" : "none";
-    }
-
-    function obtenirTokenAdmin() {
-      let tok = "";
-      try { tok = localStorage.getItem("betpulse_admin_token") || ""; } catch (e) {}
-      if (!tok && TOKEN_REQUIS) {
-        tok = (window.prompt("Token d'administration requis pour cette action :") || "").trim();
-        if (tok) {
-          try { localStorage.setItem("betpulse_admin_token", tok); } catch (e) {}
-        }
-      }
-      return tok;
-    }
-
-    async function soumettreRefresh(ev) {
-      if (ev) ev.preventDefault();
-      const btn = document.getElementById("btn-refresh");
-      const tok = obtenirTokenAdmin();
-      const hiddenTok = document.getElementById("refresh-admin-token");
-      if (hiddenTok) hiddenTok.value = tok;
-
-      if (btn) {
-        btn.disabled = true;
-        btn.innerText = "Actualisation…";
-      }
-      afficherBanniere("");
-
-      try {
-        const headers = { "Accept": "application/json" };
-        if (tok) headers["X-Admin-Token"] = tok;
-        const body = new URLSearchParams();
-        if (tok) body.set("admin_token", tok);
-
-        const res = await fetch("/refresh", {
-          method: "POST",
-          headers: headers,
-          body: body
-        });
-
-        if (res.status === 429) {
-          const retryAfter = res.headers.get("Retry-After") || "quelques secondes";
-          afficherBanniere(`Actualisation limitée (rate-limit) : réessayez dans ${retryAfter}s.`);
-          if (btn) { btn.disabled = false; btn.innerText = "↻ Actualiser"; }
-          return false;
-        }
-        if (res.status === 401 || res.status === 403) {
-          try { localStorage.removeItem("betpulse_admin_token"); } catch (e) {}
-          afficherBanniere("Accès refusé : token d'administration invalide.");
-          if (btn) { btn.disabled = false; btn.innerText = "↻ Actualiser"; }
-          return false;
-        }
-        window.location.replace(window.location.href);
-      } catch (e) {
-        if (btn) { btn.disabled = false; btn.innerText = "↻ Actualiser"; }
-        afficherBanniere("Erreur réseau lors de l'actualisation.");
-      }
-      return false;
-    }
-
-    function setConf(val, btn) {
-      confActif = val;
-      document.querySelectorAll(".pill-btn").forEach(b => b.classList.remove("active"));
-      if (btn) btn.classList.add("active");
-      appliquerFiltres();
-    }
-
-    function setFavGroupFilter(mode, btn) {
-      favGroupFilter = mode;
-      document.querySelectorAll("#fav-filter-all, #fav-filter-actifs").forEach(b => {
-        b.classList.toggle("active", b === btn);
-      });
-      appliquerFiltres();
-    }
-
-    function rafraichirCompteursFavoris() {
-      const allFavCards = Array.from(document.querySelectorAll("#favoris-container .card[data-fav-card]"));
-      const liveCards = allFavCards.filter(c => c.dataset.favState === "EN_COURS");
-      const upCards = allFavCards.filter(c => c.dataset.favState === "A_VENIR");
-      const doneCards = allFavCards.filter(c => c.dataset.favState === "TERMINE");
-
-      const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
-      setTxt("kpi-fav-total", allFavCards.length);
-      setTxt("kpi-fav-live", liveCards.length);
-      setTxt("kpi-fav-upcoming", upCards.length);
-      setTxt("kpi-fav-done", doneCards.length);
-      setTxt("kpi-fav-done-btn", doneCards.length);
-      setTxt("cnt-fav-live", liveCards.length);
-      setTxt("cnt-fav-upcoming", upCards.length);
-      setTxt("cnt-fav-done", doneCards.length);
-
-      const btnClear = document.getElementById("btn-clear-done");
-      if (btnClear) btnClear.disabled = (doneCards.length === 0);
-
-      const secLive = document.getElementById("fav-sec-live");
-      const secUp = document.getElementById("fav-sec-upcoming");
-      const secDone = document.getElementById("fav-sec-done");
-
-      if (secLive) {
-        secLive.style.display = (liveCards.length > 0 && favGroupFilter !== "TERMINE") ? "" : "none";
-      }
-      if (secUp) {
-        secUp.style.display = (upCards.length > 0 && favGroupFilter !== "TERMINE") ? "" : "none";
-      }
-      if (secDone) {
-        secDone.style.display = (doneCards.length > 0 && favGroupFilter !== "ACTIFS") ? "" : "none";
-      }
-
-      const container = document.getElementById("favoris-container");
-      if (container && allFavCards.length === 0 && !document.getElementById("fav-empty-msg")) {
-        const emptyDiv = document.createElement("div");
-        emptyDiv.className = "fav-empty-box";
-        emptyDiv.id = "fav-empty-msg";
-        emptyDiv.innerHTML = "<strong>Aucun match dans votre liste de favoris</strong>Cliquez sur ☆ sur n'importe quel match pour l'épingler ici.";
-        container.appendChild(emptyDiv);
-      } else if (allFavCards.length > 0) {
-        const emptyMsg = document.getElementById("fav-empty-msg");
-        if (emptyMsg) emptyMsg.remove();
-      }
-    }
-
-    function appliquerFiltres() {
-      const q = (document.getElementById("search-input")?.value || "").trim().toLowerCase();
-      const probaMin = parseFloat(document.getElementById("proba-min")?.value || "0") || 0;
-      let totalCartes = 0;
-      let visibles = 0;
-
-      document.querySelectorAll(".grid .card[data-conf]").forEach(card => {
-        totalCartes += 1;
-        const cConf = card.getAttribute("data-conf") || "";
-        const cProba = parseFloat(card.getAttribute("data-proba") || "0") || 0;
-        const cText = card.getAttribute("data-search") || "";
-        const favState = card.getAttribute("data-fav-state") || "";
-
-        let okGroup = true;
-        if (PAGE_FAVORIS && favState) {
-          if (favGroupFilter === "ACTIFS") okGroup = (favState !== "TERMINE");
-          if (favGroupFilter === "TERMINE") okGroup = (favState === "TERMINE");
-        }
-
-        const okConf = (confActif === "ALL") || (cConf === confActif);
-        const okProba = cProba >= probaMin;
-        const okText = !q || cText.includes(q);
-        const show = okGroup && okConf && okProba && okText;
-        card.style.display = show ? "" : "none";
-        if (show) visibles += 1;
-      });
-
-      const cpt = document.getElementById("compteur-cartes");
-      if (cpt && totalCartes > 0) {
-        cpt.textContent = `${visibles}/${totalCartes} affichés`;
-      }
-    }
-
-    function trierCartes() {
-      const mode = document.getElementById("sort-mode")?.value || "date";
-      document.querySelectorAll(".grid").forEach(grid => {
-        const cards = Array.from(grid.querySelectorAll(".card[data-conf]"));
-        if (cards.length < 2) return;
-        cards.sort((a, b) => {
-          if (mode === "proba") {
-            return (parseFloat(b.dataset.proba) || 0) - (parseFloat(a.dataset.proba) || 0);
-          }
-          if (mode === "conf") {
-            return (parseFloat(b.dataset.confScore) || 0) - (parseFloat(a.dataset.confScore) || 0);
-          }
-          const tsA = parseFloat(a.dataset.ts);
-          const tsB = parseFloat(b.dataset.ts);
-          const numA = Number.isFinite(tsA) ? tsA : Number.MAX_SAFE_INTEGER;
-          const numB = Number.isFinite(tsB) ? tsB : Number.MAX_SAFE_INTEGER;
-          return numA - numB;
-        });
-        cards.forEach(c => grid.appendChild(c));
-      });
-    }
-
-    async function toggleFavori(btn) {
-      if (!btn) return;
-      const d = btn.dataset;
-      const payload = {
-        cle_favori: d.cleFavori || "",
-        sport: d.sport || "FOOT",
-        event_id: d.eventId || "",
-        match: d.match || "",
-        competition: d.competition || "",
-        date_match: d.dateMatch || "",
-        ts_match: d.tsMatch || "",
-        choix: d.choix || "",
-        proba: d.proba || null,
-        cote: d.cote || null,
-        mise_u: d.miseU || null,
-        confiance: d.confiance || "MOYENNE",
-        confiance_score: d.confianceScore || 50,
-        detail: d.detail || ""
-      };
-      btn.disabled = true;
-      try {
-        const res = await fetch("/api/favoris/toggle", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        });
-        if (res.ok) {
-          const data = await res.json();
-          const estFav = Boolean(data.est_favori);
-          const cle = data.cle_favori || payload.cle_favori;
-
-          document.querySelectorAll(".star-btn").forEach(other => {
-            if ((other.dataset.cleFavori || "") === cle) {
-              other.classList.toggle("active", estFav);
-              other.textContent = estFav ? "★" : "☆";
-              other.title = estFav ? "Retirer des favoris" : "Ajouter aux favoris";
-            }
-          });
-
-          if (typeof data.total_favoris === "number") {
-            const tCpt = document.getElementById("fav-count-tab");
-            if (tCpt) tCpt.textContent = data.total_favoris;
-          }
-
-          if (PAGE_FAVORIS && !estFav) {
-            const favCard = btn.closest(".card[data-fav-card]");
-            if (favCard) favCard.remove();
-            rafraichirCompteursFavoris();
-          }
-          appliquerFiltres();
-        }
-      } catch (e) {
-        afficherBanniere("Impossible de mettre à jour les favoris pour le moment.");
-      } finally {
-        btn.disabled = false;
-      }
-    }
-
-    async function nettoyerTermines() {
-      const btn = document.getElementById("btn-clear-done");
-      if (btn) btn.disabled = true;
-      try {
-        const res = await fetch("/api/favoris/clear-done", { method: "POST" });
-        if (res.ok) {
-          const data = await res.json();
-          document.querySelectorAll('#favoris-container .card[data-fav-state="TERMINE"]').forEach(c => c.remove());
-          if (typeof data.total_favoris === "number") {
-            const tCpt = document.getElementById("fav-count-tab");
-            if (tCpt) tCpt.textContent = data.total_favoris;
-          }
-          rafraichirCompteursFavoris();
-          appliquerFiltres();
-          if ((data.supprimes || 0) > 0) {
-            afficherBanniere(`${data.supprimes} match(s) terminé(s) retiré(s) des favoris.`, "ok");
-          }
-        }
-      } catch (e) {
-        afficherBanniere("Erreur lors du nettoyage des matchs terminés.");
-      } finally {
-        rafraichirCompteursFavoris();
-      }
-    }
-
-    trierCartes();
-    if (PAGE_FAVORIS) {
-      const allBtn = document.getElementById("fav-filter-all");
-      if (allBtn) allBtn.classList.add("active");
-      rafraichirCompteursFavoris();
-    }
-    appliquerFiltres();
-  </script>
-</body>
-</html>
-"""
-
-
-def _demarrer_analyse_si_besoin(delai_sec=0.0):
-    def _runner():
-        if delai_sec > 0:
-            time.sleep(delai_sec)
-        try:
-            executer_analyse()
-        except Exception as e:
-            logger.critical("Erreur fatale analyse background: %s", e)
-
-    threading.Thread(target=_runner, daemon=True).start()
-
-
-def _demarrer_scheduler_si_actif():
-    global _SCHEDULER_DEMARRE
-    if CFG.auto_refresh_sec <= 0:
-        return
-    with _STATE_LOCK:
-        if _SCHEDULER_DEMARRE:
-            return
-        _SCHEDULER_DEMARRE = True
-
-    def _loop():
-        while True:
-            time.sleep(CFG.auto_refresh_sec)
-            try:
-                executer_analyse()
-            except Exception as e:
-                logger.warning("Erreur scheduler auto-refresh: %s", e)
-
-    threading.Thread(target=_loop, daemon=True).start()
-
-
-@app.route("/health")
-def health():
-    return "ok", 200
-
-
-@app.route("/api/status")
-def api_status():
-    with _STATE_LOCK:
-        maj = _DERNIER_RAPPORT.get("mis_a_jour")
-        en_cours = _ANALYSE_EN_COURS
-    if not maj and not en_cours:
-        _demarrer_analyse_si_besoin(0.0)
-    resp = make_response(jsonify({
-        "ready": bool(maj),
-        "mis_a_jour": maj,
-        "en_cours": en_cours,
-    }), 200)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-@app.route("/api/analyse")
-def api_analyse():
-    with _STATE_LOCK:
-        rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
-    if not rapport.get("mis_a_jour"):
-        rapport = executer_analyse()
-    return jsonify(rapport)
-
-
-@app.route("/api/favoris/toggle", methods=["POST"])
-def api_favoris_toggle():
-    payload = request.get_json(silent=True) or request.form or {}
-    force_raw = payload.get("favori")
-    force_etat = None
-    if isinstance(force_raw, bool):
-        force_etat = force_raw
-    elif isinstance(force_raw, str) and force_raw.strip().lower() in ("1", "true", "yes", "on"):
-        force_etat = True
-    elif isinstance(force_raw, str) and force_raw.strip().lower() in ("0", "false", "no", "off"):
-        force_etat = False
-
-    est_fav, cles_actuelles = basculer_favori(payload, force_etat=force_etat)
-    cle = str(payload.get("cle_favori") or "").strip() or _construire_cle_favori(
-        payload.get("sport"), payload.get("event_id"), payload.get("match"), payload.get("date_match")
-    )
-
-    with _STATE_LOCK:
-        if _DERNIER_RAPPORT.get("mis_a_jour"):
-            if est_fav:
-                suivis_actuels = list(_DERNIER_RAPPORT.get("favoris_suivis") or [])
-                deja_dans_suivis = any(
-                    (x.get("cle_favori") or _construire_cle_favori(x.get("sport"), x.get("event_id"), x.get("match"), x.get("date_match"))) == cle
-                    for x in suivis_actuels
-                )
-                if not deja_dans_suivis:
-                    with _FAV_LOCK:
-                        meta = dict(_FAVORIS_ACTIFS.get(cle) or {})
-                    meta.setdefault("etat_match", "A_VENIR")
-                    meta["est_favori"] = True
-                    suivis_actuels.append(meta)
-                    ordre_etat = {"EN_COURS": 0, "A_VENIR": 1, "TERMINE": 2}
-                    suivis_actuels.sort(key=lambda x: (
-                        ordre_etat.get(str(x.get("etat_match") or "A_VENIR").upper(), 1),
-                        _cle_cle_chronologique(x),
-                    ))
-                    _DERNIER_RAPPORT["favoris_suivis"] = suivis_actuels
-            _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
-            rapport_copie = dict(_DERNIER_RAPPORT)
-        else:
-            rapport_copie = None
-
-    if rapport_copie and rapport_copie.get("mis_a_jour"):
-        _sauvegarder_rapport_disque(rapport_copie)
-
-    return jsonify({
-        "ok": True,
-        "cle_favori": cle,
-        "est_favori": est_fav,
-        "total_favoris": len(cles_actuelles),
-    }), 200
-
-
-@app.route("/api/favoris/clear-done", methods=["POST"])
-def api_favoris_clear_done():
-    supprimes, total_restants = nettoyer_favoris_termines()
-    with _STATE_LOCK:
-        if _DERNIER_RAPPORT.get("mis_a_jour"):
-            _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
-            rapport_copie = dict(_DERNIER_RAPPORT)
-        else:
-            rapport_copie = None
-
-    if rapport_copie and rapport_copie.get("mis_a_jour"):
-        _sauvegarder_rapport_disque(rapport_copie)
-
-    return jsonify({
-        "ok": True,
-        "supprimes": supprimes,
-        "total_favoris": total_restants,
-    }), 200
-
-
-@app.route("/api/historique/statut", methods=["POST"])
-def api_historique_statut():
-    payload = request.get_json(silent=True) or request.form or {}
-    refus = _verifier_acces_admin("/api/historique/statut", CFG.statut_rate_limit_sec, payload=payload, json_mode=True)
-    if refus is not None:
-        return refus
-
-    bilan = definir_statut_historique(
-        payload.get("sport"),
-        payload.get("event_id"),
-        payload.get("choix"),
-        payload.get("statut"),
-    )
-    if bilan is None:
-        return jsonify({"ok": False, "error": "Entrée introuvable ou statut invalide"}), 404
-    with _STATE_LOCK:
-        _DERNIER_RAPPORT["bilan"] = bilan
-        rapport_copie = dict(_DERNIER_RAPPORT)
-    _sauvegarder_rapport_disque(rapport_copie)
-    return jsonify({"ok": True, "bilan": bilan}), 200
-
-
-if CFG.activer_debug_routes:
-    @app.route("/api/debug-foot")
-    def api_debug_foot():
-        fonctions = [n for n in dir(fb) if not n.startswith("_") and callable(getattr(fb, n, None))]
-        sched = get_foot_schedule_cached("160", "ligue-1", CFG.saison_foot)
-        evs = _extraire_events(sched)
-        echantillon = [
-            {
-                "id": ev.get("id"),
-                "status": ev.get("status"),
-                "date": ev.get("start_time") or ev.get("date"),
-                "home": (_normaliser_home_away(ev)[0].get("name")),
-                "away": (_normaliser_home_away(ev)[1].get("name")),
-            }
-            for ev in evs[:5]
-        ]
-        return jsonify({
-            "module": getattr(fb, "__name__", str(fb)),
-            "fonctions_disponibles": fonctions,
-            "nb_events_psg": len(evs),
-            "echantillon_psg": echantillon,
-        })
-
-
-@app.route("/refresh", methods=["POST"])
-def refresh():
-    payload = request.get_json(silent=True) or request.form or {}
-    wants_json = request.is_json or ("application/json" in (request.headers.get("Accept") or ""))
-    refus = _verifier_acces_admin("/refresh", CFG.refresh_rate_limit_sec, payload=payload, json_mode=wants_json)
-    if refus is not None:
-        return refus
-
-    _demarrer_analyse_si_besoin(0.0)
-    if wants_json:
-        return jsonify({"ok": True, "message": "Analyse lancée"}), 202
-    return redirect(url_for("app_view"))
-
-
-@app.route("/")
-def index():
-    with _STATE_LOCK:
-        rapport = dict(_DERNIER_RAPPORT)
-        en_cours = _ANALYSE_EN_COURS
-
-    if rapport.get("mis_a_jour"):
-        return redirect(url_for("app_view"))
-
-    if not en_cours:
-        _demarrer_analyse_si_besoin(0.2)
-
-    resp = make_response(render_template_string(
-        _HTML_HOME,
-        en_cours=en_cours,
-    ), 200)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-@app.route("/favoris")
-def favoris_view():
-    with _STATE_LOCK:
-        rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
-        en_cours = _ANALYSE_EN_COURS
-
-    if not rapport.get("mis_a_jour"):
-        if not en_cours:
-            _demarrer_analyse_si_besoin(0.0)
-        resp = make_response(render_template_string(_HTML_LOADING), 200)
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return resp
-
-    resp = make_response(render_template_string(
-        _HTML_PAGE,
-        r=rapport,
-        en_cours=en_cours,
-        cat="favoris",
-        page_favoris=True,
-        fenetre_heures=CFG.fenetre_heures,
-        token_requis=bool(CFG.admin_token),
-    ), 200)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-@app.route("/app")
-def app_view():
-    cat = (request.args.get("cat") or "all").strip().lower()
-    if cat not in {"all", "favoris", "live", "top", "foot", "tennis", "alertes", "bilan"}:
-        cat = "all"
-
-    with _STATE_LOCK:
-        rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
-        en_cours = _ANALYSE_EN_COURS
-
-    if not rapport.get("mis_a_jour"):
-        if not en_cours:
-            _demarrer_analyse_si_besoin(0.0)
-        resp = make_response(render_template_string(_HTML_LOADING), 200)
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-        return resp
-
-    resp = make_response(render_template_string(
-        _HTML_PAGE,
-        r=rapport,
-        en_cours=en_cours,
-        cat=cat,
-        page_favoris=False,
-        fenetre_heures=CFG.fenetre_heures,
-        token_requis=bool(CFG.admin_token),
-    ), 200)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-_nettoyer_fichiers_tmp_orphelins()
-_charger_favoris_disque()
-_charger_rapport_disque()
-_demarrer_scheduler_si_actif()
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+      background: rgba(251,
