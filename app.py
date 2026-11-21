@@ -8,12 +8,14 @@ import logging
 import math
 import os
 import re
+import struct
 import sys
 import threading
 import time
 import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
+import zlib
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -115,7 +117,7 @@ ICONE_SVG_MARKUP = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 5
     <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" stop-color="#0b1324"/>
       <stop offset="55%" stop-color="#0f1e36"/>
-      <stop offset="100%" stop-color="#071c1c"/>
+      <stop offset="100%" stop-color="#091629"/>
     </linearGradient>
     <linearGradient id="pulseGrad" x1="0%" y1="100%" x2="100%" y2="0%">
       <stop offset="0%" stop-color="#10b981"/>
@@ -128,30 +130,25 @@ ICONE_SVG_MARKUP = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 5
       <stop offset="100%" stop-color="#94a3b8"/>
     </linearGradient>
     <radialGradient id="glowSpot" cx="72%" cy="28%" r="45%">
-      <stop offset="0%" stop-color="#10b981" stop-opacity="0.28"/>
-      <stop offset="100%" stop-color="#10b981" stop-opacity="0"/>
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>
     </radialGradient>
   </defs>
 
   <rect width="512" height="512" rx="118" fill="url(#bgGrad)"/>
   <rect width="512" height="512" rx="118" fill="url(#glowSpot)"/>
 
-  <!-- Grille discrète style terminal sportif / bookmaker -->
   <path d="M 96 152 H 416 M 96 256 H 416 M 96 360 H 416" stroke="#38bdf8" stroke-opacity="0.08" stroke-width="2"/>
   <path d="M 152 96 V 416 M 256 96 V 416 M 360 96 V 416" stroke="#38bdf8" stroke-opacity="0.08" stroke-width="2"/>
 
-  <!-- Arc extérieur dynamique -->
   <path d="M 104 358 A 186 186 0 0 1 398 134" fill="none" stroke="url(#pulseGrad)" stroke-width="14" stroke-linecap="round" opacity="0.45"/>
 
-  <!-- Courbe de tendance & pulsation sportive -->
   <polyline points="92,334 176,334 218,224 266,368 318,176 414,176"
             fill="none" stroke="url(#pulseGrad)" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
 
-  <!-- Point pic / valeur -->
   <circle cx="414" cy="176" r="18" fill="#10b981"/>
   <circle cx="414" cy="176" r="8" fill="#ecfdf5"/>
 
-  <!-- Sphère sportive minimaliste en bas à gauche -->
   <circle cx="136" cy="366" r="54" fill="url(#ballGrad)" stroke="#0f172a" stroke-width="6"/>
   <polygon points="136,336 157,351 149,377 123,377 115,351" fill="#0f172a"/>
   <path d="M136,336 L136,312 M157,351 L180,343 M149,377 L164,398 M123,377 L108,398 M115,351 L92,343"
@@ -159,29 +156,142 @@ ICONE_SVG_MARKUP = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 5
 </svg>"""
 
 
-def _generer_png_icone_secours(taille=192):
-    """PNG 1x1 / léger de secours si Pillow n'est pas installé."""
-    png_1x1_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
-    return base64.b64decode(png_1x1_b64)
+def _encoder_png_rgba(largeur, hauteur, pixels_rgba):
+    def _chunk(tag, data):
+        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+        return struct.pack("!I", len(data)) + tag + data + struct.pack("!I", crc)
+
+    raw_rows = bytearray()
+    stride = largeur * 4
+    for y in range(hauteur):
+        raw_rows.append(0)  # filtre type 0 (None)
+        start = y * stride
+        raw_rows.extend(pixels_rgba[start:start + stride])
+
+    ihdr = struct.pack("!IIBBBBB", largeur, hauteur, 8, 6, 0, 0, 0)
+    idat = zlib.compress(bytes(raw_rows), level=6)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", idat)
+        + _chunk(b"IEND", b"")
+    )
+
+
+def _dist_segment(px, py, ax, ay, bx, by):
+    vx, vy = bx - ax, by - ay
+    wx, wy = px - ax, py - ay
+    c1 = vx * wx + vy * wy
+    if c1 <= 0.0:
+        return math.hypot(px - ax, py - ay)
+    c2 = vx * vx + vy * vy
+    if c2 <= c1:
+        return math.hypot(px - bx, py - by)
+    b = c1 / c2
+    pbx, pby = ax + b * vx, ay + b * vy
+    return math.hypot(px - pbx, py - pby)
+
+
+def _generer_png_pur_python(taille):
+    w = h = int(taille)
+    buf = bytearray(w * h * 4)
+
+    pts = [
+        (w * 0.18, h * 0.65),
+        (w * 0.34, h * 0.65),
+        (w * 0.43, h * 0.43),
+        (w * 0.52, h * 0.72),
+        (w * 0.62, h * 0.34),
+        (w * 0.81, h * 0.34),
+    ]
+    stroke_w = max(2.2, w * 0.042)
+    dot_x, dot_y, dot_r = w * 0.81, h * 0.34, max(3.5, w * 0.036)
+    ball_x, ball_y, ball_r = w * 0.27, h * 0.72, max(6.0, w * 0.105)
+    ring_r_out, ring_r_in = w * 0.36, w * 0.335
+    cx_center, cy_center = w * 0.50, h * 0.50
+
+    for y in range(h):
+        for x in range(w):
+            # Fond bleu nuit profond (#0b1324 -> #11223b)
+            t_y = y / max(1, h - 1)
+            t_x = x / max(1, w - 1)
+            r = 11 + int(8 * t_x + 6 * (1.0 - t_y))
+            g = 19 + int(15 * t_x + 12 * (1.0 - t_y))
+            b = 36 + int(28 * t_x + 18 * (1.0 - t_y))
+            a = 255
+
+            # Arc subtil extérieur
+            dist_c = math.hypot(x - cx_center, y - cy_center)
+            ang = math.atan2(y - cy_center, x - cx_center)
+            if ring_r_in <= dist_c <= ring_r_out and (-2.6 <= ang <= 0.4):
+                r = int(r * 0.65 + 56 * 0.35)
+                g = int(g * 0.65 + 189 * 0.35)
+                b = int(b * 0.65 + 248 * 0.35)
+
+            # Courbe de tendance (dégradé vert émeraude -> cyan)
+            min_d = 1e9
+            seg_t = 0.0
+            for i in range(len(pts) - 1):
+                ax, ay = pts[i]
+                bx, by = pts[i + 1]
+                d = _dist_segment(x, y, ax, ay, bx, by)
+                if d < min_d:
+                    min_d = d
+                    seg_t = (i + 0.5) / max(1, len(pts) - 1)
+
+            if min_d <= stroke_w * 1.35:
+                alpha_line = max(0.0, min(1.0, (stroke_w * 1.35 - min_d) / max(0.8, stroke_w * 0.45)))
+                lr = int(16 * (1.0 - seg_t) + 56 * seg_t)
+                lg = int(185 * (1.0 - seg_t) + 189 * seg_t)
+                lb = int(129 * (1.0 - seg_t) + 248 * seg_t)
+                r = int(r * (1.0 - alpha_line) + lr * alpha_line)
+                g = int(g * (1.0 - alpha_line) + lg * alpha_line)
+                b = int(b * (1.0 - alpha_line) + lb * alpha_line)
+
+            # Point lumineux en bout de courbe
+            d_dot = math.hypot(x - dot_x, y - dot_y)
+            if d_dot <= dot_r:
+                r, g, b = 236, 253, 245
+
+            # Sphère sportive en bas à gauche
+            d_ball = math.hypot(x - ball_x, y - ball_y)
+            if d_ball <= ball_r:
+                if d_ball >= ball_r * 0.78:
+                    r, g, b = 15, 23, 42
+                elif d_ball <= ball_r * 0.34:
+                    r, g, b = 15, 23, 42
+                else:
+                    r, g, b = 241, 245, 249
+
+            idx = (y * w + x) * 4
+            buf[idx] = max(0, min(255, r))
+            buf[idx + 1] = max(0, min(255, g))
+            buf[idx + 2] = max(0, min(255, b))
+            buf[idx + 3] = a
+
+    return _encoder_png_rgba(w, h, bytes(buf))
 
 
 def _construire_png_icone(taille=192):
     try:
         from PIL import Image, ImageDraw
     except Exception:
-        return _generer_png_icone_secours(taille)
+        return _generer_png_pur_python(taille)
 
     img = Image.new("RGBA", (taille, taille), (11, 19, 36, 255))
     draw = ImageDraw.Draw(img)
     pad = max(2, int(taille * 0.04))
     draw.rounded_rectangle([pad, pad, taille - pad, taille - pad], radius=int(taille * 0.22), fill=(15, 30, 54, 255))
 
+    arc_pad = int(taille * 0.15)
+    draw.arc([arc_pad, arc_pad, taille - arc_pad, taille - arc_pad], start=205, end=25, fill=(56, 189, 248, 130), width=max(2, int(taille * 0.025)))
+
     pts = [
-        (taille * 0.18, taille * 0.66),
-        (taille * 0.35, taille * 0.66),
-        (taille * 0.44, taille * 0.43),
-        (taille * 0.54, taille * 0.72),
-        (taille * 0.64, taille * 0.34),
+        (taille * 0.18, taille * 0.65),
+        (taille * 0.34, taille * 0.65),
+        (taille * 0.43, taille * 0.43),
+        (taille * 0.52, taille * 0.72),
+        (taille * 0.62, taille * 0.34),
         (taille * 0.81, taille * 0.34),
     ]
     draw.line(pts, fill=(16, 185, 129, 255), width=max(3, int(taille * 0.045)), joint="curve")
@@ -190,9 +300,11 @@ def _construire_png_icone(taille=192):
     cx, cy = taille * 0.81, taille * 0.34
     draw.ellipse([cx - r_dot, cy - r_dot, cx + r_dot, cy + r_dot], fill=(56, 189, 248, 255))
 
-    r_ball = max(8, int(taille * 0.10))
-    bx, by = taille * 0.27, taille * 0.73
-    draw.ellipse([bx - r_ball, by - r_ball, bx + r_ball, by + r_ball], fill=(248, 250, 252, 255))
+    r_ball = max(8, int(taille * 0.105))
+    bx, by = taille * 0.27, taille * 0.72
+    draw.ellipse([bx - r_ball, by - r_ball, bx + r_ball, by + r_ball], fill=(241, 245, 249, 255), outline=(15, 23, 42, 255), width=max(2, int(taille * 0.015)))
+    r_core = max(3, int(r_ball * 0.34))
+    draw.ellipse([bx - r_core, by - r_core, bx + r_core, by + r_core], fill=(15, 23, 42, 255))
 
     buf = io.BytesIO()
     img.save(buf, format="PNG")
@@ -2642,16 +2754,16 @@ _HTML_HOME = """<!doctype html>
     width: 74px; height: 74px; border-radius: 20px;
     overflow: hidden;
     margin-bottom: 14px;
-    border: 1px solid rgba(16, 185, 129, 0.45);
+    border: 1px solid rgba(56, 189, 248, 0.45);
     animation: pulse 2.2s cubic-bezier(.4,0,.6,1) infinite;
   }
   .logo-badge img {
     width: 100%; height: 100%; object-fit: cover; display: block;
   }
   @keyframes pulse {
-    0%   { box-shadow: 0 0 0 0 rgba(16,185,129,.55); }
-    70%  { box-shadow: 0 0 0 20px rgba(16,185,129,0); }
-    100% { box-shadow: 0 0 0 0 rgba(16,185,129,0); }
+    0%   { box-shadow: 0 0 0 0 rgba(56,189,248,.55); }
+    70%  { box-shadow: 0 0 0 20px rgba(56,189,248,0); }
+    100% { box-shadow: 0 0 0 0 rgba(56,189,248,0); }
   }
   .title { font-size: 1.85rem; font-weight: 800; margin: 0 0 6px; }
   .title span { color: var(--accent); }
@@ -3004,7 +3116,7 @@ _HTML_PAGE = """<!doctype html>
     .brand-link { display: inline-flex; align-items: center; gap: 12px; text-decoration: none; color: var(--text); }
     .brand-badge {
       width: 42px; height: 42px; border-radius: 12px; overflow: hidden;
-      border: 1px solid rgba(16, 185, 129, 0.45);
+      border: 1px solid rgba(56, 189, 248, 0.45);
       display: inline-flex; align-items: center; justify-content: center;
       flex-shrink: 0;
     }
@@ -4446,15 +4558,15 @@ def favoris_view():
         if not en_cours:
             _demarrer_analyse_si_besoin(0.0)
         resp = make_response(render_template_string(_HTML_LOADING), 200)
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         return resp
 
     resp = make_response(render_template_string(
         _HTML_PAGE,
         r=rapport,
-        en_cours=en_cours,
         cat="favoris",
         page_favoris=True,
+        en_cours=en_cours,
         fenetre_heures=CFG.fenetre_heures,
         token_requis=bool(CFG.admin_token),
     ), 200)
@@ -4464,8 +4576,8 @@ def favoris_view():
 
 @app.route("/app")
 def app_view():
-    cat = (request.args.get("cat") or "all").strip().lower()
-    if cat not in {"all", "favoris", "live", "top", "foot", "tennis", "alertes", "bilan"}:
+    cat = request.args.get("cat", "all")
+    if cat not in ("all", "favoris", "live", "top", "foot", "tennis", "alertes", "bilan"):
         cat = "all"
 
     with _STATE_LOCK:
@@ -4476,15 +4588,15 @@ def app_view():
         if not en_cours:
             _demarrer_analyse_si_besoin(0.0)
         resp = make_response(render_template_string(_HTML_LOADING), 200)
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         return resp
 
     resp = make_response(render_template_string(
         _HTML_PAGE,
         r=rapport,
-        en_cours=en_cours,
         cat=cat,
-        page_favoris=False,
+        page_favoris=(cat == "favoris"),
+        en_cours=en_cours,
         fenetre_heures=CFG.fenetre_heures,
         token_requis=bool(CFG.admin_token),
     ), 200)
@@ -4497,6 +4609,9 @@ _charger_favoris_disque()
 _charger_rapport_disque()
 _demarrer_scheduler_si_actif()
 
+if not _DERNIER_RAPPORT.get("mis_a_jour"):
+    _demarrer_analyse_si_besoin(0.5)
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
