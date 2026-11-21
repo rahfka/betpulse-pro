@@ -1,6 +1,8 @@
+import base64
 import csv
 import hmac
 import importlib
+import io
 import json
 import logging
 import math
@@ -20,7 +22,7 @@ from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 import requests
-from flask import Flask, jsonify, make_response, redirect, render_template_string, request, url_for
+from flask import Flask, Response, jsonify, make_response, redirect, render_template_string, request, url_for
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -107,6 +109,108 @@ class Config:
 
 
 CFG = Config()
+
+ICONE_SVG_MARKUP = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b1324"/>
+      <stop offset="55%" stop-color="#0f1e36"/>
+      <stop offset="100%" stop-color="#071c1c"/>
+    </linearGradient>
+    <linearGradient id="pulseGrad" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="55%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#a7f3d0"/>
+    </linearGradient>
+    <linearGradient id="ballGrad" x1="20%" y1="15%" x2="85%" y2="85%">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="65%" stop-color="#e2e8f0"/>
+      <stop offset="100%" stop-color="#94a3b8"/>
+    </linearGradient>
+    <radialGradient id="glowSpot" cx="72%" cy="28%" r="45%">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="118" fill="url(#bgGrad)"/>
+  <rect width="512" height="512" rx="118" fill="url(#glowSpot)"/>
+
+  <!-- Grille discrète style terminal sportif / bookmaker -->
+  <path d="M 96 152 H 416 M 96 256 H 416 M 96 360 H 416" stroke="#38bdf8" stroke-opacity="0.08" stroke-width="2"/>
+  <path d="M 152 96 V 416 M 256 96 V 416 M 360 96 V 416" stroke="#38bdf8" stroke-opacity="0.08" stroke-width="2"/>
+
+  <!-- Arc extérieur dynamique -->
+  <path d="M 104 358 A 186 186 0 0 1 398 134" fill="none" stroke="url(#pulseGrad)" stroke-width="14" stroke-linecap="round" opacity="0.45"/>
+
+  <!-- Courbe de tendance & pulsation sportive -->
+  <polyline points="92,334 176,334 218,224 266,368 318,176 414,176"
+            fill="none" stroke="url(#pulseGrad)" stroke-width="22" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Point pic / valeur -->
+  <circle cx="414" cy="176" r="18" fill="#10b981"/>
+  <circle cx="414" cy="176" r="8" fill="#ecfdf5"/>
+
+  <!-- Sphère sportive minimaliste en bas à gauche -->
+  <circle cx="136" cy="366" r="54" fill="url(#ballGrad)" stroke="#0f172a" stroke-width="6"/>
+  <polygon points="136,336 157,351 149,377 123,377 115,351" fill="#0f172a"/>
+  <path d="M136,336 L136,312 M157,351 L180,343 M149,377 L164,398 M123,377 L108,398 M115,351 L92,343"
+        stroke="#0f172a" stroke-width="5" stroke-linecap="round"/>
+</svg>"""
+
+
+def _generer_png_icone_secours(taille=192):
+    """PNG 1x1 / léger de secours si Pillow n'est pas installé."""
+    png_1x1_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    return base64.b64decode(png_1x1_b64)
+
+
+def _construire_png_icone(taille=192):
+    try:
+        from PIL import Image, ImageDraw
+    except Exception:
+        return _generer_png_icone_secours(taille)
+
+    img = Image.new("RGBA", (taille, taille), (11, 19, 36, 255))
+    draw = ImageDraw.Draw(img)
+    pad = max(2, int(taille * 0.04))
+    draw.rounded_rectangle([pad, pad, taille - pad, taille - pad], radius=int(taille * 0.22), fill=(15, 30, 54, 255))
+
+    pts = [
+        (taille * 0.18, taille * 0.66),
+        (taille * 0.35, taille * 0.66),
+        (taille * 0.44, taille * 0.43),
+        (taille * 0.54, taille * 0.72),
+        (taille * 0.64, taille * 0.34),
+        (taille * 0.81, taille * 0.34),
+    ]
+    draw.line(pts, fill=(16, 185, 129, 255), width=max(3, int(taille * 0.045)), joint="curve")
+
+    r_dot = max(4, int(taille * 0.04))
+    cx, cy = taille * 0.81, taille * 0.34
+    draw.ellipse([cx - r_dot, cy - r_dot, cx + r_dot, cy + r_dot], fill=(56, 189, 248, 255))
+
+    r_ball = max(8, int(taille * 0.10))
+    bx, by = taille * 0.27, taille * 0.73
+    draw.ellipse([bx - r_ball, by - r_ball, bx + r_ball, by + r_ball], fill=(248, 250, 252, 255))
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+_PNG_192 = _construire_png_icone(192)
+_PNG_512 = _construire_png_icone(512)
+
+FAVICON_HEAD_TAGS = """
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="apple-touch-icon" sizes="180x180" href="/icon-192.png">
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#0b1324">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="BetPulse Pro">
+"""
 
 
 class _LimiteDebit:
@@ -454,7 +558,6 @@ def basculer_favori(item_data, force_etat=None):
 
 
 def nettoyer_favoris_termines():
-    """Supprime tous les favoris actuellement marqués TERMINE."""
     with _STATE_LOCK:
         suivis = list(_DERNIER_RAPPORT.get("favoris_suivis") or [])
         cles_a_supprimer = {
@@ -2400,12 +2503,73 @@ def executer_analyse():
 
 app = Flask(__name__, static_folder="statique", static_url_path="/statique")
 
+
+@app.route("/icon.svg")
+def icon_svg():
+    resp = Response(ICONE_SVG_MARKUP, mimetype="image/svg+xml")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@app.route("/icon-192.png")
+def icon_192():
+    resp = Response(_PNG_192, mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@app.route("/icon-512.png")
+def icon_512():
+    resp = Response(_PNG_512, mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@app.route("/manifest.json")
+def web_manifest():
+    manifest = {
+        "name": "BetPulse Pro",
+        "short_name": "BetPulse Pro",
+        "description": "Pronostics sportifs Football & Tennis, cotes et suivi en direct",
+        "start_url": "/app",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": "#0b1324",
+        "theme_color": "#0b1324",
+        "orientation": "portrait-primary",
+        "icons": [
+            {
+                "src": "/icon-192.png",
+                "sizes": "192x192",
+                "type": "image/png",
+                "purpose": "any",
+            },
+            {
+                "src": "/icon-512.png",
+                "sizes": "512x512",
+                "type": "image/png",
+                "purpose": "any maskable",
+            },
+            {
+                "src": "/icon.svg",
+                "sizes": "any",
+                "type": "image/svg+xml",
+                "purpose": "any",
+            },
+        ],
+    }
+    resp = make_response(jsonify(manifest), 200)
+    resp.headers["Content-Type"] = "application/manifest+json; charset=utf-8"
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
 _HTML_HOME = """<!doctype html>
 <html lang="fr">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BetPulse Pro — Accueil</title>
+<title>BetPulse Pro — Accueil</title>""" + FAVICON_HEAD_TAGS + """
 <style>
   :root {
     --bg: #0f172a;
@@ -2475,16 +2639,19 @@ _HTML_HOME = """<!doctype html>
   }
   .logo-badge {
     display: inline-flex; align-items: center; justify-content: center;
-    width: 68px; height: 68px; border-radius: 20px;
-    background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
-    color: #0f172a; font-weight: 900; font-size: 1.6rem;
+    width: 74px; height: 74px; border-radius: 20px;
+    overflow: hidden;
     margin-bottom: 14px;
+    border: 1px solid rgba(16, 185, 129, 0.45);
     animation: pulse 2.2s cubic-bezier(.4,0,.6,1) infinite;
   }
+  .logo-badge img {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+  }
   @keyframes pulse {
-    0%   { box-shadow: 0 0 0 0 rgba(56,189,248,.6); }
-    70%  { box-shadow: 0 0 0 22px rgba(56,189,248,0); }
-    100% { box-shadow: 0 0 0 0 rgba(56,189,248,0); }
+    0%   { box-shadow: 0 0 0 0 rgba(16,185,129,.55); }
+    70%  { box-shadow: 0 0 0 20px rgba(16,185,129,0); }
+    100% { box-shadow: 0 0 0 0 rgba(16,185,129,0); }
   }
   .title { font-size: 1.85rem; font-weight: 800; margin: 0 0 6px; }
   .title span { color: var(--accent); }
@@ -2668,7 +2835,7 @@ _HTML_HOME = """<!doctype html>
 
 <div class="page-wrap">
   <div class="center-card">
-    <div class="logo-badge">BP</div>
+    <div class="logo-badge"><img src="/icon.svg" alt="BetPulse Pro"></div>
     <h1 class="title">BetPulse <span>Pro</span></h1>
     <div class="tagline">Préparation des pronostics &amp; suivi en direct</div>
 
@@ -2762,7 +2929,7 @@ _HTML_LOADING = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BetPulse Pro — Chargement…</title>
+  <title>BetPulse Pro — Chargement…</title>""" + FAVICON_HEAD_TAGS + """
   <style>
     body { background: #0f172a; color: #e2e8f0; font-family: sans-serif; text-align: center; padding: 80px 20px; }
     h1 { color: #38bdf8; }
@@ -2802,7 +2969,7 @@ _HTML_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BetPulse Pro — {% if page_favoris %}Matchs Favoris{% else %}Matchs &amp; Pronostics{% endif %}</title>
+  <title>BetPulse Pro — {% if page_favoris %}Matchs Favoris{% else %}Matchs &amp; Pronostics{% endif %}</title>""" + FAVICON_HEAD_TAGS + """
   <style>
     :root {
       --bg: #0b1220;
@@ -2836,11 +3003,12 @@ _HTML_PAGE = """<!doctype html>
     .header-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
     .brand-link { display: inline-flex; align-items: center; gap: 12px; text-decoration: none; color: var(--text); }
     .brand-badge {
-      width: 40px; height: 40px; border-radius: 12px;
-      background: linear-gradient(135deg, #38bdf8 0%, #0284c7 100%);
-      color: #0b1220; font-weight: 900; display: inline-flex; align-items: center; justify-content: center;
-      font-size: 1.05rem;
+      width: 42px; height: 42px; border-radius: 12px; overflow: hidden;
+      border: 1px solid rgba(16, 185, 129, 0.45);
+      display: inline-flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
     }
+    .brand-badge img { width: 100%; height: 100%; object-fit: cover; display: block; }
     .meta { color: var(--muted); font-size: 0.88em; }
     button, .btn, select {
       background: var(--accent); color: #0b1220; border: none; padding: 9px 15px;
@@ -3010,7 +3178,7 @@ _HTML_PAGE = """<!doctype html>
     <div class="header">
       <div>
         <a href="/" class="brand-link" title="Retour à l'accueil">
-          <span class="brand-badge">BP</span>
+          <span class="brand-badge"><img src="/icon.svg" alt="BetPulse Pro"></span>
           <h1 style="margin: 0;">BetPulse Pro{% if page_favoris %} — Favoris{% endif %}</h1>
         </a><br>
         <span class="meta">Dernière mise à jour : {{ r.mis_a_jour or "En attente" }} • Fenêtre : {{ fenetre_heures }}h • <span id="compteur-cartes">Filtre actif</span></span>
