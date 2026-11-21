@@ -164,7 +164,7 @@ def _encoder_png_rgba(largeur, hauteur, pixels_rgba):
     raw_rows = bytearray()
     stride = largeur * 4
     for y in range(hauteur):
-        raw_rows.append(0)  # filtre type 0 (None)
+        raw_rows.append(0)
         start = y * stride
         raw_rows.extend(pixels_rgba[start:start + stride])
 
@@ -197,22 +197,21 @@ def _generer_png_pur_python(taille):
     buf = bytearray(w * h * 4)
 
     pts = [
-        (w * 0.18, h * 0.65),
-        (w * 0.34, h * 0.65),
-        (w * 0.43, h * 0.43),
-        (w * 0.52, h * 0.72),
-        (w * 0.62, h * 0.34),
-        (w * 0.81, h * 0.34),
+        (w * 0.20, h * 0.56),
+        (w * 0.35, h * 0.56),
+        (w * 0.44, h * 0.36),
+        (w * 0.54, h * 0.64),
+        (w * 0.64, h * 0.28),
+        (w * 0.82, h * 0.28),
     ]
     stroke_w = max(2.2, w * 0.042)
-    dot_x, dot_y, dot_r = w * 0.81, h * 0.34, max(3.5, w * 0.036)
-    ball_x, ball_y, ball_r = w * 0.27, h * 0.72, max(6.0, w * 0.105)
+    dot_x, dot_y, dot_r = w * 0.82, h * 0.28, max(3.5, w * 0.036)
+    ball_x, ball_y, ball_r = w * 0.25, h * 0.77, max(6.0, w * 0.105)
     ring_r_out, ring_r_in = w * 0.36, w * 0.335
     cx_center, cy_center = w * 0.50, h * 0.50
 
     for y in range(h):
         for x in range(w):
-            # Fond bleu nuit profond (#0b1324 -> #11223b)
             t_y = y / max(1, h - 1)
             t_x = x / max(1, w - 1)
             r = 11 + int(8 * t_x + 6 * (1.0 - t_y))
@@ -220,7 +219,6 @@ def _generer_png_pur_python(taille):
             b = 36 + int(28 * t_x + 18 * (1.0 - t_y))
             a = 255
 
-            # Arc subtil extérieur
             dist_c = math.hypot(x - cx_center, y - cy_center)
             ang = math.atan2(y - cy_center, x - cx_center)
             if ring_r_in <= dist_c <= ring_r_out and (-2.6 <= ang <= 0.4):
@@ -228,7 +226,6 @@ def _generer_png_pur_python(taille):
                 g = int(g * 0.65 + 189 * 0.35)
                 b = int(b * 0.65 + 248 * 0.35)
 
-            # Courbe de tendance (dégradé vert émeraude -> cyan)
             min_d = 1e9
             seg_t = 0.0
             for i in range(len(pts) - 1):
@@ -248,12 +245,10 @@ def _generer_png_pur_python(taille):
                 g = int(g * (1.0 - alpha_line) + lg * alpha_line)
                 b = int(b * (1.0 - alpha_line) + lb * alpha_line)
 
-            # Point lumineux en bout de courbe
             d_dot = math.hypot(x - dot_x, y - dot_y)
             if d_dot <= dot_r:
                 r, g, b = 236, 253, 245
 
-            # Sphère sportive en bas à gauche
             d_ball = math.hypot(x - ball_x, y - ball_y)
             if d_ball <= ball_r:
                 if d_ball >= ball_r * 0.78:
@@ -1357,7 +1352,7 @@ def _titre_est_pertinent_pour_cible(titre, cible):
 def _filtrer_titres_pertinents(titres, cible):
     retenus = []
     for t in titres or []:
-        if _titre_est_pertinent_pour_cible(t, cible):
+        if _titre_est_pertinents_pour_cible(t, cible):
             retenus.append(str(t).strip())
     return retenus
 
@@ -1526,11 +1521,12 @@ def analyser_foot_competitions(competitions, heures_max=48):
     evenements_termines = {}
 
     aujourdhui = datetime.now(timezone.utc).date()
+    nb_jours = max(2, (int(heures_max) // 24) + 2)
 
     taches_sb = [
         (comp["slug"], (aujourdhui + timedelta(days=delta)).strftime("%Y%m%d"))
         for comp in competitions
-        for delta in range(2)
+        for delta in range(nb_jours)
     ]
 
     def charger_sb(args):
@@ -1626,10 +1622,11 @@ def analyser_foot_competitions(competitions, heures_max=48):
                 ev_enrichi["_sport"] = "FOOT"
                 ev_enrichi["_competition"] = label_comp
                 eid = str(ev.get("id") or "").strip()
+                h_c, a_c = _normaliser_home_away(ev)
                 cle_ev = _construire_cle_favori(
                     "FOOT",
                     eid,
-                    f"{_normaliser_home_away(ev)[0].get('short_name') or _normaliser_home_away(ev)[0].get('name') or 'Home'} vs {_normaliser_home_away(ev)[1].get('short_name') or _normaliser_home_away(ev)[1].get('name') or 'Away'}",
+                    f"{h_c.get('short_name') or h_c.get('name') or 'Home'} vs {a_c.get('short_name') or a_c.get('name') or 'Away'}",
                     _formater_date_locale(ev.get("start_time") or ev.get("date")),
                 )
                 clos_comp[cle_ev] = ev_enrichi
@@ -2423,6 +2420,7 @@ def definir_statut_historique(sport, event_id, choix, statut):
 
         tmp_csv = f"{FICHIER_HISTORIQUE}.tmp"
         try:
+            os.makedirs(os.path.dirname(FICHIER_HISTORIQUE) or ".", exist_ok=True)
             with open(tmp_csv, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=champs)
                 writer.writeheader()
@@ -4396,14 +4394,11 @@ def api_favoris_toggle():
                         existing_s.get("sport"), existing_s.get("event_id"), existing_s.get("match"), existing_s.get("date_match")
                     )
                     if ex_cle == cle:
-                        merged_s = dict(existing_s)
-                        merged_s.update(source_it)
-                        suivis_actuels[idx_s] = merged_s
-                        item_enrichi = dict(merged_s)
+                        suivis_actuels[idx_s] = item_enrichi
                         remplace = True
                         break
                 if not remplace:
-                    suivis_actuels.append(source_it)
+                    suivis_actuels.append(item_enrichi)
 
                 ordre_etat = {"EN_COURS": 0, "A_VENIR": 1, "TERMINE": 2}
                 suivis_actuels.sort(key=lambda x: (
@@ -4412,196 +4407,151 @@ def api_favoris_toggle():
                 ))
                 _DERNIER_RAPPORT["favoris_suivis"] = suivis_actuels
             else:
-                for ex_s in suivis_actuels:
-                    ex_cle = str(ex_s.get("cle_favori") or "").strip() or _construire_cle_favori(
-                        ex_s.get("sport"), ex_s.get("event_id"), ex_s.get("match"), ex_s.get("date_match")
-                    )
-                    if ex_cle == cle:
-                        item_enrichi = dict(ex_s, est_favori=False)
-                        break
+                _DERNIER_RAPPORT["favoris_suivis"] = [
+                    it for it in suivis_actuels
+                    if (str(it.get("cle_favori") or "").strip() or _construire_cle_favori(
+                        it.get("sport"), it.get("event_id"), it.get("match"), it.get("date_match")
+                    )) != cle
+                ]
 
             _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
-            rapport_copie = dict(_DERNIER_RAPPORT)
-        else:
-            rapport_copie = None
-
-    if rapport_copie and rapport_copie.get("mis_a_jour"):
-        _sauvegarder_rapport_disque(rapport_copie)
-
-    if item_enrichi is None:
-        with _FAV_LOCK:
-            meta_fallback = dict(_FAVORIS_ACTIFS.get(cle) or payload or {})
-        meta_fallback["cle_favori"] = cle
-        meta_fallback["est_favori"] = est_fav
-        meta_fallback.setdefault("etat_match", "A_VENIR")
-        item_enrichi = meta_fallback
+            _sauvegarder_rapport_disque(_DERNIER_RAPPORT)
 
     return jsonify({
         "ok": True,
         "cle_favori": cle,
         "est_favori": est_fav,
         "total_favoris": len(cles_actuelles),
+        "favoris": cles_actuelles,
         "item": item_enrichi,
-    }), 200
+    })
 
 
 @app.route("/api/favoris/clear-done", methods=["POST"])
 def api_favoris_clear_done():
-    supprimes, total_restants = nettoyer_favoris_termines()
+    supprimes, restants = nettoyer_favoris_termines()
     with _STATE_LOCK:
         if _DERNIER_RAPPORT.get("mis_a_jour"):
+            _DERNIER_RAPPORT["favoris_suivis"] = [
+                it for it in (_DERNIER_RAPPORT.get("favoris_suivis") or [])
+                if str(it.get("etat_match") or "").upper() != "TERMINE"
+            ]
             _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
-            rapport_copie = dict(_DERNIER_RAPPORT)
-        else:
-            rapport_copie = None
-
-    if rapport_copie and rapport_copie.get("mis_a_jour"):
-        _sauvegarder_rapport_disque(rapport_copie)
+            _sauvegarder_rapport_disque(_DERNIER_RAPPORT)
 
     return jsonify({
         "ok": True,
         "supprimes": supprimes,
-        "total_favoris": total_restants,
-    }), 200
+        "total_favoris": restants,
+    })
 
 
 @app.route("/api/historique/statut", methods=["POST"])
 def api_historique_statut():
     payload = request.get_json(silent=True) or request.form or {}
-    refus = _verifier_acces_admin("/api/historique/statut", CFG.statut_rate_limit_sec, payload=payload, json_mode=True)
+    refus = _verifier_acces_admin("historique_statut", CFG.statut_rate_limit_sec, payload=payload, json_mode=True)
     if refus is not None:
         return refus
 
-    bilan = definir_statut_historique(
-        payload.get("sport"),
-        payload.get("event_id"),
-        payload.get("choix"),
-        payload.get("statut"),
-    )
+    sport = payload.get("sport")
+    event_id = payload.get("event_id")
+    choix = payload.get("choix")
+    statut = payload.get("statut")
+
+    if not sport or not event_id or not choix or not statut:
+        return jsonify({"ok": False, "error": "Champs requis : sport, event_id, choix, statut"}), 400
+
+    bilan = definir_statut_historique(sport, event_id, choix, statut)
     if bilan is None:
-        return jsonify({"ok": False, "error": "Entrée introuvable ou statut invalide"}), 404
+        return jsonify({"ok": False, "error": "Pronostic introuvable ou statut invalide"}), 404
+
     with _STATE_LOCK:
-        _DERNIER_RAPPORT["bilan"] = bilan
-        rapport_copie = dict(_DERNIER_RAPPORT)
-    _sauvegarder_rapport_disque(rapport_copie)
-    return jsonify({"ok": True, "bilan": bilan}), 200
+        if _DERNIER_RAPPORT.get("mis_a_jour"):
+            _DERNIER_RAPPORT["bilan"] = bilan
+            _sauvegarder_rapport_disque(_DERNIER_RAPPORT)
 
-
-if CFG.activer_debug_routes:
-    @app.route("/api/debug-foot")
-    def api_debug_foot():
-        fonctions = [n for n in dir(fb) if not n.startswith("_") and callable(getattr(fb, n, None))]
-        sched = get_foot_schedule_cached("160", "ligue-1", CFG.saison_foot)
-        evs = _extraire_events(sched)
-        echantillon = [
-            {
-                "id": ev.get("id"),
-                "status": ev.get("status"),
-                "date": ev.get("start_time") or ev.get("date"),
-                "home": (_normaliser_home_away(ev)[0].get("name")),
-                "away": (_normaliser_home_away(ev)[1].get("name")),
-            }
-            for ev in evs[:5]
-        ]
-        return jsonify({
-            "module": getattr(fb, "__name__", str(fb)),
-            "fonctions_disponibles": fonctions,
-            "nb_events_psg": len(evs),
-            "echantillon_psg": echantillon,
-        })
-
-
-@app.route("/refresh", methods=["POST"])
-def refresh():
-    payload = request.get_json(silent=True) or request.form or {}
-    wants_json = request.is_json or ("application/json" in (request.headers.get("Accept") or ""))
-    refus = _verifier_acces_admin("/refresh", CFG.refresh_rate_limit_sec, payload=payload, json_mode=wants_json)
-    if refus is not None:
-        return refus
-
-    _demarrer_analyse_si_besoin(0.0)
-    if wants_json:
-        return jsonify({"ok": True, "message": "Analyse lancée"}), 202
-    return redirect(url_for("app_view"))
+    return jsonify({"ok": True, "bilan": bilan})
 
 
 @app.route("/")
 def index():
     with _STATE_LOCK:
-        rapport = dict(_DERNIER_RAPPORT)
+        maj = _DERNIER_RAPPORT.get("mis_a_jour")
         en_cours = _ANALYSE_EN_COURS
-
-    maj = rapport.get("mis_a_jour")
-    pret = bool(maj)
-
-    if not pret and not en_cours:
-        _demarrer_analyse_si_besoin(0.2)
-
+    if not maj and not en_cours:
+        _demarrer_analyse_si_besoin(0.0)
     resp = make_response(render_template_string(
         _HTML_HOME,
-        pret=pret,
-        mis_a_jour=maj,
+        pret=bool(maj),
         en_cours=en_cours,
+        mis_a_jour=maj,
         fenetre_heures=CFG.fenetre_heures,
-    ), 200)
+    ))
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
-@app.route("/favoris")
-def favoris_view():
+def _rendre_vue_principale(page_favoris=False):
+    cat = "favoris" if page_favoris else request.args.get("cat", "all")
     with _STATE_LOCK:
         rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
         en_cours = _ANALYSE_EN_COURS
-
     if not rapport.get("mis_a_jour"):
         if not en_cours:
             _demarrer_analyse_si_besoin(0.0)
-        resp = make_response(render_template_string(_HTML_LOADING), 200)
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-        return resp
-
-    resp = make_response(render_template_string(
+        return render_template_string(_HTML_LOADING), 202
+    return render_template_string(
         _HTML_PAGE,
         r=rapport,
-        cat="favoris",
-        page_favoris=True,
-        en_cours=en_cours,
+        cat=cat,
+        page_favoris=page_favoris,
         fenetre_heures=CFG.fenetre_heures,
+        en_cours=en_cours,
         token_requis=bool(CFG.admin_token),
-    ), 200)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+    )
 
 
 @app.route("/app")
 def app_view():
-    cat = request.args.get("cat", "all")
-    if cat not in ("all", "favoris", "live", "top", "foot", "tennis", "alertes", "bilan"):
-        cat = "all"
+    return _rendre_vue_principale(page_favoris=False)
 
-    with _STATE_LOCK:
-        rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
-        en_cours = _ANALYSE_EN_COURS
 
-    if not rapport.get("mis_a_jour"):
-        if not en_cours:
-            _demarrer_analyse_si_besoin(0.0)
-        resp = make_response(render_template_string(_HTML_LOADING), 200)
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-        return resp
+@app.route("/favoris")
+def favoris_view():
+    return _rendre_vue_principale(page_favoris=True)
 
-    resp = make_response(render_template_string(
-        _HTML_PAGE,
-        r=rapport,
-        cat=cat,
-        page_favoris=(cat == "favoris"),
-        en_cours=en_cours,
-        fenetre_heures=CFG.fenetre_heures,
-        token_requis=bool(CFG.admin_token),
-    ), 200)
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
+
+@app.route("/refresh", methods=["GET", "POST"])
+def refresh():
+    wants_json = "application/json" in (request.headers.get("Accept") or "")
+    if request.method == "POST":
+        payload = request.get_json(silent=True) or request.form or {}
+        refus = _verifier_acces_admin("refresh", CFG.refresh_rate_limit_sec, payload=payload, json_mode=wants_json)
+        if refus is not None:
+            return refus
+
+    _demarrer_analyse_si_besoin(0.0)
+    if wants_json:
+        return jsonify({"ok": True, "status": "refresh_started"}), 202
+    return redirect(url_for("app_view"))
+
+
+if CFG.activer_debug_routes:
+    @app.route("/debug-foot")
+    def debug_foot():
+        if CFG.admin_token:
+            refus = _verifier_acces_admin("debug_foot", 0.0, json_mode=True)
+            if refus is not None:
+                return refus
+        with _STATE_LOCK:
+            rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
+        return jsonify({
+            "mis_a_jour": rapport.get("mis_a_jour"),
+            "stats_comp": rapport.get("stats_comp"),
+            "en_cours_count": len(rapport.get("en_cours_matchs", [])),
+            "favoris_count": len(rapport.get("favoris_suivis", [])),
+            "apercu_bruts": rapport.get("apercu_bruts"),
+        })
 
 
 _nettoyer_fichiers_tmp_orphelins()
@@ -4609,9 +4559,7 @@ _charger_favoris_disque()
 _charger_rapport_disque()
 _demarrer_scheduler_si_actif()
 
-if not _DERNIER_RAPPORT.get("mis_a_jour"):
-    _demarrer_analyse_si_besoin(0.5)
-
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    logger.info("Démarrage sur 0.0.0.0:%s (fenetre: %sh)", port, CFG.fenetre_heures)
+    app.run(host="0.0.0.0", port=port, debug=False)
