@@ -559,9 +559,16 @@ def _construire_cle_favori(sport, event_id="", match="", date_match=""):
     eid = str(event_id or "").strip()
     if eid:
         return f"{sp}:{eid}"
-    m_norm = re.sub(r"\s+", " ", _normaliser_nom_equipe(match))
+    raw_match = str(match or "").strip()
+    if " vs " in raw_match.lower():
+        parts = re.split(r"\s+vs\s+", raw_match, maxsplit=1, flags=re.IGNORECASE)
+        p0 = _normaliser_nom_equipe(parts[0])
+        p1 = _normaliser_nom_equipe(parts[1])
+        m_norm = f"{p0} vs {p1}".strip()
+    else:
+        m_norm = re.sub(r"\s+", " ", _normaliser_nom_equipe(raw_match))
     d_norm = str(date_match or "").strip()[:16]
-    return f"{sp}:{m_norm}:{d_norm}"
+    return f"{sp}:{m_norm or 'match'}:{d_norm}"
 
 
 def _charger_favoris_disque():
@@ -574,7 +581,16 @@ def _charger_favoris_disque():
             with open(FICHIER_FAVORIS, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict):
-                _FAVORIS_ACTIFS = {str(k): v for k, v in data.items() if isinstance(v, dict)}
+                normalises = {}
+                for k, v in data.items():
+                    if not isinstance(v, dict):
+                        continue
+                    cle_v = str(v.get("cle_favori") or k or "").strip()
+                    if cle_v:
+                        v_copy = dict(v)
+                        v_copy["cle_favori"] = cle_v
+                        normalises[cle_v] = v_copy
+                _FAVORIS_ACTIFS = normalises
         except Exception as e:
             logger.warning("Impossible de charger les favoris disque : %s", e)
             _FAVORIS_ACTIFS = {}
@@ -613,6 +629,8 @@ def _safe_float(val, default=None):
 
 
 def basculer_favori(item_data, force_etat=None):
+    if not isinstance(item_data, dict):
+        item_data = {}
     cle = str(item_data.get("cle_favori") or "").strip() or _construire_cle_favori(
         item_data.get("sport"),
         item_data.get("event_id"),
@@ -653,6 +671,8 @@ def basculer_favori(item_data, force_etat=None):
                 "confiance_score": conf_sc_val,
                 "detail": str(item_data.get("detail") or existant.get("detail") or ""),
                 "etat_match": str(item_data.get("etat_match") or existant.get("etat_match") or "A_VENIR").upper(),
+                "score_actuel": str(item_data.get("score_actuel") or existant.get("score_actuel") or ""),
+                "chrono_live": str(item_data.get("chrono_live") or existant.get("chrono_live") or ""),
                 "ajoute_le": existant.get("ajoute_le") or datetime.now(TZ_PARIS).strftime("%Y-%m-%d %H:%M"),
             }
         else:
@@ -661,7 +681,7 @@ def basculer_favori(item_data, force_etat=None):
         _sauvegarder_favoris_disque_locked()
         cles_actuelles = list(_FAVORIS_ACTIFS.keys())
 
-    return ajouter, cles_actuelles
+    return ajouter, cles_actuelles, cle
 
 
 def nettoyer_favoris_termines():
@@ -1352,7 +1372,7 @@ def _titre_est_pertinent_pour_cible(titre, cible):
 def _filtrer_titres_pertinents(titres, cible):
     retenus = []
     for t in titres or []:
-        if _titre_est_pertinents_pour_cible(t, cible):
+        if _titre_est_pertinent_pour_cible(t, cible):
             retenus.append(str(t).strip())
     return retenus
 
@@ -3133,7 +3153,7 @@ _HTML_PAGE = """<!doctype html>
       background: rgba(15, 23, 42, 0.85); color: var(--text); border: 1px solid var(--border);
       font-weight: 600; padding: 7px 12px; font-size: 0.82em;
     }
-    .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-ghost:hover, .btn-ghost.active { border-color: var(--accent); color: var(--accent); }
     .btn-danger-ghost {
       background: rgba(239, 68, 68, 0.1); color: #fca5a5; border: 1px solid rgba(239, 68, 68, 0.35);
       font-weight: 700; padding: 7px 12px; font-size: 0.82em;
@@ -3365,7 +3385,7 @@ _HTML_PAGE = """<!doctype html>
         <span class="fav-kpi">✓ Terminés : <strong id="kpi-fav-done">{{ fav_done|length }}</strong></span>
       </div>
       <div class="header-actions">
-        <button type="button" class="btn-ghost" onclick="setFavGroupFilter('ALL', this)" id="fav-filter-all">Tous</button>
+        <button type="button" class="btn-ghost active" onclick="setFavGroupFilter('ALL', this)" id="fav-filter-all">Tous</button>
         <button type="button" class="btn-ghost" onclick="setFavGroupFilter('ACTIFS', this)" id="fav-filter-actifs">Actifs (Live + À venir)</button>
         <button type="button" class="btn-danger-ghost" id="btn-clear-done" onclick="nettoyerTermines()" {% if fav_done|length == 0 %}disabled{% endif %}>
           🗑 Effacer terminés (<span id="kpi-fav-done-btn">{{ fav_done|length }}</span>)
@@ -3957,6 +3977,33 @@ _HTML_PAGE = """<!doctype html>
       appliquerFiltres();
     }
 
+    function ensureFavorisSectionsExist() {
+      const container = document.getElementById("favoris-container");
+      if (!container) return;
+      if (!document.getElementById("fav-sec-live")) {
+        container.innerHTML = `
+          <div class="fav-group-section" data-fav-group="ACTIFS" id="fav-sec-live" style="display:none;">
+            <div class="fav-section-header">
+              <div class="fav-section-title"><span class="dot-red"></span> En direct <span class="fav-count-pill" id="cnt-fav-live">0</span></div>
+            </div>
+            <div class="grid" id="fav-grid-live"></div>
+          </div>
+          <div class="fav-group-section" data-fav-group="ACTIFS" id="fav-sec-upcoming" style="display:none;">
+            <div class="fav-section-header">
+              <div class="fav-section-title">⏱ À venir <span class="fav-count-pill" id="cnt-fav-upcoming">0</span></div>
+            </div>
+            <div class="grid" id="fav-grid-upcoming"></div>
+          </div>
+          <div class="fav-group-section" data-fav-group="TERMINE" id="fav-sec-done" style="display:none;">
+            <div class="fav-section-header">
+              <div class="fav-section-title">✓ Terminés <span class="fav-count-pill" id="cnt-fav-done">0</span></div>
+            </div>
+            <div class="grid" id="fav-grid-done"></div>
+          </div>
+        `;
+      }
+    }
+
     function rafraichirCompteursFavoris() {
       const allFavCards = Array.from(document.querySelectorAll("#favoris-container .card[data-fav-card]"));
       const liveCards = allFavCards.filter(c => c.dataset.favState === "EN_COURS");
@@ -4109,6 +4156,7 @@ _HTML_PAGE = """<!doctype html>
 
     function synchroniserCarteFavoriDom(item, estFav) {
       if (!PAGE_FAVORIS) return;
+      ensureFavorisSectionsExist();
       const cle = String(item.cle_favori || "");
       if (!cle) return;
 
@@ -4217,29 +4265,34 @@ _HTML_PAGE = """<!doctype html>
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
         });
-        if (res.ok) {
-          const data = await res.json();
-          const estFav = Boolean(data.est_favori);
-          const cle = data.cle_favori || payload.cle_favori;
-          const itemSync = data.item || { ...payload, cle_favori: cle, est_favori: estFav };
-
-          document.querySelectorAll(".star-btn").forEach(other => {
-            if ((other.dataset.cleFavori || "") === cle) {
-              other.classList.toggle("active", estFav);
-              other.textContent = estFav ? "★" : "☆";
-              other.title = estFav ? "Retirer des favoris" : "Ajouter aux favoris";
-            }
-          });
-
-          if (typeof data.total_favoris === "number") {
-            const tCpt = document.getElementById("fav-count-tab");
-            if (tCpt) tCpt.textContent = data.total_favoris;
-          }
-
-          synchroniserCarteFavoriDom(itemSync, estFav);
-          trierCartes();
-          appliquerFiltres();
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.ok) {
+          afficherBanniere(data.error || "Impossible de mettre à jour les favoris pour le moment.");
+          return;
         }
+
+        const estFav = Boolean(data.est_favori);
+        const cle = String(data.cle_favori || payload.cle_favori || "");
+        const itemSync = data.item || { ...payload, cle_favori: cle, est_favori: estFav };
+
+        document.querySelectorAll(".star-btn").forEach(other => {
+          const oCle = other.dataset.cleFavori || "";
+          if ((cle && oCle === cle) || (!cle && other === btn)) {
+            if (cle) other.dataset.cleFavori = cle;
+            other.classList.toggle("active", estFav);
+            other.textContent = estFav ? "★" : "☆";
+            other.title = estFav ? "Retirer des favoris" : "Ajouter aux favoris";
+          }
+        });
+
+        if (typeof data.total_favoris === "number") {
+          const tCpt = document.getElementById("fav-count-tab");
+          if (tCpt) tCpt.textContent = String(data.total_favoris);
+        }
+
+        synchroniserCarteFavoriDom(itemSync, estFav);
+        trierCartes();
+        appliquerFiltres();
       } catch (e) {
         afficherBanniere("Impossible de mettre à jour les favoris pour le moment.");
       } finally {
@@ -4252,12 +4305,12 @@ _HTML_PAGE = """<!doctype html>
       if (btn) btn.disabled = true;
       try {
         const res = await fetch("/api/favoris/clear-done", { method: "POST" });
-        if (res.ok) {
-          const data = await res.json();
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.ok) {
           document.querySelectorAll('#favoris-container .card[data-fav-state="TERMINE"]').forEach(c => c.remove());
           if (typeof data.total_favoris === "number") {
             const tCpt = document.getElementById("fav-count-tab");
-            if (tCpt) tCpt.textContent = data.total_favoris;
+            if (tCpt) tCpt.textContent = String(data.total_favoris);
           }
           rafraichirCompteursFavoris();
           trierCartes();
@@ -4350,7 +4403,7 @@ def api_analyse():
 
 @app.route("/api/favoris/toggle", methods=["POST"])
 def api_favoris_toggle():
-    payload = request.get_json(silent=True) or request.form or {}
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
     force_raw = payload.get("favori")
     force_etat = None
     if isinstance(force_raw, bool):
@@ -4360,61 +4413,63 @@ def api_favoris_toggle():
     elif isinstance(force_raw, str) and force_raw.strip().lower() in ("0", "false", "no", "off"):
         force_etat = False
 
-    est_fav, cles_actuelles = basculer_favori(payload, force_etat=force_etat)
-    cle = str(payload.get("cle_favori") or "").strip() or _construire_cle_favori(
-        payload.get("sport"), payload.get("event_id"), payload.get("match"), payload.get("date_match")
-    )
+    est_fav, cles_actuelles, cle = basculer_favori(payload, force_etat=force_etat)
 
-    item_enrichi = None
+    with _FAV_LOCK:
+        meta = dict(_FAVORIS_ACTIFS.get(cle) or payload or {})
+
+    item_enrichi = dict(meta)
+    item_enrichi["cle_favori"] = cle
+    item_enrichi["est_favori"] = est_fav
+    item_enrichi.setdefault("etat_match", "EN_COURS" if item_enrichi.get("en_cours") else "A_VENIR")
+
     with _STATE_LOCK:
+        suivis_actuels = list(_DERNIER_RAPPORT.get("favoris_suivis") or [])
+        index_ref = {}
+        for liste_k in ("en_cours_matchs", "top_sur", "foot", "tennis"):
+            for ref_it in (_DERNIER_RAPPORT.get(liste_k) or []):
+                ref_cle = str(ref_it.get("cle_favori") or "").strip() or _construire_cle_favori(
+                    ref_it.get("sport"), ref_it.get("event_id"), ref_it.get("match"), ref_it.get("date_match")
+                )
+                if ref_cle:
+                    index_ref[ref_cle] = ref_it
+
+        if est_fav:
+            source_it = dict(index_ref.get(cle) or {})
+            source_it.update({k: v for k, v in meta.items() if v not in (None, "")})
+            source_it["cle_favori"] = cle
+            source_it["est_favori"] = True
+            source_it.setdefault("etat_match", "EN_COURS" if source_it.get("en_cours") else "A_VENIR")
+            item_enrichi = dict(source_it)
+
+            remplace = False
+            for idx_s, existing_s in enumerate(suivis_actuels):
+                ex_cle = str(existing_s.get("cle_favori") or "").strip() or _construire_cle_favori(
+                    existing_s.get("sport"), existing_s.get("event_id"), existing_s.get("match"), existing_s.get("date_match")
+                )
+                if ex_cle == cle:
+                    suivis_actuels[idx_s] = item_enrichi
+                    remplace = True
+                    break
+            if not remplace:
+                suivis_actuels.append(item_enrichi)
+
+            ordre_etat = {"EN_COURS": 0, "A_VENIR": 1, "TERMINE": 2}
+            suivis_actuels.sort(key=lambda x: (
+                ordre_etat.get(str(x.get("etat_match") or "A_VENIR").upper(), 1),
+                _cle_cle_chronologique(x),
+            ))
+            _DERNIER_RAPPORT["favoris_suivis"] = suivis_actuels
+        else:
+            _DERNIER_RAPPORT["favoris_suivis"] = [
+                it for it in suivis_actuels
+                if (str(it.get("cle_favori") or "").strip() or _construire_cle_favori(
+                    it.get("sport"), it.get("event_id"), it.get("match"), it.get("date_match")
+                )) != cle
+            ]
+
+        _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
         if _DERNIER_RAPPORT.get("mis_a_jour"):
-            suivis_actuels = list(_DERNIER_RAPPORT.get("favoris_suivis") or [])
-            index_ref = {}
-            for liste_k in ("en_cours_matchs", "top_sur", "foot", "tennis"):
-                for ref_it in (_DERNIER_RAPPORT.get(liste_k) or []):
-                    ref_cle = str(ref_it.get("cle_favori") or "").strip() or _construire_cle_favori(
-                        ref_it.get("sport"), ref_it.get("event_id"), ref_it.get("match"), ref_it.get("date_match")
-                    )
-                    if ref_cle:
-                        index_ref[ref_cle] = ref_it
-
-            if est_fav:
-                with _FAV_LOCK:
-                    meta = dict(_FAVORIS_ACTIFS.get(cle) or payload or {})
-                source_it = dict(index_ref.get(cle) or meta)
-                source_it.update({k: v for k, v in meta.items() if v not in (None, "")})
-                source_it["cle_favori"] = cle
-                source_it["est_favori"] = True
-                source_it.setdefault("etat_match", "EN_COURS" if source_it.get("en_cours") else "A_VENIR")
-                item_enrichi = dict(source_it)
-
-                remplace = False
-                for idx_s, existing_s in enumerate(suivis_actuels):
-                    ex_cle = str(existing_s.get("cle_favori") or "").strip() or _construire_cle_favori(
-                        existing_s.get("sport"), existing_s.get("event_id"), existing_s.get("match"), existing_s.get("date_match")
-                    )
-                    if ex_cle == cle:
-                        suivis_actuels[idx_s] = item_enrichi
-                        remplace = True
-                        break
-                if not remplace:
-                    suivis_actuels.append(item_enrichi)
-
-                ordre_etat = {"EN_COURS": 0, "A_VENIR": 1, "TERMINE": 2}
-                suivis_actuels.sort(key=lambda x: (
-                    ordre_etat.get(str(x.get("etat_match") or "A_VENIR").upper(), 1),
-                    _cle_cle_chronologique(x),
-                ))
-                _DERNIER_RAPPORT["favoris_suivis"] = suivis_actuels
-            else:
-                _DERNIER_RAPPORT["favoris_suivis"] = [
-                    it for it in suivis_actuels
-                    if (str(it.get("cle_favori") or "").strip() or _construire_cle_favori(
-                        it.get("sport"), it.get("event_id"), it.get("match"), it.get("date_match")
-                    )) != cle
-                ]
-
-            _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
             _sauvegarder_rapport_disque(_DERNIER_RAPPORT)
 
     return jsonify({
@@ -4423,7 +4478,7 @@ def api_favoris_toggle():
         "est_favori": est_fav,
         "total_favoris": len(cles_actuelles),
         "favoris": cles_actuelles,
-        "item": item_enrichi,
+        "item": item_enrichi if est_fav else None,
     })
 
 
@@ -4431,12 +4486,12 @@ def api_favoris_toggle():
 def api_favoris_clear_done():
     supprimes, restants = nettoyer_favoris_termines()
     with _STATE_LOCK:
+        _DERNIER_RAPPORT["favoris_suivis"] = [
+            it for it in (_DERNIER_RAPPORT.get("favoris_suivis") or [])
+            if str(it.get("etat_match") or "").upper() != "TERMINE"
+        ]
+        _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
         if _DERNIER_RAPPORT.get("mis_a_jour"):
-            _DERNIER_RAPPORT["favoris_suivis"] = [
-                it for it in (_DERNIER_RAPPORT.get("favoris_suivis") or [])
-                if str(it.get("etat_match") or "").upper() != "TERMINE"
-            ]
-            _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
             _sauvegarder_rapport_disque(_DERNIER_RAPPORT)
 
     return jsonify({
@@ -4453,113 +4508,137 @@ def api_historique_statut():
     if refus is not None:
         return refus
 
-    sport = payload.get("sport")
-    event_id = payload.get("event_id")
-    choix = payload.get("choix")
-    statut = payload.get("statut")
-
-    if not sport or not event_id or not choix or not statut:
-        return jsonify({"ok": False, "error": "Champs requis : sport, event_id, choix, statut"}), 400
+    sport = payload.get("sport", "")
+    event_id = payload.get("event_id", "")
+    choix = payload.get("choix", "")
+    statut = payload.get("statut", "")
 
     bilan = definir_statut_historique(sport, event_id, choix, statut)
     if bilan is None:
-        return jsonify({"ok": False, "error": "Pronostic introuvable ou statut invalide"}), 404
+        return jsonify({"ok": False, "error": "Pronostic introuvable ou statut invalide"}), 400
 
     with _STATE_LOCK:
+        _DERNIER_RAPPORT["bilan"] = bilan
         if _DERNIER_RAPPORT.get("mis_a_jour"):
-            _DERNIER_RAPPORT["bilan"] = bilan
             _sauvegarder_rapport_disque(_DERNIER_RAPPORT)
 
     return jsonify({"ok": True, "bilan": bilan})
 
 
-@app.route("/")
-def index():
-    with _STATE_LOCK:
-        maj = _DERNIER_RAPPORT.get("mis_a_jour")
-        en_cours = _ANALYSE_EN_COURS
-    if not maj and not en_cours:
-        _demarrer_analyse_si_besoin(0.0)
-    resp = make_response(render_template_string(
-        _HTML_HOME,
-        pret=bool(maj),
-        en_cours=en_cours,
-        mis_a_jour=maj,
-        fenetre_heures=CFG.fenetre_heures,
-    ))
-    resp.headers["Cache-Control"] = "no-store"
-    return resp
-
-
-def _rendre_vue_principale(page_favoris=False):
-    cat = "favoris" if page_favoris else request.args.get("cat", "all")
+@app.route("/favoris")
+def favoris_page():
+    _demarrer_scheduler_si_actif()
     with _STATE_LOCK:
         rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
         en_cours = _ANALYSE_EN_COURS
+
+    if not rapport.get("mis_a_jour") and not en_cours:
+        rapport = _annoter_favoris_dans_rapport(executer_analyse())
+        en_cours = False
+
     if not rapport.get("mis_a_jour"):
-        if not en_cours:
-            _demarrer_analyse_si_besoin(0.0)
-        return render_template_string(_HTML_LOADING), 202
+        return render_template_string(_HTML_LOADING), 200
+
     return render_template_string(
         _HTML_PAGE,
         r=rapport,
-        cat=cat,
-        page_favoris=page_favoris,
+        cat="favoris",
+        page_favoris=True,
         fenetre_heures=CFG.fenetre_heures,
         en_cours=en_cours,
         token_requis=bool(CFG.admin_token),
     )
 
 
+@app.route("/")
+def index():
+    _demarrer_scheduler_si_actif()
+    with _STATE_LOCK:
+        maj = _DERNIER_RAPPORT.get("mis_a_jour")
+        en_cours = _ANALYSE_EN_COURS
+
+    if not maj and not en_cours:
+        _demarrer_analyse_si_besoin(0.0)
+        en_cours = True
+
+    return render_template_string(
+        _HTML_HOME,
+        pret=bool(maj),
+        en_cours=en_cours,
+        mis_a_jour=maj,
+        fenetre_heures=CFG.fenetre_heures,
+    )
+
+
 @app.route("/app")
 def app_view():
-    return _rendre_vue_principale(page_favoris=False)
+    _demarrer_scheduler_si_actif()
+    cat = (request.args.get("cat") or "all").strip().lower()
+    if cat not in ("all", "favoris", "live", "top", "foot", "tennis", "alertes", "bilan"):
+        cat = "all"
+
+    with _STATE_LOCK:
+        rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
+        en_cours = _ANALYSE_EN_COURS
+
+    if not rapport.get("mis_a_jour") and not en_cours:
+        rapport = _annoter_favoris_dans_rapport(executer_analyse())
+        en_cours = False
+
+    if not rapport.get("mis_a_jour"):
+        return render_template_string(_HTML_LOADING), 200
+
+    return render_template_string(
+        _HTML_PAGE,
+        r=rapport,
+        cat=cat,
+        page_favoris=(cat == "favoris"),
+        fenetre_heures=CFG.fenetre_heures,
+        en_cours=en_cours,
+        token_requis=bool(CFG.admin_token),
+    )
 
 
-@app.route("/favoris")
-def favoris_view():
-    return _rendre_vue_principale(page_favoris=True)
-
-
-@app.route("/refresh", methods=["GET", "POST"])
+@app.route("/refresh", methods=["POST"])
 def refresh():
-    wants_json = "application/json" in (request.headers.get("Accept") or "")
-    if request.method == "POST":
-        payload = request.get_json(silent=True) or request.form or {}
-        refus = _verifier_acces_admin("refresh", CFG.refresh_rate_limit_sec, payload=payload, json_mode=wants_json)
-        if refus is not None:
-            return refus
+    payload = request.get_json(silent=True) or request.form or {}
+    wants_json = request.is_json or ("application/json" in (request.headers.get("Accept") or ""))
+    refus = _verifier_acces_admin("refresh", CFG.refresh_rate_limit_sec, payload=payload, json_mode=wants_json)
+    if refus is not None:
+        return refus
 
-    _demarrer_analyse_si_besoin(0.0)
-    if wants_json:
-        return jsonify({"ok": True, "status": "refresh_started"}), 202
-    return redirect(url_for("app_view"))
+    executer_analyse()
+    ref = request.headers.get("Referer") or ""
+    if "/favoris" in ref:
+        return redirect(url_for("favoris_page"))
+    parsed = urllib.parse.urlparse(ref)
+    qs = urllib.parse.parse_qs(parsed.query)
+    cat = (qs.get("cat") or ["all"])[0]
+    if cat not in ("all", "favoris", "live", "top", "foot", "tennis", "alertes", "bilan"):
+        cat = "all"
+    return redirect(url_for("app_view", cat=cat))
 
 
-if CFG.activer_debug_routes:
-    @app.route("/debug-foot")
-    def debug_foot():
-        if CFG.admin_token:
-            refus = _verifier_acces_admin("debug_foot", 0.0, json_mode=True)
-            if refus is not None:
-                return refus
-        with _STATE_LOCK:
-            rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
-        return jsonify({
-            "mis_a_jour": rapport.get("mis_a_jour"),
-            "stats_comp": rapport.get("stats_comp"),
-            "en_cours_count": len(rapport.get("en_cours_matchs", [])),
-            "favoris_count": len(rapport.get("favoris_suivis", [])),
-            "apercu_bruts": rapport.get("apercu_bruts"),
-        })
+@app.route("/debug/reset")
+def debug_reset():
+    if not CFG.activer_debug_routes:
+        return jsonify({"error": "Route debug désactivée"}), 404
+    _CACHE_FOOT_SCHED.clear()
+    _CACHE_SANTE.clear()
+    _CACHE_COTES_MARCHE.clear()
+    executer_analyse()
+    return redirect(url_for("app_view", cat="all"))
 
 
 _nettoyer_fichiers_tmp_orphelins()
 _charger_favoris_disque()
 _charger_rapport_disque()
+with _STATE_LOCK:
+    _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
 _demarrer_scheduler_si_actif()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    logger.info("Démarrage sur 0.0.0.0:%s (fenetre: %sh)", port, CFG.fenetre_heures)
+    port = int(os.getenv("PORT", "5000"))
+    if not _DERNIER_RAPPORT.get("mis_a_jour"):
+        _demarrer_analyse_si_besoin(0.2)
     app.run(host="0.0.0.0", port=port, debug=False)
