@@ -571,6 +571,20 @@ def _construire_cle_favori(sport, event_id="", match="", date_match=""):
     return f"{sp}:{m_norm or 'match'}:{d_norm}"
 
 
+def _normaliser_cle_favori_entree(item):
+    if not isinstance(item, dict):
+        return ""
+    explicit = str(item.get("cle_favori") or "").strip()
+    if explicit:
+        return explicit
+    return _construire_cle_favori(
+        item.get("sport"),
+        item.get("event_id"),
+        item.get("match"),
+        item.get("date_match"),
+    )
+
+
 def _charger_favoris_disque():
     global _FAVORIS_ACTIFS
     with _FAV_LOCK:
@@ -585,9 +599,16 @@ def _charger_favoris_disque():
                 for k, v in data.items():
                     if not isinstance(v, dict):
                         continue
-                    cle_v = str(v.get("cle_favori") or k or "").strip()
+                    v_copy = dict(v)
+                    cle_v = str(v_copy.get("cle_favori") or k or "").strip()
+                    if not cle_v:
+                        cle_v = _construire_cle_favori(
+                            v_copy.get("sport"),
+                            v_copy.get("event_id"),
+                            v_copy.get("match"),
+                            v_copy.get("date_match"),
+                        )
                     if cle_v:
-                        v_copy = dict(v)
                         v_copy["cle_favori"] = cle_v
                         normalises[cle_v] = v_copy
                 _FAVORIS_ACTIFS = normalises
@@ -688,7 +709,7 @@ def nettoyer_favoris_termines():
     with _STATE_LOCK:
         suivis = list(_DERNIER_RAPPORT.get("favoris_suivis") or [])
         cles_a_supprimer = {
-            (it.get("cle_favori") or _construire_cle_favori(it.get("sport"), it.get("event_id"), it.get("match"), it.get("date_match")))
+            _normaliser_cle_favori_entree(it)
             for it in suivis
             if str(it.get("etat_match") or "").upper() == "TERMINE"
         }
@@ -699,7 +720,7 @@ def nettoyer_favoris_termines():
                 cles_a_supprimer.add(cle)
         supprimes = 0
         for cle in cles_a_supprimer:
-            if _FAVORIS_ACTIFS.pop(cle, None) is not None:
+            if cle and _FAVORIS_ACTIFS.pop(cle, None) is not None:
                 supprimes += 1
         if supprimes:
             _sauvegarder_favoris_disque_locked()
@@ -1651,7 +1672,7 @@ def analyser_foot_competitions(competitions, heures_max=48):
                 )
                 clos_comp[cle_ev] = ev_enrichi
                 if eid:
-                    clos_comp[eid] = ev_enrichi
+                    clos_comp[f"FOOT:{eid}"] = ev_enrichi
 
         res_comp = []
         apercu_comp = []
@@ -1839,7 +1860,7 @@ def analyser_tennis(heures_max=48):
                     cle_fav = _construire_cle_favori("TENNIS", mid, match_lbl, date_loc)
                     termines_tennis[cle_fav] = m_enrichi
                     if mid:
-                        termines_tennis[mid] = m_enrichi
+                        termines_tennis[f"TENNIS:{mid}"] = m_enrichi
 
                 est_live = _est_match_en_cours(m)
                 if not est_live and not _est_match_a_venir_dans_fenetre(m, heures_max):
@@ -2004,6 +2025,7 @@ def _enrichir_matchs_live_avec_pronostics(live_items, candidats_precalcul):
             copie["pronostic_statut"] = "EN_ATTENTE"
             copie["pronostic_source"] = "Calculé"
 
+        copie["cle_favori"] = _normaliser_cle_favori_entree(copie)
         enrichis.append(copie)
 
     return enrichis
@@ -2018,17 +2040,15 @@ def _construire_favoris_suivis(tous_items_a_venir, live_enrichis, clos_globaux, 
 
     index_actifs = {}
     for it in (tous_items_a_venir or []) + (live_enrichis or []):
-        cle = str(it.get("cle_favori") or "").strip() or _construire_cle_favori(
-            it.get("sport"), it.get("event_id"), it.get("match"), it.get("date_match")
-        )
-        index_actifs[cle] = it
+        cle = _normaliser_cle_favori_entree(it)
+        if cle:
+            index_actifs[cle] = it
 
     anciens_suivis_map = {}
     for prev in (ancien_rapport or {}).get("favoris_suivis") or []:
-        cle_p = str(prev.get("cle_favori") or "").strip() or _construire_cle_favori(
-            prev.get("sport"), prev.get("event_id"), prev.get("match"), prev.get("date_match")
-        )
-        anciens_suivis_map[cle_p] = dict(prev)
+        cle_p = _normaliser_cle_favori_entree(prev)
+        if cle_p:
+            anciens_suivis_map[cle_p] = dict(prev)
 
     suivis = []
     for cle, meta in fav_map.items():
@@ -2041,7 +2061,10 @@ def _construire_favoris_suivis(tous_items_a_venir, live_enrichis, clos_globaux, 
             suivis.append(courant)
             continue
 
-        ev_clos = clos_globaux.get(cle) or clos_globaux.get(str(meta.get("event_id") or "").strip())
+        ev_clos = clos_globaux.get(cle) or (
+            clos_globaux.get(f"{str(meta.get('sport') or 'FOOT').upper()}:{str(meta.get('event_id') or '').strip()}")
+            if meta.get("event_id") else None
+        )
         if ev_clos:
             sport_u = str(ev_clos.get("_sport") or meta.get("sport") or "FOOT").upper()
             scores = _extraire_scores_evenement(ev_clos)
@@ -2120,25 +2143,48 @@ def _construire_favoris_suivis(tous_items_a_venir, live_enrichis, clos_globaux, 
 
 
 def _annoter_favoris_dans_rapport(rapport):
-    cles_fav = _obtenir_cles_favoris()
+    with _FAV_LOCK:
+        fav_map = {k: dict(v) for k, v in _FAVORIS_ACTIFS.items()}
+    cles_fav = set(fav_map.keys())
+
     r = dict(rapport)
     for liste_key in ("top_sur", "foot", "tennis", "en_cours_matchs"):
         nouvelle_liste = []
         for it in r.get(liste_key) or []:
             copie = dict(it)
-            cle = str(copie.get("cle_favori") or "").strip() or _construire_cle_favori(
-                copie.get("sport"), copie.get("event_id"), copie.get("match"), copie.get("date_match")
-            )
+            cle = _normaliser_cle_favori_entree(copie)
             copie["cle_favori"] = cle
             copie["est_favori"] = cle in cles_fav
             nouvelle_liste.append(copie)
         r[liste_key] = nouvelle_liste
 
-    r["favoris_suivis"] = [
-        dict(it, est_favori=True)
-        for it in (r.get("favoris_suivis") or [])
-        if (it.get("cle_favori") or _construire_cle_favori(it.get("sport"), it.get("event_id"), it.get("match"), it.get("date_match"))) in cles_fav
-    ]
+    existant_suivis = {}
+    for prev in r.get("favoris_suivis") or []:
+        cle_p = _normaliser_cle_favori_entree(prev)
+        if cle_p and cle_p in cles_fav:
+            copie_p = dict(prev)
+            copie_p["cle_favori"] = cle_p
+            copie_p["est_favori"] = True
+            existant_suivis[cle_p] = copie_p
+
+    for cle_f, meta_f in fav_map.items():
+        if cle_f not in existant_suivis:
+            item_f = dict(meta_f)
+            item_f["cle_favori"] = cle_f
+            item_f["est_favori"] = True
+            item_f.setdefault("etat_match", "A_VENIR")
+            item_f.setdefault("ts_match", 9_999_999_999.0)
+            item_f.setdefault("confiance", "MOYENNE")
+            item_f.setdefault("confiance_score", 50.0)
+            existant_suivis[cle_f] = item_f
+
+    suivis_liste = list(existant_suivis.values())
+    ordre_etat = {"EN_COURS": 0, "A_VENIR": 1, "TERMINE": 2}
+    suivis_liste.sort(key=lambda x: (
+        ordre_etat.get(str(x.get("etat_match") or "A_VENIR").upper(), 1),
+        _cle_cle_chronologique(x),
+    ))
+    r["favoris_suivis"] = suivis_liste
     return r
 
 
@@ -2363,8 +2409,9 @@ def mettre_a_jour_historique(items, evenements_termines=None):
         for r in lignes:
             if r.get("statut") == "EN_ATTENTE":
                 eid = str(r.get("event_id") or "").strip()
-                cle_fav = _construire_cle_favori(r.get("sport"), eid, r.get("match"), r.get("date_match"))
-                ev_clos = clos_map.get(cle_fav) or clos_map.get(eid)
+                sp_u = str(r.get("sport") or "FOOT").upper()
+                cle_fav = _construire_cle_favori(sp_u, eid, r.get("match"), r.get("date_match"))
+                ev_clos = clos_map.get(cle_fav) or clos_map.get(f"{sp_u}:{eid}") or clos_map.get(eid)
                 nouveau_statut = _resoudre_statut_depuis_evenement(r, ev_clos)
                 if nouveau_statut in ("GAGNE", "PERDU"):
                     r["statut"] = nouveau_statut
@@ -2463,7 +2510,7 @@ def executer_analyse():
     global _DERNIER_RAPPORT, _ANALYSE_EN_COURS
     with _STATE_LOCK:
         if _ANALYSE_EN_COURS:
-            return _DERNIER_RAPPORT
+            return _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
         _ANALYSE_EN_COURS = True
         ancien_rapport = dict(_DERNIER_RAPPORT)
 
@@ -3324,7 +3371,7 @@ _HTML_PAGE = """<!doctype html>
       </div>
     </div>
 
-    <div id="action-banner" class="notice warn" style="display: none;"></div>
+    <div id="action-banner" class="notice ok" style="display: none;"></div>
 
     <div class="cat-bar">
       <a href="{{ url_for('app_view', cat='all') }}" class="btn btn-cat {% if not page_favoris and cat == 'all' %}active{% endif %}">Tout</a>
@@ -3944,20 +3991,20 @@ _HTML_PAGE = """<!doctype html>
 
         if (res.status === 429) {
           const retryAfter = res.headers.get("Retry-After") || "quelques secondes";
-          afficherBanniere(`Actualisation limitée (rate-limit) : réessayez dans ${retryAfter}s.`);
+          afficherBanniere(`Actualisation limitée (rate-limit) : réessayez dans ${retryAfter}s.`, "warn");
           if (btn) { btn.disabled = false; btn.innerText = "↻ Actualiser"; }
           return false;
         }
         if (res.status === 401 || res.status === 403) {
           try { localStorage.removeItem("betpulse_admin_token"); } catch (e) {}
-          afficherBanniere("Accès refusé : token d'administration invalide.");
+          afficherBanniere("Accès refusé : token d'administration invalide.", "warn");
           if (btn) { btn.disabled = false; btn.innerText = "↻ Actualiser"; }
           return false;
         }
         window.location.replace(window.location.href);
       } catch (e) {
         if (btn) { btn.disabled = false; btn.innerText = "↻ Actualiser"; }
-        afficherBanniere("Erreur réseau lors de l'actualisation.");
+        afficherBanniere("Erreur réseau lors de l'actualisation.", "warn");
       }
       return false;
     }
@@ -4010,7 +4057,7 @@ _HTML_PAGE = """<!doctype html>
       const upCards = allFavCards.filter(c => c.dataset.favState === "A_VENIR");
       const doneCards = allFavCards.filter(c => c.dataset.favState === "TERMINE");
 
-      const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+      const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = String(v); };
       setTxt("kpi-fav-total", allFavCards.length);
       setTxt("kpi-fav-live", liveCards.length);
       setTxt("kpi-fav-upcoming", upCards.length);
@@ -4160,7 +4207,9 @@ _HTML_PAGE = """<!doctype html>
       const cle = String(item.cle_favori || "");
       if (!cle) return;
 
-      const existante = document.querySelector(`#favoris-container .card[data-fav-card][data-cle-favori="${CSS.escape(cle)}"]`);
+      const existante = Array.from(document.querySelectorAll("#favoris-container .card[data-fav-card]"))
+        .find(el => (el.dataset.cleFavori || "") === cle);
+
       if (!estFav) {
         if (existante) existante.remove();
         rafraichirCompteursFavoris();
@@ -4267,7 +4316,7 @@ _HTML_PAGE = """<!doctype html>
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !data.ok) {
-          afficherBanniere(data.error || "Impossible de mettre à jour les favoris pour le moment.");
+          afficherBanniere(data.error || "Impossible de mettre à jour les favoris pour le moment.", "warn");
           return;
         }
 
@@ -4293,8 +4342,14 @@ _HTML_PAGE = """<!doctype html>
         synchroniserCarteFavoriDom(itemSync, estFav);
         trierCartes();
         appliquerFiltres();
+        afficherBanniere(
+          estFav
+            ? `★ "${payload.match || payload.choix}" ajouté aux favoris (${data.total_favoris} suivi(s)).`
+            : `☆ "${payload.match || payload.choix}" retiré des favoris (${data.total_favoris} suivi(s)).`,
+          "ok"
+        );
       } catch (e) {
-        afficherBanniere("Impossible de mettre à jour les favoris pour le moment.");
+        afficherBanniere("Impossible de mettre à jour les favoris pour le moment.", "warn");
       } finally {
         btn.disabled = false;
       }
@@ -4320,7 +4375,7 @@ _HTML_PAGE = """<!doctype html>
           }
         }
       } catch (e) {
-        afficherBanniere("Erreur lors du nettoyage des matchs terminés.");
+        afficherBanniere("Erreur lors du nettoyage des matchs terminés.", "warn");
       } finally {
         rafraichirCompteursFavoris();
       }
@@ -4388,257 +4443,214 @@ def api_status():
         "mis_a_jour": maj,
         "en_cours": en_cours,
     }), 200)
-    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return resp
 
 
-@app.route("/api/analyse")
-def api_analyse():
+@app.route("/api/favoris", methods=["GET"])
+def api_favoris_liste():
     with _STATE_LOCK:
-        rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
-    if not rapport.get("mis_a_jour"):
-        rapport = executer_analyse()
-    return jsonify(rapport)
+        rapport_annote = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
+    return jsonify({
+        "ok": True,
+        "total_favoris": len(rapport_annote.get("favoris_suivis") or []),
+        "favoris_suivis": rapport_annote.get("favoris_suivis") or [],
+    }), 200
 
 
 @app.route("/api/favoris/toggle", methods=["POST"])
 def api_favoris_toggle():
-    payload = request.get_json(silent=True) or request.form.to_dict() or {}
-    force_raw = payload.get("favori")
-    force_etat = None
-    if isinstance(force_raw, bool):
-        force_etat = force_raw
-    elif isinstance(force_raw, str) and force_raw.strip().lower() in ("1", "true", "yes", "on"):
-        force_etat = True
-    elif isinstance(force_raw, str) and force_raw.strip().lower() in ("0", "false", "no", "off"):
-        force_etat = False
+    global _DERNIER_RAPPORT
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return jsonify({"ok": False, "error": "Payload invalide"}), 400
 
-    est_fav, cles_actuelles, cle = basculer_favori(payload, force_etat=force_etat)
-
-    with _FAV_LOCK:
-        meta = dict(_FAVORIS_ACTIFS.get(cle) or payload or {})
-
-    item_enrichi = dict(meta)
-    item_enrichi["cle_favori"] = cle
-    item_enrichi["est_favori"] = est_fav
-    item_enrichi.setdefault("etat_match", "EN_COURS" if item_enrichi.get("en_cours") else "A_VENIR")
+    est_fav, _, cle_normalisee = basculer_favori(payload)
 
     with _STATE_LOCK:
-        suivis_actuels = list(_DERNIER_RAPPORT.get("favoris_suivis") or [])
-        index_ref = {}
-        for liste_k in ("en_cours_matchs", "top_sur", "foot", "tennis"):
-            for ref_it in (_DERNIER_RAPPORT.get(liste_k) or []):
-                ref_cle = str(ref_it.get("cle_favori") or "").strip() or _construire_cle_favori(
-                    ref_it.get("sport"), ref_it.get("event_id"), ref_it.get("match"), ref_it.get("date_match")
-                )
-                if ref_cle:
-                    index_ref[ref_cle] = ref_it
+        base_rapport = dict(_DERNIER_RAPPORT)
+        suivis_actuels = list(base_rapport.get("favoris_suivis") or [])
+        item_trouve = None
 
         if est_fav:
-            source_it = dict(index_ref.get(cle) or {})
-            source_it.update({k: v for k, v in meta.items() if v not in (None, "")})
-            source_it["cle_favori"] = cle
-            source_it["est_favori"] = True
-            source_it.setdefault("etat_match", "EN_COURS" if source_it.get("en_cours") else "A_VENIR")
-            item_enrichi = dict(source_it)
-
-            remplace = False
-            for idx_s, existing_s in enumerate(suivis_actuels):
-                ex_cle = str(existing_s.get("cle_favori") or "").strip() or _construire_cle_favori(
-                    existing_s.get("sport"), existing_s.get("event_id"), existing_s.get("match"), existing_s.get("date_match")
-                )
-                if ex_cle == cle:
-                    suivis_actuels[idx_s] = item_enrichi
-                    remplace = True
+            for it in suivis_actuels:
+                if _normaliser_cle_favori_entree(it) == cle_normalisee:
+                    item_trouve = dict(it)
                     break
-            if not remplace:
-                suivis_actuels.append(item_enrichi)
 
-            ordre_etat = {"EN_COURS": 0, "A_VENIR": 1, "TERMINE": 2}
-            suivis_actuels.sort(key=lambda x: (
-                ordre_etat.get(str(x.get("etat_match") or "A_VENIR").upper(), 1),
-                _cle_cle_chronologique(x),
-            ))
-            _DERNIER_RAPPORT["favoris_suivis"] = suivis_actuels
+            if item_trouve is None:
+                for liste_key in ("en_cours_matchs", "top_sur", "foot", "tennis"):
+                    for it in base_rapport.get(liste_key) or []:
+                        if _normaliser_cle_favori_entree(it) == cle_normalisee:
+                            item_trouve = dict(it)
+                            item_trouve["etat_match"] = "EN_COURS" if liste_key == "en_cours_matchs" else item_trouve.get("etat_match", "A_VENIR")
+                            break
+                    if item_trouve is not None:
+                        break
+
+            if item_trouve is None:
+                with _FAV_LOCK:
+                    meta_fav = dict(_FAVORIS_ACTIFS.get(cle_normalisee) or {})
+                item_trouve = {
+                    **meta_fav,
+                    "cle_favori": cle_normalisee,
+                    "sport": str(payload.get("sport") or meta_fav.get("sport") or "FOOT").upper(),
+                    "event_id": str(payload.get("event_id") or meta_fav.get("event_id") or ""),
+                    "match": str(payload.get("match") or meta_fav.get("match") or ""),
+                    "competition": str(payload.get("competition") or meta_fav.get("competition") or ""),
+                    "date_match": str(payload.get("date_match") or meta_fav.get("date_match") or ""),
+                    "ts_match": _safe_float(payload.get("ts_match"), meta_fav.get("ts_match") or 9_999_999_999.0),
+                    "choix": str(payload.get("choix") or meta_fav.get("choix") or ""),
+                    "proba": _safe_float(payload.get("proba"), meta_fav.get("proba")),
+                    "cote": _safe_float(payload.get("cote"), meta_fav.get("cote")),
+                    "mise_u": _safe_float(payload.get("mise_u"), meta_fav.get("mise_u")),
+                    "confiance": str(payload.get("confiance") or meta_fav.get("confiance") or "MOYENNE"),
+                    "confiance_score": _safe_float(payload.get("confiance_score"), meta_fav.get("confiance_score") or 50.0),
+                    "detail": str(payload.get("detail") or meta_fav.get("detail") or ""),
+                    "etat_match": str(payload.get("etat_match") or meta_fav.get("etat_match") or "A_VENIR").upper(),
+                    "score_actuel": str(payload.get("score_actuel") or meta_fav.get("score_actuel") or ""),
+                    "chrono_live": str(payload.get("chrono_live") or meta_fav.get("chrono_live") or ""),
+                }
+
+            item_trouve["cle_favori"] = cle_normalisee
+            item_trouve["est_favori"] = True
+            nouveaux_suivis = [x for x in suivis_actuels if _normaliser_cle_favori_entree(x) != cle_normalisee]
+            nouveaux_suivis.append(item_trouve)
+            base_rapport["favoris_suivis"] = nouveaux_suivis
         else:
-            _DERNIER_RAPPORT["favoris_suivis"] = [
-                it for it in suivis_actuels
-                if (str(it.get("cle_favori") or "").strip() or _construire_cle_favori(
-                    it.get("sport"), it.get("event_id"), it.get("match"), it.get("date_match")
-                )) != cle
+            item_trouve = {"cle_favori": cle_normalisee, "est_favori": False}
+            base_rapport["favoris_suivis"] = [
+                x for x in suivis_actuels if _normaliser_cle_favori_entree(x) != cle_normalisee
             ]
 
-        _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
-        if _DERNIER_RAPPORT.get("mis_a_jour"):
-            _sauvegarder_rapport_disque(_DERNIER_RAPPORT)
+        rapport_maj = _annoter_favoris_dans_rapport(base_rapport)
+        _DERNIER_RAPPORT = rapport_maj
+        total_fav = len(rapport_maj.get("favoris_suivis") or [])
+
+    if rapport_maj.get("mis_a_jour"):
+        _sauvegarder_rapport_disque(rapport_maj)
 
     return jsonify({
         "ok": True,
-        "cle_favori": cle,
+        "cle_favori": cle_normalisee,
         "est_favori": est_fav,
-        "total_favoris": len(cles_actuelles),
-        "favoris": cles_actuelles,
-        "item": item_enrichi if est_fav else None,
-    })
+        "total_favoris": total_fav,
+        "item": item_trouve,
+    }), 200
 
 
 @app.route("/api/favoris/clear-done", methods=["POST"])
 def api_favoris_clear_done():
+    global _DERNIER_RAPPORT
     supprimes, restants = nettoyer_favoris_termines()
     with _STATE_LOCK:
-        _DERNIER_RAPPORT["favoris_suivis"] = [
-            it for it in (_DERNIER_RAPPORT.get("favoris_suivis") or [])
-            if str(it.get("etat_match") or "").upper() != "TERMINE"
+        base_rapport = dict(_DERNIER_RAPPORT)
+        base_rapport["favoris_suivis"] = [
+            x for x in (base_rapport.get("favoris_suivis") or [])
+            if str(x.get("etat_match") or "").upper() != "TERMINE"
         ]
-        _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
-        if _DERNIER_RAPPORT.get("mis_a_jour"):
-            _sauvegarder_rapport_disque(_DERNIER_RAPPORT)
+        rapport_maj = _annoter_favoris_dans_rapport(base_rapport)
+        _DERNIER_RAPPORT = rapport_maj
+        total_fav = len(rapport_maj.get("favoris_suivis") or [])
+
+    if rapport_maj.get("mis_a_jour"):
+        _sauvegarder_rapport_disque(rapport_maj)
 
     return jsonify({
         "ok": True,
         "supprimes": supprimes,
-        "total_favoris": restants,
-    })
-
-
-@app.route("/api/historique/statut", methods=["POST"])
-def api_historique_statut():
-    payload = request.get_json(silent=True) or request.form or {}
-    refus = _verifier_acces_admin("historique_statut", CFG.statut_rate_limit_sec, payload=payload, json_mode=True)
-    if refus is not None:
-        return refus
-
-    sport = payload.get("sport", "")
-    event_id = payload.get("event_id", "")
-    choix = payload.get("choix", "")
-    statut = payload.get("statut", "")
-
-    bilan = definir_statut_historique(sport, event_id, choix, statut)
-    if bilan is None:
-        return jsonify({"ok": False, "error": "Pronostic introuvable ou statut invalide"}), 400
-
-    with _STATE_LOCK:
-        _DERNIER_RAPPORT["bilan"] = bilan
-        if _DERNIER_RAPPORT.get("mis_a_jour"):
-            _sauvegarder_rapport_disque(_DERNIER_RAPPORT)
-
-    return jsonify({"ok": True, "bilan": bilan})
-
-
-@app.route("/favoris")
-def favoris_page():
-    _demarrer_scheduler_si_actif()
-    with _STATE_LOCK:
-        rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
-        en_cours = _ANALYSE_EN_COURS
-
-    if not rapport.get("mis_a_jour") and not en_cours:
-        rapport = _annoter_favoris_dans_rapport(executer_analyse())
-        en_cours = False
-
-    if not rapport.get("mis_a_jour"):
-        return render_template_string(_HTML_LOADING), 200
-
-    return render_template_string(
-        _HTML_PAGE,
-        r=rapport,
-        cat="favoris",
-        page_favoris=True,
-        fenetre_heures=CFG.fenetre_heures,
-        en_cours=en_cours,
-        token_requis=bool(CFG.admin_token),
-    )
+        "restants": restants,
+        "total_favoris": total_fav,
+    }), 200
 
 
 @app.route("/")
 def index():
-    _demarrer_scheduler_si_actif()
     with _STATE_LOCK:
         maj = _DERNIER_RAPPORT.get("mis_a_jour")
         en_cours = _ANALYSE_EN_COURS
-
     if not maj and not en_cours:
         _demarrer_analyse_si_besoin(0.0)
         en_cours = True
-
-    return render_template_string(
+    resp = make_response(render_template_string(
         _HTML_HOME,
         pret=bool(maj),
         en_cours=en_cours,
         mis_a_jour=maj,
         fenetre_heures=CFG.fenetre_heures,
-    )
+    ))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 
 @app.route("/app")
 def app_view():
-    _demarrer_scheduler_si_actif()
-    cat = (request.args.get("cat") or "all").strip().lower()
+    cat = request.args.get("cat", "all").strip().lower()
     if cat not in ("all", "favoris", "live", "top", "foot", "tennis", "alertes", "bilan"):
         cat = "all"
 
     with _STATE_LOCK:
-        rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
+        maj = _DERNIER_RAPPORT.get("mis_a_jour")
         en_cours = _ANALYSE_EN_COURS
+        rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT) if maj else None
 
-    if not rapport.get("mis_a_jour") and not en_cours:
-        rapport = _annoter_favoris_dans_rapport(executer_analyse())
-        en_cours = False
-
-    if not rapport.get("mis_a_jour"):
-        return render_template_string(_HTML_LOADING), 200
+    if not maj:
+        if not en_cours:
+            _demarrer_analyse_si_besoin(0.0)
+        return render_template_string(_HTML_LOADING)
 
     return render_template_string(
         _HTML_PAGE,
         r=rapport,
         cat=cat,
         page_favoris=(cat == "favoris"),
-        fenetre_heures=CFG.fenetre_heures,
         en_cours=en_cours,
+        fenetre_heures=CFG.fenetre_heures,
+        token_requis=bool(CFG.admin_token),
+    )
+
+
+@app.route("/favoris")
+def favoris_page():
+    with _STATE_LOCK:
+        maj = _DERNIER_RAPPORT.get("mis_a_jour")
+        en_cours = _ANALYSE_EN_COURS
+        rapport = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT) if maj else None
+
+    if not maj:
+        if not en_cours:
+            _demarrer_analyse_si_besoin(0.0)
+        return render_template_string(_HTML_LOADING)
+
+    return render_template_string(
+        _HTML_PAGE,
+        r=rapport,
+        cat="favoris",
+        page_favoris=True,
+        en_cours=en_cours,
+        fenetre_heures=CFG.fenetre_heures,
         token_requis=bool(CFG.admin_token),
     )
 
 
 @app.route("/refresh", methods=["POST"])
 def refresh():
-    payload = request.get_json(silent=True) or request.form or {}
-    wants_json = request.is_json or ("application/json" in (request.headers.get("Accept") or ""))
-    refus = _verifier_acces_admin("refresh", CFG.refresh_rate_limit_sec, payload=payload, json_mode=wants_json)
+    refus = _verifier_acces_admin("refresh", CFG.refresh_rate_limit_sec, payload=None, json_mode=False)
     if refus is not None:
         return refus
-
     executer_analyse()
-    ref = request.headers.get("Referer") or ""
-    if "/favoris" in ref:
-        return redirect(url_for("favoris_page"))
-    parsed = urllib.parse.urlparse(ref)
-    qs = urllib.parse.parse_qs(parsed.query)
-    cat = (qs.get("cat") or ["all"])[0]
-    if cat not in ("all", "favoris", "live", "top", "foot", "tennis", "alertes", "bilan"):
-        cat = "all"
-    return redirect(url_for("app_view", cat=cat))
-
-
-@app.route("/debug/reset")
-def debug_reset():
-    if not CFG.activer_debug_routes:
-        return jsonify({"error": "Route debug désactivée"}), 404
-    _CACHE_FOOT_SCHED.clear()
-    _CACHE_SANTE.clear()
-    _CACHE_COTES_MARCHE.clear()
-    executer_analyse()
-    return redirect(url_for("app_view", cat="all"))
+    referer = request.headers.get("Referer") or url_for("app_view")
+    return redirect(referer)
 
 
 _nettoyer_fichiers_tmp_orphelins()
 _charger_favoris_disque()
 _charger_rapport_disque()
-with _STATE_LOCK:
-    _DERNIER_RAPPORT = _annoter_favoris_dans_rapport(_DERNIER_RAPPORT)
 _demarrer_scheduler_si_actif()
 
+if not _DERNIER_RAPPORT.get("mis_a_jour"):
+    _demarrer_analyse_si_besoin(0.5)
+
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    if not _DERNIER_RAPPORT.get("mis_a_jour"):
-        _demarrer_analyse_si_besoin(0.2)
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
